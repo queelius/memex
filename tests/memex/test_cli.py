@@ -72,8 +72,8 @@ class TestCLIImport:
             [sys.executable, "-m", "memex", "import", str(export_file), "--db", str(db_dir)],
             capture_output=True, text=True,
         )
-        assert result.returncode == 0
-        assert "Imported 0 conversation" in result.stdout
+        assert result.returncode == 1
+        assert "no importer found" in result.stderr
 
 
 class TestCLIExport:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import uuid
 from contextlib import asynccontextmanager
 from typing import Annotated, Any, Optional
@@ -34,6 +35,10 @@ def create_server(db=None, sql_write=False):
     """
     mcp = FastMCP("memex", lifespan=lifespan if db is None else None)
     if db is not None:
+        # Enforce readonly at the SQLite level when sql_write is disabled
+        if not sql_write and not db.readonly:
+            db.conn.execute("PRAGMA query_only=ON")
+            db.readonly = True
         mcp._test_db = db
         mcp._test_sql_write = sql_write
     _register_tools(mcp)
@@ -58,7 +63,7 @@ def _get_db_from_ctx(mcp, ctx, db_name=None):
 
 
 def _get_sql_write(mcp, ctx):
-    """Get sql_write setting from either lifespan context or test injection."""
+    """Check sql_write setting for informational error messages."""
     if (ctx is not None
             and hasattr(ctx, 'request_context')
             and ctx.request_context is not None
@@ -74,17 +79,18 @@ def _register_tools(mcp: FastMCP):
     @mcp.tool(annotations={"readOnlyHint": True})
     def execute_sql(
         sql: Annotated[str, Field(description="SQL query to execute")],
+        params: Annotated[list | None, Field(description="Query parameters for ? placeholders")] = None,
         db: Annotated[str | None, Field(description="Target database name")] = None,
         ctx: Context = None,
     ) -> list[dict]:
-        """Run a SQL query against the database. Read-only by default."""
+        """Run a SQL query against the database. Read-only by default (enforced by SQLite PRAGMA query_only)."""
         database = _get_db_from_ctx(mcp, ctx, db)
-        sql_write = _get_sql_write(mcp, ctx)
-        sql_stripped = sql.strip().upper()
-        if not sql_write and not (sql_stripped.startswith("SELECT") or sql_stripped.startswith("PRAGMA")):
-            raise ToolError("SQL writes are disabled. Set MEMEX_SQL_WRITE=true to enable.")
         try:
-            return database.execute_sql(sql)
+            return database.execute_sql(sql, tuple(params) if params else ())
+        except sqlite3.OperationalError as e:
+            if "attempt to write a readonly database" in str(e):
+                raise ToolError("SQL writes are disabled. Set MEMEX_SQL_WRITE=true to enable.")
+            raise ToolError(str(e))
         except Exception as e:
             raise ToolError(str(e))
 
@@ -183,7 +189,7 @@ def _register_tools(mcp: FastMCP):
     ) -> dict:
         """Add a message to the conversation tree."""
         database = _get_db_from_ctx(mcp, ctx, db)
-        msg_id = str(uuid.uuid4())[:8]
+        msg_id = str(uuid.uuid4())
         msg = Message(
             id=msg_id, role=role, content=content,
             parent_id=parent_message_id, model=message_model,

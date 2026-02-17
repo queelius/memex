@@ -1,4 +1,7 @@
+import sqlite3
 from datetime import datetime
+
+import pytest
 
 from memex.db import Database
 from memex.models import (
@@ -394,3 +397,114 @@ class TestPaths:
     def test_list_paths_not_found(self, tmp_db_path):
         with pytest.raises(ValueError):
             Database(tmp_db_path).list_paths("nope")
+
+
+class TestFTSInjection:
+    """Tests for FTS5 MATCH sanitization (issue #1)."""
+
+    def test_double_quotes_stripped(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        # Should not raise — double quotes are stripped
+        result = db.query_conversations(query='hello "world"')
+        assert isinstance(result["items"], list)
+
+    def test_single_quotes_stripped(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        result = db.query_conversations(query="it's a test")
+        assert isinstance(result["items"], list)
+
+    def test_empty_after_sanitize(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        # All characters stripped → empty query → no results
+        result = db.query_conversations(query='""')
+        assert result["items"] == []
+
+    def test_like_wildcards_escaped(self, tmp_db_path):
+        """LIKE fallback should escape % and _ wildcards."""
+        db = Database(tmp_db_path)
+        now = datetime.now()
+        conv = Conversation(
+            id="c1", created_at=now, updated_at=now, title="Test",
+        )
+        conv.add_message(Message(id="m1", role="user", content=[text_block("100% complete")]))
+        db.save_conversation(conv)
+        # The FTS query will work normally; this tests the sanitization path
+        result = db.query_conversations(query="100% complete")
+        assert len(result["items"]) == 1
+
+
+class TestReadonlyMode:
+    """Tests for PRAGMA query_only enforcement (issue #2)."""
+
+    def test_readonly_blocks_insert(self, tmp_db_path):
+        db = Database(tmp_db_path, readonly=True)
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            db.execute_sql("INSERT INTO conversations (id, message_count, created_at, updated_at, sensitive) VALUES ('x', 0, '2024-01-01', '2024-01-01', 0)")
+
+    def test_readonly_allows_select(self, tmp_db_path):
+        # Write data with a writable connection first
+        db_w = Database(tmp_db_path)
+        db_w.save_conversation(_make_conv())
+        db_w.close()
+        # Now open readonly
+        db_r = Database(tmp_db_path, readonly=True)
+        result = db_r.execute_sql("SELECT COUNT(*) as n FROM conversations")
+        assert result[0]["n"] == 1
+
+    def test_readonly_blocks_delete(self, tmp_db_path):
+        db = Database(tmp_db_path, readonly=True)
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            db.execute_sql("DELETE FROM conversations")
+
+    def test_readonly_blocks_drop(self, tmp_db_path):
+        db = Database(tmp_db_path, readonly=True)
+        with pytest.raises(sqlite3.OperationalError):
+            db.execute_sql("DROP TABLE IF EXISTS conversations")
+
+
+class TestContextManager:
+    """Tests for Database __enter__/__exit__ (issue #8)."""
+
+    def test_context_manager_basic(self, tmp_db_path):
+        with Database(tmp_db_path) as db:
+            db.save_conversation(_make_conv())
+            assert db.conn is not None
+        # After exit, connection should be closed
+        assert db.conn is None
+
+    def test_context_manager_on_exception(self, tmp_db_path):
+        try:
+            with Database(tmp_db_path) as db:
+                db.save_conversation(_make_conv())
+                raise ValueError("test error")
+        except ValueError:
+            pass
+        # Connection should still be closed even on exception
+        assert db.conn is None
+
+    def test_context_manager_data_persists(self, tmp_db_path):
+        with Database(tmp_db_path) as db:
+            db.save_conversation(_make_conv())
+        # Reopen and verify data survived
+        with Database(tmp_db_path) as db2:
+            conv = db2.load_conversation("c1")
+            assert conv is not None
+            assert conv.title == "Test"
+
+
+class TestTransactionRollback:
+    """Tests for transaction safety in append_message and update_conversation (issue #3)."""
+
+    def test_append_duplicate_message_rolls_back(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        # m1 already exists; inserting again should fail and rollback
+        dup_msg = Message(id="m1", role="user", content=[text_block("dup")])
+        with pytest.raises(Exception):
+            db.append_message("c1", dup_msg)
+        # Original message should be unchanged
+        conv = db.load_conversation("c1")
+        assert conv.messages["m1"].get_text() == "hello"

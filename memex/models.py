@@ -78,18 +78,21 @@ class Conversation:
         return [self.messages[cid] for cid in self._children.get(message_id, []) if cid in self.messages]
 
     def get_all_paths(self) -> List[List[Message]]:
+        """Get all root-to-leaf paths. Uses iterative DFS to avoid recursion limits."""
         paths: List[List[Message]] = []
-        def walk(msg_id: str, current: List[Message]):
-            current.append(self.messages[msg_id])
+        # Stack entries: (message_id, path_so_far)
+        stack: List[tuple[str, List[Message]]] = [
+            (rid, []) for rid in reversed(self.root_ids)
+        ]
+        while stack:
+            msg_id, current = stack.pop()
+            path = current + [self.messages[msg_id]]
             children = self._children.get(msg_id, [])
             if not children:
-                paths.append(list(current))
+                paths.append(path)
             else:
-                for cid in children:
-                    walk(cid, current)
-            current.pop()
-        for rid in self.root_ids:
-            walk(rid, [])
+                for cid in reversed(children):
+                    stack.append((cid, path))
         return paths
 
     def get_path(self, leaf_id: str) -> Optional[List[Message]]:

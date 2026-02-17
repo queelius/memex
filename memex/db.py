@@ -80,21 +80,31 @@ def _decode_cursor(cursor: str) -> tuple[str, str]:
 
 
 class Database:
-    def __init__(self, path: str):
+    def __init__(self, path: str, readonly: bool = False):
         if path == ":memory:":
             self.db_path = ":memory:"
         else:
             db_dir = Path(path)
             db_dir.mkdir(parents=True, exist_ok=True)
             self.db_path = str(db_dir / "conversations.db")
+        self.readonly = readonly
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = _dict_factory
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
         self._ensure_schema()
+        if readonly:
+            self.conn.execute("PRAGMA query_only=ON")
 
     def _ensure_schema(self):
         self.conn.executescript(SCHEMA_SQL)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 
     def close(self):
         if self.conn:
@@ -133,8 +143,8 @@ class Database:
                     int(conv.sensitive), json.dumps(conv.metadata),
                 ),
             )
-            c.execute("DELETE FROM messages WHERE conversation_id=?", (conv.id,))
-            c.execute("DELETE FROM tags WHERE conversation_id=?", (conv.id,))
+            # CASCADE handles messages and tags on REPLACE.
+            # FTS is not covered by CASCADE, so we must clean it explicitly.
             c.execute(
                 "DELETE FROM messages_fts WHERE conversation_id=?", (conv.id,)
             )
@@ -176,8 +186,8 @@ class Database:
         r = rows[0]
         conv = Conversation(
             id=r["id"],
-            created_at=_parse_dt(r["created_at"]),
-            updated_at=_parse_dt(r["updated_at"]),
+            created_at=_parse_dt(r["created_at"]) or datetime.now(),
+            updated_at=_parse_dt(r["updated_at"]) or datetime.now(),
             title=r["title"],
             source=r["source"],
             model=r["model"],
@@ -300,7 +310,15 @@ class Database:
         return {"items": items, "next_cursor": nc, "has_more": has_more}
 
     def _fts_search(self, query: str) -> List[str]:
-        fts_q = " OR ".join(f'"{t}"' for t in query.split())
+        # Sanitize: strip characters that are FTS5 operators/syntax
+        sanitized = query.replace('"', "").replace("'", "")
+        tokens = sanitized.split()
+        if not tokens:
+            return []
+        # Quote each token individually and join with OR for keyword search
+        fts_q = " OR ".join(f'"{t}"' for t in tokens if t)
+        if not fts_q:
+            return []
         try:
             rows = self.execute_sql(
                 "SELECT DISTINCT conversation_id FROM messages_fts "
@@ -308,10 +326,16 @@ class Database:
                 (fts_q,),
             )
         except sqlite3.OperationalError:
+            # Escape LIKE wildcards then fall back to LIKE search
+            escaped = (
+                query.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
             rows = self.execute_sql(
                 "SELECT DISTINCT conversation_id FROM messages "
-                "WHERE content LIKE ? LIMIT 1000",
-                (f"%{query}%",),
+                "WHERE content LIKE ? ESCAPE '\\' LIMIT 1000",
+                (f"%{escaped}%",),
             )
         return [r["conversation_id"] for r in rows]
 
@@ -333,92 +357,100 @@ class Database:
         )
         if not existing:
             raise ValueError(f"Conversation not found: {id}")
-        sets: List[str] = []
-        params: List[Any] = []
-        now = _fmt_dt(datetime.now())
-        if title is not None:
-            sets.append("title=?")
-            params.append(title)
-        if summary is not None:
-            sets.append("summary=?")
-            params.append(summary)
-        if starred is True:
-            sets.append("starred_at=?")
-            params.append(now)
-        elif starred is False:
-            sets.append("starred_at=NULL")
-        if pinned is True:
-            sets.append("pinned_at=?")
-            params.append(now)
-        elif pinned is False:
-            sets.append("pinned_at=NULL")
-        if archived is True:
-            sets.append("archived_at=?")
-            params.append(now)
-        elif archived is False:
-            sets.append("archived_at=NULL")
-        if sensitive is not None:
-            sets.append("sensitive=?")
-            params.append(int(sensitive))
-        if metadata is not None:
-            m = json.loads(existing[0]["metadata"] or "{}")
-            m.update(metadata)
-            sets.append("metadata=?")
-            params.append(json.dumps(m))
-        if sets:
-            sets.append("updated_at=?")
-            params.append(now)
-            params.append(id)
-            self.conn.execute(
-                f"UPDATE conversations SET {','.join(sets)} WHERE id=?",
-                tuple(params),
-            )
-        if add_tags:
-            for t in add_tags:
+        try:
+            sets: List[str] = []
+            params: List[Any] = []
+            now = _fmt_dt(datetime.now())
+            if title is not None:
+                sets.append("title=?")
+                params.append(title)
+            if summary is not None:
+                sets.append("summary=?")
+                params.append(summary)
+            if starred is True:
+                sets.append("starred_at=?")
+                params.append(now)
+            elif starred is False:
+                sets.append("starred_at=NULL")
+            if pinned is True:
+                sets.append("pinned_at=?")
+                params.append(now)
+            elif pinned is False:
+                sets.append("pinned_at=NULL")
+            if archived is True:
+                sets.append("archived_at=?")
+                params.append(now)
+            elif archived is False:
+                sets.append("archived_at=NULL")
+            if sensitive is not None:
+                sets.append("sensitive=?")
+                params.append(int(sensitive))
+            if metadata is not None:
+                m = json.loads(existing[0]["metadata"] or "{}")
+                m.update(metadata)
+                sets.append("metadata=?")
+                params.append(json.dumps(m))
+            if sets:
+                sets.append("updated_at=?")
+                params.append(now)
+                params.append(id)
                 self.conn.execute(
-                    "INSERT OR IGNORE INTO tags (conversation_id,tag) "
-                    "VALUES (?,?)",
-                    (id, t),
+                    f"UPDATE conversations SET {','.join(sets)} WHERE id=?",
+                    tuple(params),
                 )
-        if remove_tags:
-            for t in remove_tags:
-                self.conn.execute(
-                    "DELETE FROM tags WHERE conversation_id=? AND tag=?",
-                    (id, t),
-                )
-        self.conn.commit()
+            if add_tags:
+                for t in add_tags:
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO tags (conversation_id,tag) "
+                        "VALUES (?,?)",
+                        (id, t),
+                    )
+            if remove_tags:
+                for t in remove_tags:
+                    self.conn.execute(
+                        "DELETE FROM tags WHERE conversation_id=? AND tag=?",
+                        (id, t),
+                    )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def append_message(self, conversation_id, message):
         if not self.execute_sql(
             "SELECT id FROM conversations WHERE id=?", (conversation_id,)
         ):
             raise ValueError(f"Conversation not found: {conversation_id}")
-        now = _fmt_dt(datetime.now())
-        self.conn.execute(
-            "INSERT INTO messages "
-            "(conversation_id,id,role,parent_id,model,created_at,"
-            "sensitive,content,metadata) VALUES (?,?,?,?,?,?,?,?,?)",
-            (
-                conversation_id, message.id, message.role, message.parent_id,
-                message.model, _fmt_dt(message.created_at) or now,
-                int(message.sensitive), json.dumps(message.content),
-                json.dumps(message.metadata),
-            ),
-        )
-        text = message.get_text()
-        if text:
+        try:
+            now = _fmt_dt(datetime.now())
             self.conn.execute(
-                "INSERT INTO messages_fts "
-                "(conversation_id,message_id,text) VALUES (?,?,?)",
-                (conversation_id, message.id, text),
+                "INSERT INTO messages "
+                "(conversation_id,id,role,parent_id,model,created_at,"
+                "sensitive,content,metadata) VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    conversation_id, message.id, message.role, message.parent_id,
+                    message.model, _fmt_dt(message.created_at) or now,
+                    int(message.sensitive), json.dumps(message.content),
+                    json.dumps(message.metadata),
+                ),
             )
-        self.conn.execute(
-            "UPDATE conversations SET message_count="
-            "(SELECT COUNT(*) FROM messages WHERE conversation_id=?),"
-            "updated_at=? WHERE id=?",
-            (conversation_id, now, conversation_id),
-        )
-        self.conn.commit()
+            text = message.get_text()
+            if text:
+                self.conn.execute(
+                    "INSERT INTO messages_fts "
+                    "(conversation_id,message_id,text) VALUES (?,?,?)",
+                    (conversation_id, message.id, text),
+                )
+            self.conn.execute(
+                "UPDATE conversations SET message_count="
+                "(SELECT COUNT(*) FROM messages WHERE conversation_id=?),"
+                "updated_at=? WHERE id=?",
+                (conversation_id, now, conversation_id),
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def get_statistics(self):
         tc = self.execute_sql(

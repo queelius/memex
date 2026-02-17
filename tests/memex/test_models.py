@@ -106,3 +106,18 @@ class TestConversation:
 
     def test_get_leaf_ids(self):
         assert self._linear().get_leaf_ids() == ["m4"]
+
+    def test_get_all_paths_deep_chain(self):
+        """Iterative get_all_paths should handle chains > 1000 messages (issue #10)."""
+        conv = Conversation(id="deep", created_at=datetime.now(), updated_at=datetime.now())
+        # Build a chain of 1500 messages (exceeds Python default recursion limit of 1000)
+        for i in range(1500):
+            conv.add_message(Message(
+                id=f"m{i}", role="user", content=[text_block(f"msg{i}")],
+                parent_id=f"m{i-1}" if i > 0 else None,
+            ))
+        paths = conv.get_all_paths()
+        assert len(paths) == 1
+        assert len(paths[0]) == 1500
+        assert paths[0][0].id == "m0"
+        assert paths[0][-1].id == "m1499"

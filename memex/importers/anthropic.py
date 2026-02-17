@@ -75,9 +75,6 @@ def _detect_model(data: dict) -> str:
     for msg in messages:
         if msg.get("model"):
             return msg["model"]
-        # Check in metadata
-        if msg.get("sender") == "assistant":
-            return "claude"
     return "claude"
 
 

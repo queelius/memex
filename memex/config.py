@@ -41,9 +41,10 @@ class DatabaseRegistry:
         self.primary = config.get("primary")
         self.sql_write = config.get("sql_write", False)
         self._dbs: Dict[str, Database] = {}
+        readonly = not self.sql_write
         for name, db_config in config.get("databases", {}).items():
             path = os.path.expanduser(db_config["path"])
-            self._dbs[name] = Database(path)
+            self._dbs[name] = Database(path, readonly=readonly)
 
     def get_db(self, name: str | None = None) -> Database:
         """Get a database by name, or the primary database if name is None."""

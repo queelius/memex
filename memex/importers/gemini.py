@@ -94,7 +94,7 @@ def _import_conversation(data: dict) -> Optional[Conversation]:
 
     for idx, msg_data in enumerate(messages):
         msg_id = msg_data.get("id", f"msg_{idx}")
-        role_str = msg_data.get("author", msg_data.get("role", "user"))
+        role_str = str(msg_data.get("author", msg_data.get("role", "user")))
         role = "assistant" if role_str.lower() in ("model", "gemini", "bard") else "user"
 
         content = _extract_content(msg_data)
