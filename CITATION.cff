@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "memex: Personal Conversation Knowledge Base"
+type: software
+version: 0.1.0
+date-released: "2026-02-17"
+license: MIT
+repository-code: "https://github.com/queelius/memex"
+abstract: >-
+  MCP-first personal conversation knowledge base for managing,
+  searching, and analyzing chat conversations from multiple AI
+  providers. Raw SQLite with FTS5 search, convention-based
+  importers/exporters, and a FastMCP server interface.
+keywords:
+  - conversations
+  - knowledge-base
+  - mcp
+  - sqlite
+  - fts5
+  - ai
+  - llm
+authors:
+  - family-names: Towell
+    given-names: Alexander
+    email: lex@metafunctor.com
+    orcid: "https://orcid.org/0000-0001-6443-9897"
