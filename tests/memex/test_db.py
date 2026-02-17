@@ -232,3 +232,94 @@ class TestSearch:
         r = db.query_conversations(query="topic", source="anthropic")
         for item in r["items"]:
             assert item["id"] in ("c4", "c5")
+
+
+import pytest
+
+
+class TestUpdate:
+    def test_title(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        db.update_conversation("c1", title="New")
+        assert db.load_conversation("c1").title == "New"
+
+    def test_star_unstar(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        db.update_conversation("c1", starred=True)
+        assert db.load_conversation("c1").starred_at is not None
+        db.update_conversation("c1", starred=False)
+        assert db.load_conversation("c1").starred_at is None
+
+    def test_add_remove_tags(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        db.update_conversation("c1", add_tags=["new"])
+        assert "new" in db.load_conversation("c1").tags
+        db.update_conversation("c1", remove_tags=["python"])
+        assert "python" not in db.load_conversation("c1").tags
+
+    def test_metadata_merge(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        conv = _make_conv()
+        conv.metadata = {"a": 1}
+        db.save_conversation(conv)
+        db.update_conversation("c1", metadata={"b": 2})
+        assert db.load_conversation("c1").metadata == {"a": 1, "b": 2}
+
+    def test_summary(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        db.update_conversation("c1", summary="A test.")
+        assert db.load_conversation("c1").summary == "A test."
+
+    def test_nonexistent(self, tmp_db_path):
+        with pytest.raises(ValueError, match="not found"):
+            Database(tmp_db_path).update_conversation("nope", title="x")
+
+
+class TestAppend:
+    def test_append(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        db.append_message(
+            "c1",
+            Message(
+                id="m3", role="user",
+                content=[text_block("followup")], parent_id="m2",
+            ),
+        )
+        loaded = db.load_conversation("c1")
+        assert len(loaded.messages) == 3 and loaded.message_count == 3
+
+    def test_branch(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        db.append_message(
+            "c1",
+            Message(
+                id="m2b", role="assistant",
+                content=[text_block("alt")], parent_id="m1",
+            ),
+        )
+        assert len(db.load_conversation("c1").get_all_paths()) == 2
+
+    def test_nonexistent(self, tmp_db_path):
+        with pytest.raises(ValueError, match="not found"):
+            Database(tmp_db_path).append_message(
+                "nope",
+                Message(id="m1", role="user", content=[text_block("x")]),
+            )
+
+    def test_updates_fts(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        db.append_message(
+            "c1",
+            Message(
+                id="m3", role="user",
+                content=[text_block("unique_xyz_term")], parent_id="m2",
+            ),
+        )
+        assert len(db.query_conversations(query="unique_xyz_term")["items"]) == 1

@@ -314,3 +314,108 @@ class Database:
                 (f"%{query}%",),
             )
         return [r["conversation_id"] for r in rows]
+
+    def update_conversation(
+        self,
+        id,
+        title=None,
+        summary=None,
+        starred=None,
+        pinned=None,
+        archived=None,
+        sensitive=None,
+        add_tags=None,
+        remove_tags=None,
+        metadata=None,
+    ):
+        existing = self.execute_sql(
+            "SELECT id,metadata FROM conversations WHERE id=?", (id,)
+        )
+        if not existing:
+            raise ValueError(f"Conversation not found: {id}")
+        sets: List[str] = []
+        params: List[Any] = []
+        now = _fmt_dt(datetime.now())
+        if title is not None:
+            sets.append("title=?")
+            params.append(title)
+        if summary is not None:
+            sets.append("summary=?")
+            params.append(summary)
+        if starred is True:
+            sets.append("starred_at=?")
+            params.append(now)
+        elif starred is False:
+            sets.append("starred_at=NULL")
+        if pinned is True:
+            sets.append("pinned_at=?")
+            params.append(now)
+        elif pinned is False:
+            sets.append("pinned_at=NULL")
+        if archived is True:
+            sets.append("archived_at=?")
+            params.append(now)
+        elif archived is False:
+            sets.append("archived_at=NULL")
+        if sensitive is not None:
+            sets.append("sensitive=?")
+            params.append(int(sensitive))
+        if metadata is not None:
+            m = json.loads(existing[0]["metadata"] or "{}")
+            m.update(metadata)
+            sets.append("metadata=?")
+            params.append(json.dumps(m))
+        if sets:
+            sets.append("updated_at=?")
+            params.append(now)
+            params.append(id)
+            self.conn.execute(
+                f"UPDATE conversations SET {','.join(sets)} WHERE id=?",
+                tuple(params),
+            )
+        if add_tags:
+            for t in add_tags:
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO tags (conversation_id,tag) "
+                    "VALUES (?,?)",
+                    (id, t),
+                )
+        if remove_tags:
+            for t in remove_tags:
+                self.conn.execute(
+                    "DELETE FROM tags WHERE conversation_id=? AND tag=?",
+                    (id, t),
+                )
+        self.conn.commit()
+
+    def append_message(self, conversation_id, message):
+        if not self.execute_sql(
+            "SELECT id FROM conversations WHERE id=?", (conversation_id,)
+        ):
+            raise ValueError(f"Conversation not found: {conversation_id}")
+        now = _fmt_dt(datetime.now())
+        self.conn.execute(
+            "INSERT INTO messages "
+            "(conversation_id,id,role,parent_id,model,created_at,"
+            "sensitive,content,metadata) VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                conversation_id, message.id, message.role, message.parent_id,
+                message.model, _fmt_dt(message.created_at) or now,
+                int(message.sensitive), json.dumps(message.content),
+                json.dumps(message.metadata),
+            ),
+        )
+        text = message.get_text()
+        if text:
+            self.conn.execute(
+                "INSERT INTO messages_fts "
+                "(conversation_id,message_id,text) VALUES (?,?,?)",
+                (conversation_id, message.id, text),
+            )
+        self.conn.execute(
+            "UPDATE conversations SET message_count="
+            "(SELECT COUNT(*) FROM messages WHERE conversation_id=?),"
+            "updated_at=? WHERE id=?",
+            (conversation_id, now, conversation_id),
+        )
+        self.conn.commit()
