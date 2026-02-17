@@ -151,3 +151,84 @@ class TestSaveLoad:
         m1 = db.load_conversation("c1").messages["m1"]
         assert m1.content[1]["type"] == "tool_use"
         assert m1.content[1]["name"] == "search"
+
+
+def _populate_db(db):
+    for i in range(1, 6):
+        now = datetime(2024, 1, i)
+        conv = Conversation(
+            id=f"c{i}", created_at=now, updated_at=now, title=f"Chat {i}",
+            source="openai" if i <= 3 else "anthropic",
+            model="gpt-4" if i <= 3 else "claude-3",
+            tags=["python"] if i % 2 == 0 else ["rust"],
+        )
+        if i == 1:
+            conv.starred_at = now
+        if i == 2:
+            conv.pinned_at = now
+        if i == 3:
+            conv.archived_at = now
+        conv.add_message(
+            Message(id="m1", role="user", content=[text_block(f"topic {i}")])
+        )
+        conv.add_message(
+            Message(
+                id="m2", role="assistant",
+                content=[text_block(f"answer {i}")], parent_id="m1",
+            )
+        )
+        db.save_conversation(conv)
+
+
+class TestQuery:
+    def test_all(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        assert len(db.query_conversations()["items"]) == 5
+
+    def test_limit(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        r = db.query_conversations(limit=2)
+        assert len(r["items"]) == 2 and r["has_more"] is True
+
+    def test_starred(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        r = db.query_conversations(starred=True)
+        assert len(r["items"]) == 1 and r["items"][0]["id"] == "c1"
+
+    def test_source(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        assert len(db.query_conversations(source="anthropic")["items"]) == 2
+
+    def test_tag(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        assert len(db.query_conversations(tag="python")["items"]) == 2
+
+    def test_not_archived(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        assert len(db.query_conversations(archived=False)["items"]) == 4
+
+
+class TestSearch:
+    def test_fts(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        r = db.query_conversations(query="topic 3")
+        assert "c3" in [i["id"] for i in r["items"]]
+
+    def test_no_results(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        assert len(db.query_conversations(query="nonexistent_xyz")["items"]) == 0
+
+    def test_with_filter(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        r = db.query_conversations(query="topic", source="anthropic")
+        for item in r["items"]:
+            assert item["id"] in ("c4", "c5")

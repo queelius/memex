@@ -214,3 +214,103 @@ class Database:
                 )
             )
         return conv
+
+    def query_conversations(
+        self,
+        query=None,
+        starred=None,
+        pinned=None,
+        archived=None,
+        sensitive=None,
+        source=None,
+        model=None,
+        tag=None,
+        before=None,
+        after=None,
+        limit=20,
+        cursor=None,
+    ) -> Dict[str, Any]:
+        conds: List[str] = []
+        params: List[Any] = []
+        if query:
+            fts_ids = self._fts_search(query)
+            if not fts_ids:
+                return {"items": [], "next_cursor": None, "has_more": False}
+            conds.append(
+                f"c.id IN ({','.join('?' for _ in fts_ids)})"
+            )
+            params.extend(fts_ids)
+        if starred is True:
+            conds.append("c.starred_at IS NOT NULL")
+        elif starred is False:
+            conds.append("c.starred_at IS NULL")
+        if pinned is True:
+            conds.append("c.pinned_at IS NOT NULL")
+        elif pinned is False:
+            conds.append("c.pinned_at IS NULL")
+        if archived is True:
+            conds.append("c.archived_at IS NOT NULL")
+        elif archived is False:
+            conds.append("c.archived_at IS NULL")
+        if sensitive is True:
+            conds.append("c.sensitive=1")
+        elif sensitive is False:
+            conds.append("c.sensitive=0")
+        if source:
+            conds.append("c.source=?")
+            params.append(source)
+        if model:
+            conds.append("c.model=?")
+            params.append(model)
+        if tag:
+            conds.append(
+                "EXISTS(SELECT 1 FROM tags t "
+                "WHERE t.conversation_id=c.id AND t.tag=?)"
+            )
+            params.append(tag)
+        if before:
+            conds.append("c.created_at<?")
+            params.append(before)
+        if after:
+            conds.append("c.created_at>?")
+            params.append(after)
+        if cursor:
+            cdt, cid = _decode_cursor(cursor)
+            conds.append(
+                "(c.updated_at<? OR (c.updated_at=? AND c.id<?))"
+            )
+            params.extend([cdt, cdt, cid])
+        where = " AND ".join(conds) if conds else "1=1"
+        params.append(limit + 1)
+        rows = self.execute_sql(
+            f"SELECT c.id,c.title,c.source,c.model,c.message_count,"
+            f"c.created_at,c.updated_at,c.starred_at,c.pinned_at,"
+            f"c.archived_at,c.sensitive,c.summary "
+            f"FROM conversations c WHERE {where} "
+            f"ORDER BY c.updated_at DESC,c.id DESC LIMIT ?",
+            tuple(params),
+        )
+        has_more = len(rows) > limit
+        items = rows[:limit]
+        nc = (
+            _encode_cursor(items[-1]["updated_at"], items[-1]["id"])
+            if has_more and items
+            else None
+        )
+        return {"items": items, "next_cursor": nc, "has_more": has_more}
+
+    def _fts_search(self, query: str) -> List[str]:
+        fts_q = " OR ".join(f'"{t}"' for t in query.split())
+        try:
+            rows = self.execute_sql(
+                "SELECT DISTINCT conversation_id FROM messages_fts "
+                "WHERE messages_fts MATCH ? LIMIT 1000",
+                (fts_q,),
+            )
+        except sqlite3.OperationalError:
+            rows = self.execute_sql(
+                "SELECT DISTINCT conversation_id FROM messages "
+                "WHERE content LIKE ? LIMIT 1000",
+                (f"%{query}%",),
+            )
+        return [r["conversation_id"] for r in rows]
