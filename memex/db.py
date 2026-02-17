@@ -116,3 +116,101 @@ class Database:
             "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name"
         )
         return "\n\n".join(r["sql"] for r in rows)
+
+    def save_conversation(self, conv: Conversation) -> None:
+        c = self.conn.cursor()
+        try:
+            c.execute(
+                "INSERT OR REPLACE INTO conversations "
+                "(id,title,source,model,summary,message_count,"
+                "created_at,updated_at,starred_at,pinned_at,archived_at,"
+                "sensitive,metadata) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    conv.id, conv.title, conv.source, conv.model, conv.summary,
+                    conv.message_count, _fmt_dt(conv.created_at),
+                    _fmt_dt(conv.updated_at), _fmt_dt(conv.starred_at),
+                    _fmt_dt(conv.pinned_at), _fmt_dt(conv.archived_at),
+                    int(conv.sensitive), json.dumps(conv.metadata),
+                ),
+            )
+            c.execute("DELETE FROM messages WHERE conversation_id=?", (conv.id,))
+            c.execute("DELETE FROM tags WHERE conversation_id=?", (conv.id,))
+            c.execute(
+                "DELETE FROM messages_fts WHERE conversation_id=?", (conv.id,)
+            )
+            for msg in conv.messages.values():
+                c.execute(
+                    "INSERT INTO messages "
+                    "(conversation_id,id,role,parent_id,model,created_at,"
+                    "sensitive,content,metadata) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (
+                        conv.id, msg.id, msg.role, msg.parent_id, msg.model,
+                        _fmt_dt(msg.created_at), int(msg.sensitive),
+                        json.dumps(msg.content), json.dumps(msg.metadata),
+                    ),
+                )
+                text = msg.get_text()
+                if text:
+                    c.execute(
+                        "INSERT INTO messages_fts "
+                        "(conversation_id,message_id,text) VALUES (?,?,?)",
+                        (conv.id, msg.id, text),
+                    )
+            for tag in conv.tags:
+                c.execute(
+                    "INSERT OR IGNORE INTO tags (conversation_id,tag) "
+                    "VALUES (?,?)",
+                    (conv.id, tag),
+                )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def load_conversation(self, id: str) -> Optional[Conversation]:
+        rows = self.execute_sql(
+            "SELECT * FROM conversations WHERE id=?", (id,)
+        )
+        if not rows:
+            return None
+        r = rows[0]
+        conv = Conversation(
+            id=r["id"],
+            created_at=_parse_dt(r["created_at"]),
+            updated_at=_parse_dt(r["updated_at"]),
+            title=r["title"],
+            source=r["source"],
+            model=r["model"],
+            summary=r["summary"],
+            message_count=r["message_count"],
+            starred_at=_parse_dt(r["starred_at"]),
+            pinned_at=_parse_dt(r["pinned_at"]),
+            archived_at=_parse_dt(r["archived_at"]),
+            sensitive=bool(r["sensitive"]),
+            metadata=json.loads(r["metadata"]) if r["metadata"] else {},
+        )
+        conv.tags = [
+            t["tag"]
+            for t in self.execute_sql(
+                "SELECT tag FROM tags WHERE conversation_id=?", (id,)
+            )
+        ]
+        for mr in self.execute_sql(
+            "SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at",
+            (id,),
+        ):
+            conv.add_message(
+                Message(
+                    id=mr["id"],
+                    role=mr["role"],
+                    content=json.loads(mr["content"]) if mr["content"] else [],
+                    parent_id=mr["parent_id"],
+                    model=mr["model"],
+                    created_at=_parse_dt(mr["created_at"]),
+                    sensitive=bool(mr["sensitive"]),
+                    metadata=(
+                        json.loads(mr["metadata"]) if mr["metadata"] else {}
+                    ),
+                )
+            )
+        return conv
