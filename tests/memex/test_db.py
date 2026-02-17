@@ -323,3 +323,74 @@ class TestAppend:
             ),
         )
         assert len(db.query_conversations(query="unique_xyz_term")["items"]) == 1
+
+
+class TestStatistics:
+    def test_stats(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        s = db.get_statistics()
+        assert s["total_conversations"] == 5 and s["total_messages"] == 10
+        assert "openai" in s["sources"] and "anthropic" in s["sources"]
+
+    def test_stats_empty(self, tmp_db_path):
+        s = Database(tmp_db_path).get_statistics()
+        assert s["total_conversations"] == 0
+
+
+class TestPaths:
+    def test_list_paths(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        now = datetime.now()
+        conv = Conversation(id="c1", created_at=now, updated_at=now)
+        conv.add_message(
+            Message(id="m1", role="user", content=[text_block("q")])
+        )
+        conv.add_message(
+            Message(
+                id="m2a", role="assistant",
+                content=[text_block("a1")], parent_id="m1",
+            )
+        )
+        conv.add_message(
+            Message(
+                id="m2b", role="assistant",
+                content=[text_block("a2")], parent_id="m1",
+            )
+        )
+        db.save_conversation(conv)
+        paths = db.list_paths("c1")
+        assert len(paths) == 2 and paths[0]["index"] == 0
+
+    def test_get_path_messages(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        msgs = db.get_path_messages("c1", path_index=0)
+        assert len(msgs) == 2 and msgs[0]["role"] == "user"
+
+    def test_get_path_by_leaf(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        msgs = db.get_path_messages("c1", leaf_message_id="m2")
+        assert len(msgs) == 2
+
+    def test_get_path_offset_limit(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        now = datetime.now()
+        conv = Conversation(id="c1", created_at=now, updated_at=now)
+        for i in range(1, 6):
+            conv.add_message(
+                Message(
+                    id=f"m{i}",
+                    role="user" if i % 2 else "assistant",
+                    content=[text_block(f"msg{i}")],
+                    parent_id=f"m{i-1}" if i > 1 else None,
+                )
+            )
+        db.save_conversation(conv)
+        msgs = db.get_path_messages("c1", path_index=0, offset=1, limit=2)
+        assert len(msgs) == 2 and msgs[0]["id"] == "m2"
+
+    def test_list_paths_not_found(self, tmp_db_path):
+        with pytest.raises(ValueError):
+            Database(tmp_db_path).list_paths("nope")

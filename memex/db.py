@@ -419,3 +419,104 @@ class Database:
             (conversation_id, now, conversation_id),
         )
         self.conn.commit()
+
+    def get_statistics(self):
+        tc = self.execute_sql(
+            "SELECT COUNT(*) as n FROM conversations"
+        )[0]["n"]
+        tm = self.execute_sql(
+            "SELECT COUNT(*) as n FROM messages"
+        )[0]["n"]
+        sources = {
+            r["source"]: r["n"]
+            for r in self.execute_sql(
+                "SELECT source,COUNT(*) as n FROM conversations "
+                "WHERE source IS NOT NULL GROUP BY source"
+            )
+        }
+        models = {
+            r["model"]: r["n"]
+            for r in self.execute_sql(
+                "SELECT model,COUNT(*) as n FROM conversations "
+                "WHERE model IS NOT NULL GROUP BY model"
+            )
+        }
+        tags = {
+            r["tag"]: r["n"]
+            for r in self.execute_sql(
+                "SELECT tag,COUNT(*) as n FROM tags GROUP BY tag"
+            )
+        }
+        return {
+            "total_conversations": tc,
+            "total_messages": tm,
+            "sources": sources,
+            "models": models,
+            "tags": tags,
+        }
+
+    def list_paths(self, conversation_id):
+        conv = self.load_conversation(conversation_id)
+        if conv is None:
+            raise ValueError(f"Conversation not found: {conversation_id}")
+        result = []
+        for i, path in enumerate(conv.get_all_paths()):
+            first = path[0] if path else None
+            last = path[-1] if path else None
+            result.append({
+                "index": i,
+                "message_count": len(path),
+                "first_message": {
+                    "id": first.id,
+                    "role": first.role,
+                    "preview": first.get_text()[:100],
+                } if first else None,
+                "last_message": {
+                    "id": last.id,
+                    "role": last.role,
+                    "preview": last.get_text()[:100],
+                } if last else None,
+                "leaf_id": last.id if last else None,
+            })
+        return result
+
+    def get_path_messages(
+        self,
+        conversation_id,
+        path_index=None,
+        leaf_message_id=None,
+        offset=0,
+        limit=None,
+    ):
+        conv = self.load_conversation(conversation_id)
+        if conv is None:
+            raise ValueError(f"Conversation not found: {conversation_id}")
+        if leaf_message_id:
+            path = conv.get_path(leaf_message_id)
+            if path is None:
+                raise ValueError(f"Message not found: {leaf_message_id}")
+        elif path_index is not None:
+            all_paths = conv.get_all_paths()
+            if path_index < 0 or path_index >= len(all_paths):
+                raise ValueError(f"Path index out of range: {path_index}")
+            path = all_paths[path_index]
+        else:
+            all_paths = conv.get_all_paths()
+            path = all_paths[0] if all_paths else []
+        if offset:
+            path = path[offset:]
+        if limit is not None:
+            path = path[:limit]
+        return [
+            {
+                "id": m.id,
+                "role": m.role,
+                "content": m.content,
+                "parent_id": m.parent_id,
+                "model": m.model,
+                "created_at": _fmt_dt(m.created_at),
+                "sensitive": m.sensitive,
+                "metadata": m.metadata,
+            }
+            for m in path
+        ]
