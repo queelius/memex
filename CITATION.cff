@@ -5,6 +5,7 @@ type: software
 version: 0.1.0
 date-released: "2026-02-17"
 license: MIT
+url: "https://metafunctor.com"
 repository-code: "https://github.com/queelius/memex"
 abstract: >-
   MCP-first personal conversation knowledge base for managing,
@@ -22,5 +23,8 @@ keywords:
 authors:
   - family-names: Towell
     given-names: Alexander
+    name-particle: Richard
+    alias: queelius
     email: lex@metafunctor.com
     orcid: "https://orcid.org/0000-0001-6443-9897"
+    website: "https://metafunctor.com"
