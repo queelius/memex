@@ -24,7 +24,7 @@ memex export output.json --format json
 
 **MCP server** (for Claude Desktop, etc.):
 ```bash
-memex serve
+memex mcp
 ```
 
 ## Supported Formats

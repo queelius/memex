@@ -37,16 +37,16 @@ def main():
         default=os.environ.get("MEMEX_DATABASE_PATH", "~/.memex/default"),
     )
 
-    # serve
-    sub.add_parser("serve", help="Start MCP server")
+    # mcp
+    sub.add_parser("mcp", help="Start MCP server")
 
     args = parser.parse_args()
     if args.command == "import":
         _cmd_import(args)
     elif args.command == "export":
         _cmd_export(args)
-    elif args.command == "serve":
-        _cmd_serve(args)
+    elif args.command == "mcp":
+        _cmd_mcp(args)
     else:
         parser.print_help()
 
@@ -153,10 +153,10 @@ def _find_exporter(format_name):
     return None
 
 
-def _cmd_serve(args):
-    from memex.server import main as serve_main
+def _cmd_mcp(args):
+    from memex.mcp import main as mcp_main
 
-    serve_main()
+    mcp_main()
 
 
 if __name__ == "__main__":

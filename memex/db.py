@@ -228,6 +228,7 @@ class Database:
     def query_conversations(
         self,
         query=None,
+        title=None,
         starred=None,
         pinned=None,
         archived=None,
@@ -250,6 +251,14 @@ class Database:
                 f"c.id IN ({','.join('?' for _ in fts_ids)})"
             )
             params.extend(fts_ids)
+        if title:
+            escaped = (
+                title.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            conds.append("c.title LIKE ? ESCAPE '\\'")
+            params.append(f"%{escaped}%")
         if starred is True:
             conds.append("c.starred_at IS NOT NULL")
         elif starred is False:
@@ -295,7 +304,9 @@ class Database:
         rows = self.execute_sql(
             f"SELECT c.id,c.title,c.source,c.model,c.message_count,"
             f"c.created_at,c.updated_at,c.starred_at,c.pinned_at,"
-            f"c.archived_at,c.sensitive,c.summary "
+            f"c.archived_at,c.sensitive,c.summary,"
+            f"(SELECT GROUP_CONCAT(t.tag) FROM tags t"
+            f" WHERE t.conversation_id=c.id) as tags_csv "
             f"FROM conversations c WHERE {where} "
             f"ORDER BY c.updated_at DESC,c.id DESC LIMIT ?",
             tuple(params),
@@ -338,6 +349,132 @@ class Database:
                 (f"%{escaped}%",),
             )
         return [r["conversation_id"] for r in rows]
+
+    def search_messages(
+        self,
+        query: str,
+        mode: str = "fts",
+        conversation_id: str | None = None,
+        role: str | None = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Search within message content. Returns message-level results with conversation metadata.
+
+        Modes:
+            fts: FTS5 MATCH (token OR, porter stemming)
+            phrase: exact substring via LIKE (escapes wildcards)
+            like: raw LIKE pattern (caller provides wildcards)
+        """
+        conds: List[str] = []
+        params: List[Any] = []
+
+        if mode == "fts":
+            # Use FTS5 to find matching (conversation_id, message_id) pairs
+            sanitized = query.replace('"', "").replace("'", "")
+            tokens = sanitized.split()
+            if not tokens:
+                return []
+            fts_q = " OR ".join(f'"{t}"' for t in tokens if t)
+            if not fts_q:
+                return []
+            # Join FTS results with messages table
+            join_clause = (
+                "INNER JOIN messages_fts f "
+                "ON m.conversation_id=f.conversation_id AND m.id=f.message_id"
+            )
+            conds.append("f.messages_fts MATCH ?")
+            params.append(fts_q)
+        elif mode == "phrase":
+            join_clause = ""
+            escaped = (
+                query.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            conds.append("m.content LIKE ? ESCAPE '\\'")
+            params.append(f"%{escaped}%")
+        elif mode == "like":
+            join_clause = ""
+            conds.append("m.content LIKE ?")
+            params.append(query)
+        else:
+            raise ValueError(f"Invalid search mode: {mode}")
+
+        if conversation_id:
+            conds.append("m.conversation_id=?")
+            params.append(conversation_id)
+        if role:
+            conds.append("m.role=?")
+            params.append(role)
+
+        where = " AND ".join(conds) if conds else "1=1"
+        params.append(limit)
+
+        try:
+            rows = self.execute_sql(
+                f"SELECT m.conversation_id, m.id as message_id, m.role,"
+                f" m.content, m.parent_id, m.model, m.created_at,"
+                f" c.title as conversation_title "
+                f"FROM messages m "
+                f"{join_clause + ' ' if join_clause else ''}"
+                f"INNER JOIN conversations c ON m.conversation_id=c.id "
+                f"WHERE {where} "
+                f"LIMIT ?",
+                tuple(params),
+            )
+        except sqlite3.OperationalError:
+            return []
+
+        return rows
+
+    def get_context_messages(
+        self, conversation_id: str, message_id: str, context: int = 1,
+    ) -> List[Dict[str, Any]]:
+        """Get surrounding messages for a matched message by walking the tree."""
+        # Walk up to find ancestors
+        ancestors: List[str] = []
+        current_id = message_id
+        for _ in range(context):
+            rows = self.execute_sql(
+                "SELECT parent_id FROM messages "
+                "WHERE conversation_id=? AND id=?",
+                (conversation_id, current_id),
+            )
+            if not rows or rows[0]["parent_id"] is None:
+                break
+            current_id = rows[0]["parent_id"]
+            ancestors.append(current_id)
+        ancestors.reverse()
+
+        # Walk down to find descendants (BFS by depth)
+        descendants: List[str] = []
+        frontier = [message_id]
+        for _ in range(context):
+            if not frontier:
+                break
+            placeholders = ",".join("?" for _ in frontier)
+            rows = self.execute_sql(
+                f"SELECT id FROM messages "
+                f"WHERE conversation_id=? AND parent_id IN ({placeholders}) "
+                f"ORDER BY created_at",
+                (conversation_id, *frontier),
+            )
+            next_frontier = [r["id"] for r in rows]
+            descendants.extend(next_frontier)
+            frontier = next_frontier
+
+        # Fetch all messages in order
+        all_ids = ancestors + [message_id] + descendants
+        if not all_ids:
+            return []
+        placeholders = ",".join("?" for _ in all_ids)
+        rows = self.execute_sql(
+            f"SELECT id, role, content, parent_id, model, created_at "
+            f"FROM messages WHERE conversation_id=? "
+            f"AND id IN ({placeholders}) ORDER BY created_at",
+            (conversation_id, *all_ids),
+        )
+        return rows
 
     def update_conversation(
         self,

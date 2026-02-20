@@ -1,4 +1,4 @@
-"""Tests for memex CLI: import, export, serve, version."""
+"""Tests for memex CLI: import, export, mcp, version."""
 import json
 import subprocess
 import sys

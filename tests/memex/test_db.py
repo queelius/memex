@@ -508,3 +508,198 @@ class TestTransactionRollback:
         # Original message should be unchanged
         conv = db.load_conversation("c1")
         assert conv.messages["m1"].get_text() == "hello"
+
+
+class TestQueryTitle:
+    """Tests for query_conversations title filter."""
+
+    def test_title_filter(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        r = db.query_conversations(title="Chat 3")
+        assert len(r["items"]) == 1
+        assert r["items"][0]["id"] == "c3"
+
+    def test_title_substring(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        r = db.query_conversations(title="Chat")
+        assert len(r["items"]) == 5
+
+    def test_title_no_match(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        r = db.query_conversations(title="nonexistent")
+        assert len(r["items"]) == 0
+
+    def test_title_with_wildcards_escaped(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        now = datetime.now()
+        conv = Conversation(
+            id="w1", created_at=now, updated_at=now,
+            title="100% done",
+        )
+        conv.add_message(Message(id="m1", role="user", content=[text_block("hi")]))
+        db.save_conversation(conv)
+        r = db.query_conversations(title="100%")
+        assert len(r["items"]) == 1
+        # Make sure plain "100" doesn't match via unescaped %
+        r2 = db.query_conversations(title="100% d")
+        assert len(r2["items"]) == 1
+
+    def test_title_combined_with_source(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        r = db.query_conversations(title="Chat", source="anthropic")
+        assert len(r["items"]) == 2
+        for item in r["items"]:
+            assert item["id"] in ("c4", "c5")
+
+
+class TestTagsInQueryResults:
+    """Tests for tags_csv in query_conversations results."""
+
+    def test_tags_csv_present(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        r = db.query_conversations()
+        for item in r["items"]:
+            assert "tags_csv" in item
+
+    def test_tags_csv_values(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        r = db.query_conversations()
+        # c2 has tag "python", c1 has tag "rust"
+        items_by_id = {i["id"]: i for i in r["items"]}
+        assert items_by_id["c2"]["tags_csv"] == "python"
+        assert items_by_id["c1"]["tags_csv"] == "rust"
+
+    def test_tags_csv_none_when_no_tags(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        now = datetime.now()
+        conv = Conversation(
+            id="notags", created_at=now, updated_at=now, title="No Tags",
+        )
+        conv.add_message(Message(id="m1", role="user", content=[text_block("hi")]))
+        db.save_conversation(conv)
+        r = db.query_conversations()
+        items_by_id = {i["id"]: i for i in r["items"]}
+        assert items_by_id["notags"]["tags_csv"] is None
+
+
+class TestSearchMessages:
+    """Tests for the new search_messages method."""
+
+    def test_fts_search(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        results = db.search_messages("topic")
+        assert len(results) >= 1
+        assert all("message_id" in r for r in results)
+        assert all("conversation_title" in r for r in results)
+
+    def test_fts_no_results(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        results = db.search_messages("zzz_nonexistent_zzz")
+        assert len(results) == 0
+
+    def test_phrase_search(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        results = db.search_messages("topic 3", mode="phrase")
+        assert len(results) >= 1
+        # Check the content contains the exact phrase
+        found = False
+        for r in results:
+            if "topic 3" in r["content"]:
+                found = True
+        assert found
+
+    def test_like_search(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        results = db.search_messages("%topic%", mode="like")
+        assert len(results) >= 1
+
+    def test_filter_by_conversation_id(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        results = db.search_messages("topic", conversation_id="c1")
+        assert all(r["conversation_id"] == "c1" for r in results)
+
+    def test_filter_by_role(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        results = db.search_messages("answer", role="assistant")
+        assert len(results) >= 1
+        assert all(r["role"] == "assistant" for r in results)
+
+    def test_limit(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        results = db.search_messages("topic", limit=2)
+        assert len(results) <= 2
+
+    def test_invalid_mode(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        with pytest.raises(ValueError, match="Invalid search mode"):
+            db.search_messages("test", mode="invalid")
+
+    def test_empty_fts_query(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        results = db.search_messages('""', mode="fts")
+        assert results == []
+
+    def test_returns_conversation_title(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        results = db.search_messages("topic 1")
+        matching = [r for r in results if r["conversation_id"] == "c1"]
+        assert len(matching) >= 1
+        assert matching[0]["conversation_title"] == "Chat 1"
+
+
+class TestContextMessages:
+    """Tests for get_context_messages."""
+
+    def test_context_messages(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        now = datetime.now()
+        conv = Conversation(id="c1", created_at=now, updated_at=now)
+        for i in range(1, 6):
+            conv.add_message(
+                Message(
+                    id=f"m{i}",
+                    role="user" if i % 2 else "assistant",
+                    content=[text_block(f"msg{i}")],
+                    parent_id=f"m{i-1}" if i > 1 else None,
+                    created_at=datetime(2024, 1, 1, 0, i),
+                )
+            )
+        db.save_conversation(conv)
+        # Get context around m3 with 1 message of context
+        ctx = db.get_context_messages("c1", "m3", context=1)
+        ids = [r["id"] for r in ctx]
+        assert "m2" in ids  # parent
+        assert "m3" in ids  # match
+        assert "m4" in ids  # child
+
+    def test_context_at_root(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        ctx = db.get_context_messages("c1", "m1", context=1)
+        ids = [r["id"] for r in ctx]
+        assert "m1" in ids
+        assert "m2" in ids  # child
+
+    def test_context_at_leaf(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        ctx = db.get_context_messages("c1", "m2", context=1)
+        ids = [r["id"] for r in ctx]
+        assert "m1" in ids  # parent
+        assert "m2" in ids

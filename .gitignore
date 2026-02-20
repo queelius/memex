@@ -27,9 +27,10 @@ env/
 ENV/
 .venv
 
-# IDE
+# IDE / tools
 .vscode/
 .idea/
+.serena/
 *.swp
 *.swo
 .DS_Store

@@ -23,8 +23,8 @@ memex/
   models.py            # ContentBlock, Message, Conversation (tree)
   db.py                # Database (raw sqlite3, WAL, FTS5)
   config.py            # YAML config, DatabaseRegistry
-  server.py            # FastMCP server (7 tools, 3 resources)
-  cli.py               # argparse CLI (import, export, serve)
+  mcp.py               # FastMCP server (6 tools, 2 resources)
+  cli.py               # argparse CLI (import, export, mcp)
   importers/           # Convention-based: detect() + import_file()
     openai.py
     anthropic.py
@@ -41,6 +41,19 @@ memex/
 - Convention-based plugins: modules with detect()/import_file() or export()
 - FastMCP 2.x with lifespan pattern for DB lifecycle
 - Cursor-based keyset pagination (base64-encoded updated_at + id)
+
+## MCP Tools
+
+| Tool | Purpose |
+|---|---|
+| `query_conversations` | Search/list conversations (FTS, title, filters, tags inline, optional path summaries) |
+| `get_conversation` | One tool for metadata, messages, or export (3 modes based on parameters) |
+| `search_messages` | Message-level search with fts/phrase/like modes and context snippets |
+| `update_conversations` | Bulk update 1..N conversations, returns updated state |
+| `append_message` | Add message, returns created message + updated conversation metadata |
+| `execute_sql` | Read-only SQL escape hatch (PRAGMA query_only enforced) |
+
+**Resources:** `memex://schema` (DDL for execute_sql users), `memex://databases` (multi-db discovery)
 
 ## Database
 
