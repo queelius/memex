@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from memex.models import Conversation, Message
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS conversations (
@@ -39,6 +39,25 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS enrichments (
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    type TEXT NOT NULL,
+    value TEXT NOT NULL,
+    source TEXT NOT NULL,
+    confidence REAL,
+    created_at DATETIME NOT NULL,
+    PRIMARY KEY (conversation_id, type, value)
+);
+CREATE TABLE IF NOT EXISTS provenance (
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    source_type TEXT NOT NULL,
+    source_file TEXT,
+    source_id TEXT,
+    source_hash TEXT,
+    imported_at DATETIME NOT NULL,
+    importer_version TEXT,
+    PRIMARY KEY (conversation_id, source_type)
+);
 CREATE INDEX IF NOT EXISTS idx_conversations_source ON conversations(source);
 CREATE INDEX IF NOT EXISTS idx_conversations_model ON conversations(model);
 CREATE INDEX IF NOT EXISTS idx_conversations_created ON conversations(created_at);
@@ -48,9 +67,49 @@ CREATE INDEX IF NOT EXISTS idx_conversations_pinned ON conversations(pinned_at) 
 CREATE INDEX IF NOT EXISTS idx_conversations_archived ON conversations(archived_at) WHERE archived_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(conversation_id, parent_id);
 CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);
+CREATE INDEX IF NOT EXISTS idx_enrichments_type ON enrichments(type);
+CREATE INDEX IF NOT EXISTS idx_enrichments_source ON enrichments(source);
 """
 
-MIGRATIONS: Dict[int, callable] = {}  # {from_version: migration_fn(conn)}
+
+def _migrate_to_v2(conn):
+    """Add enrichments and provenance tables, backfill provenance from conversations.source."""
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS enrichments (
+            conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            type TEXT NOT NULL,
+            value TEXT NOT NULL,
+            source TEXT NOT NULL,
+            confidence REAL,
+            created_at DATETIME NOT NULL,
+            PRIMARY KEY (conversation_id, type, value)
+        );
+        CREATE TABLE IF NOT EXISTS provenance (
+            conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            source_type TEXT NOT NULL,
+            source_file TEXT,
+            source_id TEXT,
+            source_hash TEXT,
+            imported_at DATETIME NOT NULL,
+            importer_version TEXT,
+            PRIMARY KEY (conversation_id, source_type)
+        );
+        CREATE INDEX IF NOT EXISTS idx_enrichments_type ON enrichments(type);
+        CREATE INDEX IF NOT EXISTS idx_enrichments_source ON enrichments(source);
+    """)
+    # Backfill provenance from conversations.source
+    conn.execute(
+        "INSERT OR IGNORE INTO provenance "
+        "(conversation_id, source_type, imported_at) "
+        "SELECT id, source, created_at FROM conversations "
+        "WHERE source IS NOT NULL"
+    )
+    conn.commit()
+
+
+MIGRATIONS: Dict[int, callable] = {
+    1: _migrate_to_v2,
+}
 
 
 def _dict_factory(cursor, row):
@@ -641,6 +700,155 @@ class Database:
         except Exception:
             self.conn.rollback()
             raise
+
+    # ── Enrichments ──────────────────────────────────────────────
+
+    def save_enrichment(
+        self,
+        conversation_id: str,
+        type: str,
+        value: str,
+        source: str,
+        confidence: float | None = None,
+    ) -> None:
+        now = _fmt_dt(datetime.now())
+        try:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO enrichments "
+                "(conversation_id,type,value,source,confidence,created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (conversation_id, type, value, source, confidence, now),
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def save_enrichments(
+        self, conversation_id: str, enrichments: List[Dict[str, Any]]
+    ) -> None:
+        now = _fmt_dt(datetime.now())
+        try:
+            for e in enrichments:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO enrichments "
+                    "(conversation_id,type,value,source,confidence,created_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (
+                        conversation_id,
+                        e["type"],
+                        e["value"],
+                        e["source"],
+                        e.get("confidence"),
+                        now,
+                    ),
+                )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def get_enrichments(self, conversation_id: str) -> List[Dict[str, Any]]:
+        return self.execute_sql(
+            "SELECT type,value,source,confidence,created_at "
+            "FROM enrichments WHERE conversation_id=? "
+            "ORDER BY type,value",
+            (conversation_id,),
+        )
+
+    def query_enrichments(
+        self,
+        type: str | None = None,
+        value: str | None = None,
+        source: str | None = None,
+        conversation_id: str | None = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        conds: List[str] = []
+        params: List[Any] = []
+        if type:
+            conds.append("e.type=?")
+            params.append(type)
+        if value:
+            escaped = (
+                value.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            conds.append("e.value LIKE ? ESCAPE '\\'")
+            params.append(f"%{escaped}%")
+        if source:
+            conds.append("e.source=?")
+            params.append(source)
+        if conversation_id:
+            conds.append("e.conversation_id=?")
+            params.append(conversation_id)
+        where = " AND ".join(conds) if conds else "1=1"
+        params.append(limit)
+        return self.execute_sql(
+            f"SELECT e.conversation_id,e.type,e.value,e.source,"
+            f"e.confidence,e.created_at,"
+            f"c.title as conversation_title "
+            f"FROM enrichments e "
+            f"INNER JOIN conversations c ON e.conversation_id=c.id "
+            f"WHERE {where} "
+            f"ORDER BY e.created_at DESC LIMIT ?",
+            tuple(params),
+        )
+
+    def delete_enrichment(
+        self, conversation_id: str, type: str, value: str
+    ) -> bool:
+        try:
+            cursor = self.conn.execute(
+                "DELETE FROM enrichments "
+                "WHERE conversation_id=? AND type=? AND value=?",
+                (conversation_id, type, value),
+            )
+            self.conn.commit()
+            return cursor.rowcount > 0
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    # ── Provenance ──────────────────────────────────────────────
+
+    def save_provenance(
+        self,
+        conversation_id: str,
+        source_type: str,
+        imported_at: str | None = None,
+        source_file: str | None = None,
+        source_id: str | None = None,
+        source_hash: str | None = None,
+        importer_version: str | None = None,
+    ) -> None:
+        now = imported_at or _fmt_dt(datetime.now())
+        try:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO provenance "
+                "(conversation_id,source_type,source_file,source_id,"
+                "source_hash,imported_at,importer_version) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (
+                    conversation_id, source_type, source_file,
+                    source_id, source_hash, now, importer_version,
+                ),
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def get_provenance(self, conversation_id: str) -> List[Dict[str, Any]]:
+        return self.execute_sql(
+            "SELECT source_type,source_file,source_id,source_hash,"
+            "imported_at,importer_version "
+            "FROM provenance WHERE conversation_id=?",
+            (conversation_id,),
+        )
+
+    # ── Statistics ──────────────────────────────────────────────
 
     def get_statistics(self):
         tc = self.execute_sql(

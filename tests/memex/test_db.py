@@ -751,3 +751,260 @@ class TestContextMessages:
         ids = [r["id"] for r in ctx]
         assert "m1" in ids  # parent
         assert "m2" in ids
+
+
+class TestEnrichments:
+    """Tests for enrichment CRUD methods."""
+
+    def test_save_and_get(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        db.save_enrichment("c1", "summary", "A test conversation", "claude", 0.9)
+        enrichments = db.get_enrichments("c1")
+        assert len(enrichments) == 1
+        assert enrichments[0]["type"] == "summary"
+        assert enrichments[0]["value"] == "A test conversation"
+        assert enrichments[0]["source"] == "claude"
+        assert enrichments[0]["confidence"] == 0.9
+
+    def test_save_batch(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        db.save_enrichments("c1", [
+            {"type": "topic", "value": "python", "source": "claude"},
+            {"type": "topic", "value": "testing", "source": "claude"},
+            {"type": "importance", "value": "high", "source": "heuristic", "confidence": 0.8},
+        ])
+        enrichments = db.get_enrichments("c1")
+        assert len(enrichments) == 3
+
+    def test_upsert(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        db.save_enrichment("c1", "summary", "old", "claude")
+        db.save_enrichment("c1", "summary", "old", "user")  # same PK, different source
+        enrichments = db.get_enrichments("c1")
+        assert len(enrichments) == 1
+        assert enrichments[0]["source"] == "user"
+
+    def test_null_confidence(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        db.save_enrichment("c1", "topic", "greeting", "heuristic")
+        e = db.get_enrichments("c1")
+        assert e[0]["confidence"] is None
+
+    def test_delete(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        db.save_enrichment("c1", "topic", "python", "claude")
+        assert db.delete_enrichment("c1", "topic", "python") is True
+        assert db.get_enrichments("c1") == []
+
+    def test_delete_nonexistent(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        assert db.delete_enrichment("c1", "topic", "nope") is False
+
+    def test_cascade_on_conversation_delete(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        db.save_enrichment("c1", "topic", "python", "claude")
+        # Re-saving triggers INSERT OR REPLACE → CASCADE deletes enrichments
+        db.save_conversation(_make_conv())
+        assert db.get_enrichments("c1") == []
+
+    def test_query_by_type(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        db.save_enrichment("c1", "topic", "python", "claude")
+        db.save_enrichment("c1", "summary", "A chat", "claude")
+        db.save_enrichment("c2", "topic", "rust", "claude")
+        results = db.query_enrichments(type="topic")
+        assert len(results) == 2
+        assert all(r["type"] == "topic" for r in results)
+
+    def test_query_by_value(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        db.save_enrichment("c1", "topic", "python programming", "claude")
+        db.save_enrichment("c2", "topic", "rust systems", "claude")
+        results = db.query_enrichments(value="python")
+        assert len(results) == 1
+        assert results[0]["conversation_id"] == "c1"
+
+    def test_query_by_source(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        db.save_enrichment("c1", "topic", "python", "claude")
+        db.save_enrichment("c2", "topic", "rust", "user")
+        results = db.query_enrichments(source="user")
+        assert len(results) == 1
+
+    def test_query_by_conversation_id(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        db.save_enrichment("c1", "topic", "python", "claude")
+        db.save_enrichment("c2", "topic", "rust", "claude")
+        results = db.query_enrichments(conversation_id="c1")
+        assert len(results) == 1
+        assert results[0]["conversation_id"] == "c1"
+
+    def test_query_includes_title(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        _populate_db(db)
+        db.save_enrichment("c1", "topic", "python", "claude")
+        results = db.query_enrichments(type="topic")
+        assert results[0]["conversation_title"] == "Chat 1"
+
+
+class TestProvenance:
+    """Tests for provenance CRUD methods."""
+
+    def test_save_and_get(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        db.save_provenance(
+            "c1", source_type="openai",
+            source_file="/data/export.json",
+            source_id="conv-abc",
+        )
+        prov = db.get_provenance("c1")
+        assert len(prov) == 1
+        assert prov[0]["source_type"] == "openai"
+        assert prov[0]["source_file"] == "/data/export.json"
+        assert prov[0]["source_id"] == "conv-abc"
+
+    def test_upsert(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        db.save_provenance("c1", source_type="openai", source_file="old.json")
+        db.save_provenance("c1", source_type="openai", source_file="new.json")
+        prov = db.get_provenance("c1")
+        assert len(prov) == 1
+        assert prov[0]["source_file"] == "new.json"
+
+    def test_multiple_sources(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        db.save_provenance("c1", source_type="openai")
+        db.save_provenance("c1", source_type="anthropic")
+        prov = db.get_provenance("c1")
+        assert len(prov) == 2
+
+    def test_cascade_on_conversation_delete(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        db.save_provenance("c1", source_type="openai")
+        db.save_conversation(_make_conv())  # CASCADE
+        assert db.get_provenance("c1") == []
+
+
+class TestMigrationV1toV2:
+    """Tests for v1→v2 migration (enrichments + provenance tables)."""
+
+    def test_migration_creates_tables(self, tmp_db_path):
+        """Simulate v1 DB and verify migration adds enrichments+provenance."""
+        import sqlite3 as _sqlite3
+        db_file = str(Path(tmp_db_path) / "conversations.db")
+        conn = _sqlite3.connect(db_file)
+        # Create v1 schema (no enrichments, no provenance)
+        conn.executescript("""
+            CREATE TABLE conversations (
+                id TEXT PRIMARY KEY, title TEXT, source TEXT, model TEXT,
+                summary TEXT, message_count INTEGER NOT NULL DEFAULT 0,
+                created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL,
+                starred_at DATETIME, pinned_at DATETIME, archived_at DATETIME,
+                sensitive BOOLEAN NOT NULL DEFAULT 0,
+                metadata JSON NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE messages (
+                conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                id TEXT NOT NULL, role TEXT NOT NULL, parent_id TEXT, model TEXT,
+                created_at DATETIME, sensitive BOOLEAN NOT NULL DEFAULT 0,
+                content JSON NOT NULL, metadata JSON NOT NULL DEFAULT '{}',
+                PRIMARY KEY (conversation_id, id)
+            );
+            CREATE TABLE tags (
+                conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                tag TEXT NOT NULL, PRIMARY KEY (conversation_id, tag)
+            );
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version (version) VALUES (1);
+            INSERT INTO conversations (id, source, created_at, updated_at, message_count, sensitive)
+            VALUES ('c1', 'openai', '2024-01-01', '2024-01-01', 0, 0);
+        """)
+        # FTS5 needs separate statement
+        conn.execute(
+            "CREATE VIRTUAL TABLE messages_fts USING fts5("
+            "conversation_id UNINDEXED, message_id UNINDEXED, text,"
+            "tokenize = 'porter unicode61')"
+        )
+        conn.commit()
+        conn.close()
+
+        # Open with Database — should run migration
+        db = Database(tmp_db_path)
+        tables = [r["name"] for r in db.execute_sql(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )]
+        assert "enrichments" in tables
+        assert "provenance" in tables
+        # Schema version should be 2 now
+        assert db.execute_sql("SELECT version FROM schema_version")[0]["version"] == 2
+
+    def test_migration_backfills_provenance(self, tmp_db_path):
+        """Source field from conversations should be backfilled into provenance."""
+        import sqlite3 as _sqlite3
+        db_file = str(Path(tmp_db_path) / "conversations.db")
+        conn = _sqlite3.connect(db_file)
+        conn.executescript("""
+            CREATE TABLE conversations (
+                id TEXT PRIMARY KEY, title TEXT, source TEXT, model TEXT,
+                summary TEXT, message_count INTEGER NOT NULL DEFAULT 0,
+                created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL,
+                starred_at DATETIME, pinned_at DATETIME, archived_at DATETIME,
+                sensitive BOOLEAN NOT NULL DEFAULT 0,
+                metadata JSON NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE messages (
+                conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                id TEXT NOT NULL, role TEXT NOT NULL, parent_id TEXT, model TEXT,
+                created_at DATETIME, sensitive BOOLEAN NOT NULL DEFAULT 0,
+                content JSON NOT NULL, metadata JSON NOT NULL DEFAULT '{}',
+                PRIMARY KEY (conversation_id, id)
+            );
+            CREATE TABLE tags (
+                conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                tag TEXT NOT NULL, PRIMARY KEY (conversation_id, tag)
+            );
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version (version) VALUES (1);
+            INSERT INTO conversations VALUES ('c1', 'Chat 1', 'openai', NULL, NULL, 0, '2024-01-01', '2024-01-01', NULL, NULL, NULL, 0, '{}');
+            INSERT INTO conversations VALUES ('c2', 'Chat 2', 'anthropic', NULL, NULL, 0, '2024-01-02', '2024-01-02', NULL, NULL, NULL, 0, '{}');
+        """)
+        conn.execute(
+            "CREATE VIRTUAL TABLE messages_fts USING fts5("
+            "conversation_id UNINDEXED, message_id UNINDEXED, text,"
+            "tokenize = 'porter unicode61')"
+        )
+        conn.commit()
+        conn.close()
+
+        db = Database(tmp_db_path)
+        p1 = db.get_provenance("c1")
+        assert len(p1) == 1
+        assert p1[0]["source_type"] == "openai"
+        p2 = db.get_provenance("c2")
+        assert len(p2) == 1
+        assert p2[0]["source_type"] == "anthropic"
+
+    def test_migration_idempotent(self, tmp_db_path):
+        """Opening the DB multiple times shouldn't fail or duplicate data."""
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        db.save_enrichment("c1", "topic", "test", "claude")
+        db.close()
+        db2 = Database(tmp_db_path)
+        assert len(db2.get_enrichments("c1")) == 1
+        assert db2.execute_sql("SELECT version FROM schema_version")[0]["version"] == 2
