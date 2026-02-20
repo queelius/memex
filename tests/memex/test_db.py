@@ -1,5 +1,6 @@
 import sqlite3
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 
@@ -69,6 +70,7 @@ class TestDatabaseSchema:
         schema = db.get_schema()
         assert "CREATE TABLE conversations" in schema
         assert "CREATE TABLE messages" in schema
+        assert "CREATE TABLE schema_version" in schema
 
     def test_memory_db(self):
         db = Database(":memory:")
@@ -80,6 +82,52 @@ class TestDatabaseSchema:
         db = Database(tmp_db_path)
         rows = db.execute_sql("SELECT 1 as a, 2 as b")
         assert rows == [{"a": 1, "b": 2}]
+
+
+class TestSchemaVersioning:
+    def test_fresh_db_has_current_version(self, tmp_db_path):
+        from memex.db import SCHEMA_VERSION
+        db = Database(tmp_db_path)
+        rows = db.execute_sql("SELECT version FROM schema_version")
+        assert len(rows) == 1
+        assert rows[0]["version"] == SCHEMA_VERSION
+
+    def test_reopen_db_no_duplicate_rows(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.close()
+        db2 = Database(tmp_db_path)
+        rows = db2.execute_sql("SELECT version FROM schema_version")
+        assert len(rows) == 1
+
+    def test_pre_existing_db_bootstraps_at_v1(self, tmp_db_path):
+        """A DB created without schema_version gets bootstrapped at v1."""
+        import sqlite3 as _sqlite3
+        from memex.db import SCHEMA_VERSION
+        # Manually create a pre-existing DB without schema_version
+        db_file = str(Path(tmp_db_path) / "conversations.db")
+        conn = _sqlite3.connect(db_file)
+        conn.execute(
+            "CREATE TABLE conversations ("
+            "id TEXT PRIMARY KEY, title TEXT, source TEXT, model TEXT, summary TEXT,"
+            "message_count INTEGER NOT NULL DEFAULT 0,"
+            "created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL,"
+            "starred_at DATETIME, pinned_at DATETIME, archived_at DATETIME,"
+            "sensitive BOOLEAN NOT NULL DEFAULT 0,"
+            "metadata JSON NOT NULL DEFAULT '{}'"
+            ")"
+        )
+        conn.commit()
+        conn.close()
+        # Now open with Database — should detect pre-existing and bootstrap
+        db = Database(tmp_db_path)
+        rows = db.execute_sql("SELECT version FROM schema_version")
+        assert len(rows) == 1
+        assert rows[0]["version"] == SCHEMA_VERSION
+
+    def test_schema_version_table_in_schema(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        schema = db.get_schema()
+        assert "schema_version" in schema
 
 
 class TestSaveLoad:

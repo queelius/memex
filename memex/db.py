@@ -10,6 +10,8 @@ from typing import Any, Dict, List, Optional
 
 from memex.models import Conversation, Message
 
+SCHEMA_VERSION = 1
+
 SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY, title TEXT, source TEXT, model TEXT, summary TEXT,
@@ -34,6 +36,9 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     conversation_id UNINDEXED, message_id UNINDEXED, text,
     tokenize = 'porter unicode61'
 );
+CREATE TABLE IF NOT EXISTS schema_version (
+    version INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_conversations_source ON conversations(source);
 CREATE INDEX IF NOT EXISTS idx_conversations_model ON conversations(model);
 CREATE INDEX IF NOT EXISTS idx_conversations_created ON conversations(created_at);
@@ -44,6 +49,8 @@ CREATE INDEX IF NOT EXISTS idx_conversations_archived ON conversations(archived_
 CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(conversation_id, parent_id);
 CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);
 """
+
+MIGRATIONS: Dict[int, callable] = {}  # {from_version: migration_fn(conn)}
 
 
 def _dict_factory(cursor, row):
@@ -97,7 +104,53 @@ class Database:
             self.conn.execute("PRAGMA query_only=ON")
 
     def _ensure_schema(self):
-        self.conn.executescript(SCHEMA_SQL)
+        # Check if this is a pre-existing DB (has conversations but no schema_version)
+        tables = {
+            r["name"]
+            for r in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        has_conversations = "conversations" in tables
+        has_version_table = "schema_version" in tables
+
+        if not has_conversations:
+            # Fresh DB: create all tables and set to current version
+            self.conn.executescript(SCHEMA_SQL)
+            self.conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?)",
+                (SCHEMA_VERSION,),
+            )
+            self.conn.commit()
+        elif not has_version_table:
+            # Pre-existing DB without versioning: bootstrap at v1
+            self.conn.executescript(SCHEMA_SQL)
+            self.conn.execute(
+                "INSERT INTO schema_version (version) VALUES (1)"
+            )
+            self.conn.commit()
+            self._apply_migrations()
+        else:
+            # DB with version table: apply any pending migrations
+            self._apply_migrations()
+
+    def _apply_migrations(self):
+        row = self.conn.execute(
+            "SELECT version FROM schema_version"
+        ).fetchone()
+        current = row["version"] if row else 1
+        while current < SCHEMA_VERSION:
+            migrate_fn = MIGRATIONS.get(current)
+            if migrate_fn is None:
+                raise RuntimeError(
+                    f"No migration from v{current} to v{current + 1}"
+                )
+            migrate_fn(self.conn)
+            current += 1
+            self.conn.execute(
+                "UPDATE schema_version SET version=?", (current,)
+            )
+            self.conn.commit()
 
     def __enter__(self):
         return self
