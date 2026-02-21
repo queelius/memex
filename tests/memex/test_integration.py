@@ -233,6 +233,76 @@ class TestDatabaseOperations:
         db.close()
 
 
+class TestClaudeCodeImportRoundtrip:
+    """Import Claude Code transcript → save to DB → search → verify FTS."""
+
+    def test_import_search_verify(self, tmp_path):
+        import json as _json
+        from memex.importers.claude_code import import_file
+
+        # Build a minimal Claude Code JSONL
+        events = [
+            {
+                "type": "user", "uuid": "u1", "parentUuid": None,
+                "sessionId": "int-test-sess", "slug": "integration-test-session",
+                "timestamp": "2026-02-18T10:00:00Z",
+                "userType": "external", "isSidechain": False,
+                "message": {"role": "user", "content": "Explain quicksort algorithm"},
+            },
+            {
+                "type": "assistant", "uuid": "a1", "parentUuid": "u1",
+                "sessionId": "int-test-sess", "slug": "integration-test-session",
+                "timestamp": "2026-02-18T10:00:01Z",
+                "userType": "external", "isSidechain": False,
+                "message": {
+                    "role": "assistant", "model": "claude-opus-4-6",
+                    "content": [{"type": "text",
+                                 "text": "Quicksort is a divide-and-conquer sorting algorithm."}],
+                },
+            },
+        ]
+        jsonl_file = tmp_path / "session.jsonl"
+        jsonl_file.write_text("\n".join(_json.dumps(e) for e in events))
+
+        # Import
+        convs = import_file(str(jsonl_file))
+        assert len(convs) == 1
+
+        # Save to DB
+        db = Database(str(tmp_path / "db"))
+        for conv in convs:
+            prov = conv.metadata.pop("_provenance", None)
+            db.save_conversation(conv)
+            if prov:
+                db.save_provenance(conv.id, **prov)
+
+        # Verify searchable via FTS
+        result = db.query_conversations(query="quicksort")
+        assert len(result["items"]) >= 1
+        assert result["items"][0]["id"] == "int-test-sess"
+
+        # Verify message-level search
+        msg_results = db.search_messages("divide-and-conquer")
+        assert len(msg_results) >= 1
+
+        # Load and verify structure
+        loaded = db.load_conversation("int-test-sess")
+        assert loaded is not None
+        assert loaded.title == "Integration Test Session"
+        assert loaded.source == "claude_code"
+        assert loaded.model == "claude-opus-4-6"
+        assert loaded.message_count == 2
+        assert "claude-code" in loaded.tags
+        assert loaded.metadata.get("importer_mode") == "conversation_only"
+
+        # Verify provenance
+        prov = db.get_provenance("int-test-sess")
+        assert len(prov) == 1
+        assert prov[0]["source_type"] == "claude_code"
+
+        db.close()
+
+
 class TestEnrichmentWorkflow:
     """Full enrichment workflow: create → enrich → query → filter → statistics."""
 

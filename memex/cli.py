@@ -37,12 +37,24 @@ def main():
         default=os.environ.get("MEMEX_DATABASE_PATH", "~/.memex/default"),
     )
 
+    # show
+    show = sub.add_parser("show", help="Display a conversation")
+    show.add_argument("id", nargs="?", help="Conversation ID (omit to list all)")
+    show.add_argument("--raw", action="store_true", help="(deprecated, now always prints markdown)")
+    show.add_argument(
+        "--db",
+        help="Database directory",
+        default=os.environ.get("MEMEX_DATABASE_PATH", "~/.memex/default"),
+    )
+
     # mcp
     sub.add_parser("mcp", help="Start MCP server")
 
     args = parser.parse_args()
     if args.command == "import":
         _cmd_import(args)
+    elif args.command == "show":
+        _cmd_show(args)
     elif args.command == "export":
         _cmd_export(args)
     elif args.command == "mcp":
@@ -122,6 +134,66 @@ def _auto_import(file_path, format_name=None):
                     return mod.import_file(file_path)
     print(f"Error: no importer found for {file_path}", file=sys.stderr)
     sys.exit(1)
+
+
+def _cmd_show(args):
+    from memex.db import Database
+
+    db_path = os.path.expanduser(args.db)
+    with Database(db_path, readonly=True) as db:
+        if args.id is None:
+            # List mode
+            cursor = None
+            while True:
+                result = db.query_conversations(limit=50, cursor=cursor)
+                for item in result["items"]:
+                    tags = f"  [{item['tags_csv']}]" if item.get("tags_csv") else ""
+                    print(f"{item['id']}  {item['message_count']:3d} msgs  {item['title'] or '(untitled)'}{tags}")
+                if not result["has_more"]:
+                    break
+                cursor = result["next_cursor"]
+            return
+
+        conv = db.load_conversation(args.id)
+        if conv is None:
+            print(f"Error: conversation '{args.id}' not found", file=sys.stderr)
+            sys.exit(1)
+
+        print(_render_conversation_md(conv))
+
+
+def _render_conversation_md(conv):
+    """Render a conversation as markdown text."""
+    lines = []
+    lines.append(f"# {conv.title or conv.id}")
+    lines.append("")
+    meta = []
+    if conv.source:
+        meta.append(f"**Source:** {conv.source}")
+    if conv.model:
+        meta.append(f"**Model:** {conv.model}")
+    if conv.tags:
+        meta.append(f"**Tags:** {', '.join(conv.tags)}")
+    if conv.message_count:
+        meta.append(f"**Messages:** {conv.message_count}")
+    if meta:
+        lines.append(" | ".join(meta))
+        lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    for i, path_msgs in enumerate(conv.get_all_paths()):
+        if i > 0:
+            lines.append("---")
+            lines.append("")
+        for msg in path_msgs:
+            text = msg.get_text()
+            lines.append(f"### {msg.role}")
+            lines.append("")
+            lines.append(text)
+            lines.append("")
+
+    return "\n".join(lines)
 
 
 def _cmd_export(args):

@@ -1,4 +1,4 @@
-"""Tests for memex importers: OpenAI, Anthropic, Gemini."""
+"""Tests for memex importers: OpenAI, Anthropic, Gemini, Claude Code."""
 import json
 
 from memex.importers.openai import detect as openai_detect
@@ -7,6 +7,8 @@ from memex.importers.anthropic import detect as anthropic_detect
 from memex.importers.anthropic import import_file as anthropic_import
 from memex.importers.gemini import detect as gemini_detect
 from memex.importers.gemini import import_file as gemini_import
+from memex.importers.claude_code import detect as claude_code_detect
+from memex.importers.claude_code import import_file as claude_code_import
 
 
 # ---------- OpenAI ----------
@@ -440,3 +442,253 @@ class TestGeminiImport:
         assert prov is not None
         assert prov["source_type"] == "gemini"
         assert prov["source_id"] == "conv1"
+
+
+# ---------- Claude Code ----------
+
+def _cc_event(event_type, uuid="u1", parent_uuid=None, session_id="sess-123",
+              slug="cool-testing-session", timestamp="2026-02-18T10:00:00Z",
+              user_type="external", is_sidechain=False, message=None, **extra):
+    """Helper to build a Claude Code JSONL event."""
+    rec = {
+        "type": event_type,
+        "uuid": uuid,
+        "parentUuid": parent_uuid,
+        "sessionId": session_id,
+        "slug": slug,
+        "timestamp": timestamp,
+        "userType": user_type,
+        "isSidechain": is_sidechain,
+    }
+    if message is not None:
+        rec["message"] = message
+    rec.update(extra)
+    return rec
+
+
+def _write_jsonl(path, events):
+    """Write events as JSONL file."""
+    path.write_text("\n".join(json.dumps(e) for e in events))
+
+
+class TestClaudeCodeDetect:
+    def test_detect_jsonl(self, tmp_path):
+        f = tmp_path / "session.jsonl"
+        _write_jsonl(f, [_cc_event("user")])
+        assert claude_code_detect(str(f)) is True
+
+    def test_detect_rejects_json(self, tmp_path):
+        f = tmp_path / "data.json"
+        f.write_text(json.dumps({"type": "user", "sessionId": "abc"}))
+        assert claude_code_detect(str(f)) is False
+
+    def test_detect_rejects_non_claude_jsonl(self, tmp_path):
+        f = tmp_path / "other.jsonl"
+        f.write_text(json.dumps({"foo": "bar", "type": "something_else"}))
+        assert claude_code_detect(str(f)) is False
+
+    def test_detect_nonexistent_file(self, tmp_path):
+        assert claude_code_detect(str(tmp_path / "nope.jsonl")) is False
+
+    def test_detect_invalid_json(self, tmp_path):
+        f = tmp_path / "bad.jsonl"
+        f.write_text("not json at all")
+        assert claude_code_detect(str(f)) is False
+
+
+class TestClaudeCodeImport:
+    def test_import_basic(self, tmp_path):
+        """Import a transcript with 2 user + 2 assistant messages."""
+        events = [
+            _cc_event("user", uuid="u1", timestamp="2026-02-18T10:00:00Z",
+                      message={"role": "user", "content": "Hello, help me with Python"}),
+            _cc_event("assistant", uuid="a1", parent_uuid="u1",
+                      timestamp="2026-02-18T10:00:01Z",
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [{"type": "text", "text": "Sure, I can help!"}]}),
+            _cc_event("user", uuid="u2", parent_uuid="a1",
+                      timestamp="2026-02-18T10:00:02Z",
+                      message={"role": "user", "content": "How do I sort a list?"}),
+            _cc_event("assistant", uuid="a2", parent_uuid="u2",
+                      timestamp="2026-02-18T10:00:03Z",
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [{"type": "text", "text": "Use sorted() or list.sort()"}]}),
+        ]
+        f = tmp_path / "session.jsonl"
+        _write_jsonl(f, events)
+        convs = claude_code_import(str(f))
+        assert len(convs) == 1
+        conv = convs[0]
+        assert conv.id == "sess-123"
+        assert conv.title == "Cool Testing Session"
+        assert conv.source == "claude_code"
+        assert conv.model == "claude-opus-4-6"
+        assert "claude-code" in conv.tags
+        assert len(conv.messages) == 4
+        assert conv.metadata["importer_mode"] == "conversation_only"
+
+        # Verify linear chain
+        msgs = list(conv.messages.values())
+        assert msgs[0].parent_id is None
+        assert msgs[1].parent_id == msgs[0].id
+        assert msgs[2].parent_id == msgs[1].id
+        assert msgs[3].parent_id == msgs[2].id
+
+    def test_import_skips_tool_use(self, tmp_path):
+        """Assistant messages with only tool_use (no text) are skipped."""
+        events = [
+            _cc_event("user", uuid="u1",
+                      message={"role": "user", "content": "Read my file"}),
+            _cc_event("assistant", uuid="a1", parent_uuid="u1",
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [{"type": "tool_use", "id": "tu1",
+                                            "name": "Read", "input": {"path": "a.py"}}]}),
+            _cc_event("assistant", uuid="a2", parent_uuid="a1",
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [{"type": "text", "text": "Here is your file."}]}),
+        ]
+        f = tmp_path / "session.jsonl"
+        _write_jsonl(f, events)
+        convs = claude_code_import(str(f))
+        assert len(convs[0].messages) == 2  # user + text assistant only
+
+    def test_import_skips_tool_results(self, tmp_path):
+        """User messages that are tool results (not external) are skipped."""
+        events = [
+            _cc_event("user", uuid="u1",
+                      message={"role": "user", "content": "Check something"}),
+            # Tool result: userType=internal
+            _cc_event("user", uuid="u2", parent_uuid="u1",
+                      user_type="internal",
+                      message={"role": "user", "content": [
+                          {"type": "tool_result", "tool_use_id": "tu1",
+                           "content": "file contents here"}
+                      ]}),
+            _cc_event("assistant", uuid="a1", parent_uuid="u2",
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [{"type": "text", "text": "Done!"}]}),
+        ]
+        f = tmp_path / "session.jsonl"
+        _write_jsonl(f, events)
+        convs = claude_code_import(str(f))
+        assert len(convs[0].messages) == 2  # external user + text assistant only
+
+    def test_import_skips_sidechain(self, tmp_path):
+        """Messages with isSidechain=true are skipped."""
+        events = [
+            _cc_event("user", uuid="u1",
+                      message={"role": "user", "content": "Hello"}),
+            _cc_event("assistant", uuid="a1", parent_uuid="u1",
+                      is_sidechain=True,
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [{"type": "text", "text": "Sidechain response"}]}),
+            _cc_event("assistant", uuid="a2", parent_uuid="u1",
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [{"type": "text", "text": "Main response"}]}),
+        ]
+        f = tmp_path / "session.jsonl"
+        _write_jsonl(f, events)
+        convs = claude_code_import(str(f))
+        msgs = list(convs[0].messages.values())
+        assert len(msgs) == 2
+        assert msgs[1].get_text() == "Main response"
+
+    def test_import_skips_progress_and_system(self, tmp_path):
+        """Non-message event types (progress, system, file-history-snapshot) are skipped."""
+        events = [
+            _cc_event("progress", uuid="p1", data={"type": "hook_progress"}),
+            _cc_event("system", uuid="s1", message={"role": "system", "content": "init"}),
+            _cc_event("file-history-snapshot", uuid="f1",
+                      snapshot={"trackedFileBackups": {}}),
+            _cc_event("user", uuid="u1",
+                      message={"role": "user", "content": "Hello"}),
+            _cc_event("assistant", uuid="a1", parent_uuid="u1",
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [{"type": "text", "text": "Hi!"}]}),
+        ]
+        f = tmp_path / "session.jsonl"
+        _write_jsonl(f, events)
+        convs = claude_code_import(str(f))
+        assert len(convs[0].messages) == 2
+
+    def test_import_extracts_model(self, tmp_path):
+        events = [
+            _cc_event("user", uuid="u1",
+                      message={"role": "user", "content": "Hi"}),
+            _cc_event("assistant", uuid="a1", parent_uuid="u1",
+                      message={"role": "assistant", "model": "claude-sonnet-4-6",
+                               "content": [{"type": "text", "text": "Hello!"}]}),
+        ]
+        f = tmp_path / "session.jsonl"
+        _write_jsonl(f, events)
+        convs = claude_code_import(str(f))
+        assert convs[0].model == "claude-sonnet-4-6"
+
+    def test_import_provenance_metadata(self, tmp_path):
+        events = [
+            _cc_event("user", uuid="u1",
+                      message={"role": "user", "content": "Hi"}),
+            _cc_event("assistant", uuid="a1", parent_uuid="u1",
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [{"type": "text", "text": "Hello!"}]}),
+        ]
+        f = tmp_path / "session.jsonl"
+        _write_jsonl(f, events)
+        convs = claude_code_import(str(f))
+        prov = convs[0].metadata.get("_provenance")
+        assert prov is not None
+        assert prov["source_type"] == "claude_code"
+        assert prov["source_id"] == "sess-123"
+        assert prov["source_file"] == str(f)
+
+    def test_import_empty_session(self, tmp_path):
+        """Session with only system/progress events returns empty list."""
+        events = [
+            _cc_event("progress", uuid="p1", data={"type": "hook_progress"}),
+            _cc_event("system", uuid="s1", message={"role": "system", "content": "init"}),
+        ]
+        f = tmp_path / "session.jsonl"
+        _write_jsonl(f, events)
+        convs = claude_code_import(str(f))
+        assert convs == []
+
+    def test_import_strips_thinking_blocks(self, tmp_path):
+        """Thinking blocks in assistant content are stripped."""
+        events = [
+            _cc_event("user", uuid="u1",
+                      message={"role": "user", "content": "Think about this"}),
+            _cc_event("assistant", uuid="a1", parent_uuid="u1",
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [
+                                   {"type": "thinking", "text": "Let me think..."},
+                                   {"type": "text", "text": "Here is my answer."},
+                               ]}),
+        ]
+        f = tmp_path / "session.jsonl"
+        _write_jsonl(f, events)
+        convs = claude_code_import(str(f))
+        msg = list(convs[0].messages.values())[1]
+        assert msg.get_text() == "Here is my answer."
+        assert len(msg.content) == 1  # Only text block, no thinking
+
+    def test_import_joins_multiple_text_blocks(self, tmp_path):
+        """Multiple text blocks in one assistant turn are joined."""
+        events = [
+            _cc_event("user", uuid="u1",
+                      message={"role": "user", "content": "Explain"}),
+            _cc_event("assistant", uuid="a1", parent_uuid="u1",
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [
+                                   {"type": "text", "text": "First part."},
+                                   {"type": "tool_use", "id": "tu1", "name": "Read",
+                                    "input": {"path": "a.py"}},
+                                   {"type": "text", "text": "Second part."},
+                               ]}),
+        ]
+        f = tmp_path / "session.jsonl"
+        _write_jsonl(f, events)
+        convs = claude_code_import(str(f))
+        msg = list(convs[0].messages.values())[1]
+        assert "First part." in msg.get_text()
+        assert "Second part." in msg.get_text()
+        assert len(msg.content) == 1  # Joined into single text block

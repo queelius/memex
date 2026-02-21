@@ -29,6 +29,7 @@ memex/
     openai.py
     anthropic.py
     gemini.py
+    claude_code.py     # Claude Code JSONL sessions (conversation_only mode)
   exporters/           # Convention-based: export()
     markdown.py
     json_export.py
@@ -73,7 +74,7 @@ memex/
 
 ## Testing
 
-- Tests in `tests/memex/` -- ~275 tests, 80%+ coverage
+- Tests in `tests/memex/` -- ~290 tests, 80%+ coverage
 - `conftest.py` provides `tmp_db_path` fixture
 - Server tests exercise DB methods directly (MCP protocol testing deferred)
 
@@ -88,3 +89,4 @@ memex/
 - Importers set `conv.metadata["_provenance"]` -- CLI pops it before save, writes to provenance table after (CASCADE-safe)
 - Enrichment types validated at MCP layer: summary, topic, importance, excerpt, note
 - Enrichment sources validated at MCP layer: user, claude, heuristic
+- Claude Code importer uses "conversation_only" mode (strips tool use, thinking, progress). Future `claude_code_full` importer can coexist for full-fidelity import
