@@ -231,3 +231,93 @@ class TestDatabaseOperations:
         assert len(not_archived["items"]) == 4
 
         db.close()
+
+
+class TestEnrichmentWorkflow:
+    """Full enrichment workflow: create → enrich → query → filter → statistics."""
+
+    def test_full_enrichment_workflow(self, tmp_db_path):
+        db = Database(tmp_db_path)
+
+        # 1. Create conversations
+        for i in range(3):
+            now = datetime(2024, 6, i + 1)
+            conv = Conversation(
+                id=f"conv{i}", created_at=now, updated_at=now,
+                title=f"Discussion {i}", source="openai",
+            )
+            conv.add_message(
+                Message(id="m1", role="user", content=[text_block(f"topic {i}")])
+            )
+            db.save_conversation(conv)
+
+        # 2. Enrich conversations
+        db.save_enrichments("conv0", [
+            {"type": "topic", "value": "python", "source": "claude"},
+            {"type": "importance", "value": "high", "source": "heuristic", "confidence": 0.9},
+            {"type": "summary", "value": "Discussion about Python", "source": "claude"},
+        ])
+        db.save_enrichments("conv1", [
+            {"type": "topic", "value": "rust", "source": "claude"},
+            {"type": "importance", "value": "trivial", "source": "heuristic", "confidence": 0.1},
+        ])
+        db.save_enrichment("conv2", "topic", "python", "claude")
+
+        # 3. Query enrichments
+        python_topics = db.query_enrichments(type="topic", value="python")
+        assert len(python_topics) == 2
+        assert {r["conversation_id"] for r in python_topics} == {"conv0", "conv2"}
+
+        # 4. Filter conversations by enrichment
+        high_importance = db.query_conversations(
+            enrichment_type="importance", enrichment_value="high",
+        )
+        assert len(high_importance["items"]) == 1
+        assert high_importance["items"][0]["id"] == "conv0"
+
+        # 5. Verify statistics
+        stats = db.get_statistics()
+        assert stats["enrichment_types"]["topic"] == 3
+        assert stats["enrichment_types"]["importance"] == 2
+        assert stats["enrichment_types"]["summary"] == 1
+        assert stats["provenance_tracked"] == 0  # No provenance saved yet
+
+        db.close()
+
+    def test_provenance_workflow(self, tmp_db_path):
+        from memex.mcp import _conv_metadata
+        db = Database(tmp_db_path)
+
+        # 1. Create and save a conversation with provenance
+        now = datetime(2024, 6, 1)
+        conv = Conversation(
+            id="conv1", created_at=now, updated_at=now,
+            title="Test", source="openai",
+        )
+        conv.add_message(
+            Message(id="m1", role="user", content=[text_block("hello")])
+        )
+        db.save_conversation(conv)
+        db.save_provenance(
+            "conv1", source_type="openai",
+            source_file="/data/export.json",
+            source_id="orig-id-123",
+        )
+
+        # 2. Verify provenance
+        prov = db.get_provenance("conv1")
+        assert len(prov) == 1
+        assert prov[0]["source_type"] == "openai"
+        assert prov[0]["source_id"] == "orig-id-123"
+
+        # 3. Verify in _conv_metadata
+        loaded = db.load_conversation("conv1")
+        meta = _conv_metadata(loaded, db)
+        assert len(meta["provenance"]) == 1
+        assert meta["provenance"][0]["source_type"] == "openai"
+
+        # 4. Verify statistics
+        stats = db.get_statistics()
+        assert stats["provenance_tracked"] == 1
+
+        db.close()

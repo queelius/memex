@@ -21,9 +21,9 @@ memex/
   __init__.py          # version
   __main__.py          # python -m memex
   models.py            # ContentBlock, Message, Conversation (tree)
-  db.py                # Database (raw sqlite3, WAL, FTS5)
+  db.py                # Database (raw sqlite3, WAL, FTS5, migrations)
   config.py            # YAML config, DatabaseRegistry
-  mcp.py               # FastMCP server (6 tools, 2 resources)
+  mcp.py               # FastMCP server (8 tools, 2 resources)
   cli.py               # argparse CLI (import, export, mcp)
   importers/           # Convention-based: detect() + import_file()
     openai.py
@@ -41,16 +41,21 @@ memex/
 - Convention-based plugins: modules with detect()/import_file() or export()
 - FastMCP 2.x with lifespan pattern for DB lifecycle
 - Cursor-based keyset pagination (base64-encoded updated_at + id)
+- Schema versioning: `schema_version` table + `MIGRATIONS` dict for forward migrations
+- Enrichments: structured metadata (summaries, topics, importance) with source tracking
+- Provenance: `_provenance` metadata convention in importers, persisted by CLI
 
 ## MCP Tools
 
 | Tool | Purpose |
 |---|---|
-| `query_conversations` | Search/list conversations (FTS, title, filters, tags inline, optional path summaries) |
+| `query_conversations` | Search/list conversations (FTS, title, filters, tags, enrichment filtering) |
 | `get_conversation` | One tool for metadata, messages, or export (3 modes based on parameters) |
 | `search_messages` | Message-level search with fts/phrase/like modes and context snippets |
 | `update_conversations` | Bulk update 1..N conversations, returns updated state |
 | `append_message` | Add message, returns created message + updated conversation metadata |
+| `enrich_conversation` | Add enrichments (summary/topic/importance/excerpt/note) with validation |
+| `query_enrichments` | Search enrichments by type, value, source, or conversation |
 | `execute_sql` | Read-only SQL escape hatch (PRAGMA query_only enforced) |
 
 **Resources:** `memex://schema` (DDL for execute_sql users), `memex://databases` (multi-db discovery)
@@ -60,12 +65,15 @@ memex/
 - Composite PK on messages: (conversation_id, id)
 - FTS5 virtual table (messages_fts) with porter unicode61 tokenizer
 - Tags in separate table with (conversation_id, tag) PK
+- Enrichments table: PK (conversation_id, type, value), types: summary|topic|importance|excerpt|note
+- Provenance table: PK (conversation_id, source_type), tracks import origin
+- Schema versioning: `schema_version` table, `MIGRATIONS` dict, auto-applied on open
 - PRAGMA query_only=ON when readonly=True (enforced at SQLite engine level)
 - Database supports context manager: `with Database(path) as db:`
 
 ## Testing
 
-- Tests in `tests/memex/` -- 203 tests, 81% coverage
+- Tests in `tests/memex/` -- ~275 tests, 80%+ coverage
 - `conftest.py` provides `tmp_db_path` fixture
 - Server tests exercise DB methods directly (MCP protocol testing deferred)
 
@@ -76,4 +84,7 @@ memex/
 - `get_all_paths()` is iterative (not recursive) to handle 1000+ message chains
 - FTS queries sanitize quotes; LIKE fallback escapes % and _ wildcards
 - `append_message` and `update_conversation` have try/except/rollback
-- `save_conversation` uses INSERT OR REPLACE (triggers CASCADE delete on messages/tags)
+- `save_conversation` uses INSERT OR REPLACE (triggers CASCADE delete on messages/tags/enrichments/provenance)
+- Importers set `conv.metadata["_provenance"]` -- CLI pops it before save, writes to provenance table after (CASCADE-safe)
+- Enrichment types validated at MCP layer: summary, topic, importance, excerpt, note
+- Enrichment sources validated at MCP layer: user, claude, heuristic

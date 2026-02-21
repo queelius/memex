@@ -896,12 +896,23 @@ class Database:
                 "SELECT tag,COUNT(*) as n FROM tags GROUP BY tag"
             )
         }
+        enrichment_types = {
+            r["type"]: r["n"]
+            for r in self.execute_sql(
+                "SELECT type,COUNT(*) as n FROM enrichments GROUP BY type"
+            )
+        }
+        provenance_tracked = self.execute_sql(
+            "SELECT COUNT(DISTINCT conversation_id) as n FROM provenance"
+        )[0]["n"]
         return {
             "total_conversations": tc,
             "total_messages": tm,
             "sources": sources,
             "models": models,
             "tags": tags,
+            "enrichment_types": enrichment_types,
+            "provenance_tracked": provenance_tracked,
         }
 
     def list_paths(self, conversation_id):
