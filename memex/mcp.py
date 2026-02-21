@@ -338,6 +338,60 @@ def _register_tools(mcp: FastMCP):
         except ValueError as e:
             raise ToolError(str(e))
 
+    VALID_ENRICHMENT_TYPES = {"summary", "topic", "importance", "excerpt", "note"}
+    VALID_ENRICHMENT_SOURCES = {"user", "claude", "heuristic"}
+
+    @mcp.tool(annotations={"idempotentHint": True})
+    def enrich_conversation(
+        conversation_id: Annotated[str, Field(description="Conversation ID")],
+        enrichments: Annotated[list[dict], Field(description="List of enrichments: [{type, value, source, confidence?}]")],
+        db: Annotated[str | None, Field(description="Target database name")] = None,
+        ctx: Context = None,
+    ) -> dict:
+        """Add enrichments (summaries, topics, importance, excerpts, notes) to a conversation. Idempotent -- re-sending the same enrichment updates it."""
+        database = _get_db_from_ctx(mcp, ctx, db)
+        # Validate conversation exists
+        conv = database.load_conversation(conversation_id)
+        if conv is None:
+            raise ToolError(f"Conversation not found: {conversation_id}")
+        # Validate each enrichment
+        for e in enrichments:
+            if e.get("type") not in VALID_ENRICHMENT_TYPES:
+                raise ToolError(
+                    f"Invalid enrichment type: {e.get('type')}. "
+                    f"Must be one of: {', '.join(sorted(VALID_ENRICHMENT_TYPES))}"
+                )
+            if e.get("source") not in VALID_ENRICHMENT_SOURCES:
+                raise ToolError(
+                    f"Invalid enrichment source: {e.get('source')}. "
+                    f"Must be one of: {', '.join(sorted(VALID_ENRICHMENT_SOURCES))}"
+                )
+            conf = e.get("confidence")
+            if conf is not None and (conf < 0.0 or conf > 1.0):
+                raise ToolError(f"Confidence must be 0.0-1.0, got: {conf}")
+        database.save_enrichments(conversation_id, enrichments)
+        return {
+            "conversation_id": conversation_id,
+            "enrichments": database.get_enrichments(conversation_id),
+        }
+
+    @mcp.tool(annotations={"readOnlyHint": True})
+    def query_enrichments(
+        type: Annotated[str | None, Field(description="Filter by enrichment type")] = None,
+        value: Annotated[str | None, Field(description="Substring match on value")] = None,
+        source: Annotated[str | None, Field(description="Filter by source (user/claude/heuristic)")] = None,
+        conversation_id: Annotated[str | None, Field(description="Filter by conversation ID")] = None,
+        limit: Annotated[int, Field(description="Max results", ge=1, le=100)] = 20,
+        db: Annotated[str | None, Field(description="Target database name")] = None,
+        ctx: Context = None,
+    ) -> list[dict]:
+        """Search enrichments across conversations. Filter by type, value, source, or conversation."""
+        database = _get_db_from_ctx(mcp, ctx, db)
+        return database.query_enrichments(
+            type=type, value=value, source=source,
+            conversation_id=conversation_id, limit=limit,
+        )
+
 
 def _register_resources(mcp: FastMCP):
     """Register all MCP resources on the server."""

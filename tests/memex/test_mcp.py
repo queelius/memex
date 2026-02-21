@@ -68,12 +68,13 @@ class TestCreateServer:
         server = create_server(db=db)
         assert server._test_db is db
 
-    def test_server_has_six_tools(self, db):
+    def test_server_has_eight_tools(self, db):
         server = create_server(db=db)
         tool_names = [t.name for t in server._tool_manager._tools.values()]
         assert sorted(tool_names) == sorted([
             "execute_sql", "query_conversations", "get_conversation",
             "search_messages", "update_conversations", "append_message",
+            "enrich_conversation", "query_enrichments",
         ])
 
     def test_server_has_two_resources(self, db):
@@ -437,3 +438,72 @@ class TestBranchingConversation:
         msgs_b = branching_db.get_path_messages("c2", leaf_message_id="m2b")
         assert len(msgs_b) == 2
         assert msgs_b[1]["id"] == "m2b"
+
+
+class TestEnrichConversation:
+    """Tests for the enrich_conversation MCP tool (via DB methods)."""
+
+    def test_enrich_single(self, db):
+        db.save_enrichments("c1", [
+            {"type": "summary", "value": "A greeting", "source": "claude", "confidence": 0.9},
+        ])
+        enrichments = db.get_enrichments("c1")
+        assert len(enrichments) == 1
+        assert enrichments[0]["type"] == "summary"
+
+    def test_enrich_batch(self, db):
+        db.save_enrichments("c1", [
+            {"type": "topic", "value": "greetings", "source": "claude"},
+            {"type": "topic", "value": "testing", "source": "claude"},
+            {"type": "importance", "value": "low", "source": "heuristic", "confidence": 0.3},
+        ])
+        enrichments = db.get_enrichments("c1")
+        assert len(enrichments) == 3
+
+    def test_enrich_upsert(self, db):
+        db.save_enrichments("c1", [
+            {"type": "summary", "value": "old summary", "source": "claude"},
+        ])
+        db.save_enrichments("c1", [
+            {"type": "summary", "value": "old summary", "source": "user"},
+        ])
+        enrichments = db.get_enrichments("c1")
+        assert len(enrichments) == 1
+        assert enrichments[0]["source"] == "user"
+
+    def test_enrich_not_found(self, db):
+        # save_enrichments doesn't validate conversation existence at DB level
+        # (that's the MCP layer's job), so this just tests the DB FK constraint
+        import sqlite3 as _sqlite3
+        with pytest.raises(_sqlite3.IntegrityError):
+            db.save_enrichments("nonexistent", [
+                {"type": "summary", "value": "test", "source": "claude"},
+            ])
+
+
+class TestQueryEnrichments:
+    """Tests for the query_enrichments MCP tool (via DB methods)."""
+
+    def test_query_all(self, multi_db):
+        multi_db.save_enrichment("c1", "topic", "python", "claude")
+        multi_db.save_enrichment("c2", "topic", "rust", "claude")
+        results = multi_db.query_enrichments()
+        assert len(results) == 2
+
+    def test_query_by_type(self, multi_db):
+        multi_db.save_enrichment("c1", "topic", "python", "claude")
+        multi_db.save_enrichment("c1", "summary", "A chat", "claude")
+        results = multi_db.query_enrichments(type="topic")
+        assert len(results) == 1
+        assert results[0]["type"] == "topic"
+
+    def test_query_by_value(self, multi_db):
+        multi_db.save_enrichment("c1", "topic", "python programming", "claude")
+        multi_db.save_enrichment("c2", "topic", "rust systems", "claude")
+        results = multi_db.query_enrichments(value="python")
+        assert len(results) == 1
+
+    def test_query_includes_title(self, multi_db):
+        multi_db.save_enrichment("c1", "topic", "python", "claude")
+        results = multi_db.query_enrichments(type="topic")
+        assert results[0]["conversation_title"] == "Chat 1"
