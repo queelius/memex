@@ -41,7 +41,7 @@ def import_file(path: str) -> List[Conversation]:
 
     conversations = []
     for item in conv_list:
-        conv = _import_conversation(item)
+        conv = _import_conversation(item, path)
         if conv:
             conversations.append(conv)
     return conversations
@@ -71,7 +71,7 @@ def _detect_model(data: dict) -> str:
     return "gemini"
 
 
-def _import_conversation(data: dict) -> Optional[Conversation]:
+def _import_conversation(data: dict, source_path: str = None) -> Optional[Conversation]:
     conv_id = data.get("id") or data.get("conversation_id", str(uuid.uuid4()))
     title = data.get("title", "Untitled Conversation")
     model = _detect_model(data)
@@ -111,6 +111,11 @@ def _import_conversation(data: dict) -> Optional[Conversation]:
         conv.add_message(msg)
         parent_id = msg_id
 
+    conv.metadata["_provenance"] = {
+        "source_type": "gemini",
+        "source_file": source_path,
+        "source_id": conv_id,
+    }
     return conv
 
 

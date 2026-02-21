@@ -64,7 +64,18 @@ def _cmd_import(args):
     with Database(db_path) as db:
         convs = _auto_import(args.file, args.format)
         for conv in convs:
+            # Extract provenance before save (pop to keep metadata clean)
+            prov = conv.metadata.pop("_provenance", None)
             db.save_conversation(conv)
+            # Write provenance after save (CASCADE-safe ordering)
+            if prov:
+                db.save_provenance(
+                    conv.id,
+                    source_type=prov.get("source_type", "unknown"),
+                    source_file=prov.get("source_file"),
+                    source_id=prov.get("source_id"),
+                    source_hash=prov.get("source_hash"),
+                )
         print(f"Imported {len(convs)} conversation(s) into {db_path}")
 
 

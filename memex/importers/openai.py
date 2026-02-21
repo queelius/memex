@@ -33,13 +33,13 @@ def import_file(path: str) -> List[Conversation]:
         data = [data]
     conversations = []
     for item in data:
-        conv = _import_conversation(item)
+        conv = _import_conversation(item, path)
         if conv:
             conversations.append(conv)
     return conversations
 
 
-def _import_conversation(data: dict) -> Optional[Conversation]:
+def _import_conversation(data: dict, source_path: str = None) -> Optional[Conversation]:
     conv_id = data.get("id") or data.get("conversation_id", "")
     mapping = data.get("mapping", {})
     if not mapping:
@@ -93,6 +93,11 @@ def _import_conversation(data: dict) -> Optional[Conversation]:
         )
         conv.add_message(msg)
     conv.model = model
+    conv.metadata["_provenance"] = {
+        "source_type": "openai",
+        "source_file": source_path,
+        "source_id": conv_id,
+    }
     return conv
 
 

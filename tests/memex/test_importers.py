@@ -139,6 +139,30 @@ class TestOpenAIImport:
         convs = openai_import(str(f))
         assert len(convs) == 0
 
+    def test_provenance_metadata(self, tmp_path):
+        data = [{
+            "id": "conv1", "title": "Test",
+            "create_time": 1700000000, "update_time": 1700000001,
+            "mapping": {
+                "m1": {
+                    "id": "m1", "parent": None, "children": [],
+                    "message": {
+                        "id": "m1", "author": {"role": "user"},
+                        "content": {"parts": ["hello"]},
+                        "create_time": 1700000000,
+                    },
+                },
+            },
+        }]
+        f = tmp_path / "export.json"
+        f.write_text(json.dumps(data))
+        convs = openai_import(str(f))
+        prov = convs[0].metadata.get("_provenance")
+        assert prov is not None
+        assert prov["source_type"] == "openai"
+        assert prov["source_id"] == "conv1"
+        assert prov["source_file"] == str(f)
+
     def test_tool_use_content(self, tmp_path):
         data = [{
             "id": "conv5", "create_time": 1700000000, "update_time": 1700000001,
@@ -257,6 +281,21 @@ class TestAnthropicImport:
         convs = anthropic_import(str(f))
         assert "anthropic" in convs[0].tags
         assert "claude" in convs[0].tags
+
+    def test_provenance_metadata(self, tmp_path):
+        data = [{
+            "uuid": "conv1", "name": "Test",
+            "chat_messages": [
+                {"uuid": "m1", "sender": "human", "text": "hello"},
+            ],
+        }]
+        f = tmp_path / "claude.json"
+        f.write_text(json.dumps(data))
+        convs = anthropic_import(str(f))
+        prov = convs[0].metadata.get("_provenance")
+        assert prov is not None
+        assert prov["source_type"] == "anthropic"
+        assert prov["source_id"] == "conv1"
 
 
 # ---------- Gemini ----------
@@ -384,3 +423,20 @@ class TestGeminiImport:
         f.write_text(json.dumps(data))
         convs = gemini_import(str(f))
         assert convs[0].model == "gemini-1.5-pro"
+
+    def test_provenance_metadata(self, tmp_path):
+        data = {
+            "conversations": [{
+                "id": "conv1", "title": "Gemini Chat",
+                "turns": [
+                    {"id": "m1", "role": "user", "parts": [{"text": "hello"}]},
+                ],
+            }],
+        }
+        f = tmp_path / "gemini.json"
+        f.write_text(json.dumps(data))
+        convs = gemini_import(str(f))
+        prov = convs[0].metadata.get("_provenance")
+        assert prov is not None
+        assert prov["source_type"] == "gemini"
+        assert prov["source_id"] == "conv1"

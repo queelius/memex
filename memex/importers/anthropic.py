@@ -44,7 +44,7 @@ def import_file(path: str) -> List[Conversation]:
         data = [data]
     conversations = []
     for item in data:
-        conv = _import_conversation(item)
+        conv = _import_conversation(item, path)
         if conv:
             conversations.append(conv)
     return conversations
@@ -78,7 +78,7 @@ def _detect_model(data: dict) -> str:
     return "claude"
 
 
-def _import_conversation(data: dict) -> Optional[Conversation]:
+def _import_conversation(data: dict, source_path: str = None) -> Optional[Conversation]:
     conv_id = data.get("uuid") or data.get("id", str(uuid.uuid4()))
     title = data.get("name") or data.get("title", "Untitled Conversation")
     model = _detect_model(data)
@@ -118,6 +118,11 @@ def _import_conversation(data: dict) -> Optional[Conversation]:
         conv.add_message(msg)
         parent_id = msg_id
 
+    conv.metadata["_provenance"] = {
+        "source_type": "anthropic",
+        "source_file": source_path,
+        "source_id": conv_id,
+    }
     return conv
 
 

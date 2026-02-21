@@ -76,6 +76,40 @@ class TestCLIImport:
         assert "no importer found" in result.stderr
 
 
+class TestCLIImportProvenance:
+    def test_import_persists_provenance(self, tmp_path):
+        from memex.db import Database
+        db_dir = tmp_path / "db"
+        export_file = tmp_path / "export.json"
+        export_file.write_text(json.dumps([{
+            "id": "c1", "title": "Test",
+            "create_time": 1700000000, "update_time": 1700000001,
+            "mapping": {
+                "m1": {
+                    "id": "m1", "parent": None, "children": [],
+                    "message": {
+                        "id": "m1", "author": {"role": "user"},
+                        "content": {"parts": ["hello"]},
+                        "create_time": 1700000000,
+                    },
+                },
+            },
+        }]))
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "import", str(export_file), "--db", str(db_dir)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        # Verify provenance was saved to DB
+        db = Database(str(db_dir))
+        prov = db.get_provenance("c1")
+        assert len(prov) == 1
+        assert prov[0]["source_type"] == "openai"
+        assert prov[0]["source_id"] == "c1"
+        assert str(export_file) in prov[0]["source_file"]
+        db.close()
+
+
 class TestCLIExport:
     def test_export_markdown(self, tmp_path):
         # First import, then export
