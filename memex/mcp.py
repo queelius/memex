@@ -75,7 +75,7 @@ def _get_sql_write(mcp, ctx):
 
 
 def _conv_metadata(conv, db) -> dict:
-    """Build conversation metadata dict with boolean flags and tags."""
+    """Build conversation metadata dict with boolean flags, tags, enrichments, provenance."""
     from memex.db import _fmt_dt
     tags = [
         t["tag"]
@@ -98,6 +98,8 @@ def _conv_metadata(conv, db) -> dict:
         "sensitive": conv.sensitive,
         "tags": tags,
         "metadata": conv.metadata,
+        "enrichments": db.get_enrichments(conv.id),
+        "provenance": db.get_provenance(conv.id),
     }
 
 
@@ -135,6 +137,8 @@ def _register_tools(mcp: FastMCP):
         tag: Annotated[str | None, Field(description="Filter by tag")] = None,
         before: Annotated[str | None, Field(description="Only conversations created before this date (YYYY-MM-DD)")] = None,
         after: Annotated[str | None, Field(description="Only conversations created after this date (YYYY-MM-DD)")] = None,
+        enrichment_type: Annotated[str | None, Field(description="Filter by enrichment type (e.g. topic, summary)")] = None,
+        enrichment_value: Annotated[str | None, Field(description="Filter by enrichment value substring")] = None,
         include_paths: Annotated[bool, Field(description="Include path summaries to eliminate follow-up list_paths call")] = False,
         limit: Annotated[int, Field(description="Max results", ge=1, le=100)] = 20,
         cursor: Annotated[str | None, Field(description="Pagination cursor")] = None,
@@ -147,6 +151,7 @@ def _register_tools(mcp: FastMCP):
             query=query, title=title, starred=starred, pinned=pinned,
             archived=archived, sensitive=sensitive, source=source,
             model=model, tag=tag, before=before, after=after,
+            enrichment_type=enrichment_type, enrichment_value=enrichment_value,
             limit=limit, cursor=cursor,
         )
         # Post-process: convert tags_csv to list, timestamps to booleans

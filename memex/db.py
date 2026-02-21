@@ -350,6 +350,8 @@ class Database:
         tag=None,
         before=None,
         after=None,
+        enrichment_type=None,
+        enrichment_value=None,
         limit=20,
         cursor=None,
     ) -> Dict[str, Any]:
@@ -399,6 +401,23 @@ class Database:
                 "WHERE t.conversation_id=c.id AND t.tag=?)"
             )
             params.append(tag)
+        if enrichment_type or enrichment_value:
+            e_conds = ["e.conversation_id=c.id"]
+            if enrichment_type:
+                e_conds.append("e.type=?")
+                params.append(enrichment_type)
+            if enrichment_value:
+                escaped = (
+                    enrichment_value.replace("\\", "\\\\")
+                    .replace("%", "\\%")
+                    .replace("_", "\\_")
+                )
+                e_conds.append("e.value LIKE ? ESCAPE '\\'")
+                params.append(f"%{escaped}%")
+            conds.append(
+                f"EXISTS(SELECT 1 FROM enrichments e "
+                f"WHERE {' AND '.join(e_conds)})"
+            )
         if before:
             conds.append("c.created_at<?")
             params.append(before)

@@ -408,6 +408,70 @@ class TestConvMetadata:
         assert meta["pinned"] is False
         assert meta["archived"] is False
 
+    def test_enrichments_in_metadata(self, db):
+        db.save_enrichment("c1", "topic", "greetings", "claude")
+        conv = db.load_conversation("c1")
+        meta = _conv_metadata(conv, db)
+        assert "enrichments" in meta
+        assert len(meta["enrichments"]) == 1
+        assert meta["enrichments"][0]["type"] == "topic"
+
+    def test_provenance_in_metadata(self, db):
+        db.save_provenance("c1", source_type="openai", source_file="export.json")
+        conv = db.load_conversation("c1")
+        meta = _conv_metadata(conv, db)
+        assert "provenance" in meta
+        assert len(meta["provenance"]) == 1
+        assert meta["provenance"][0]["source_type"] == "openai"
+
+    def test_empty_enrichments_and_provenance(self, db):
+        conv = db.load_conversation("c1")
+        meta = _conv_metadata(conv, db)
+        assert meta["enrichments"] == []
+        assert meta["provenance"] == []
+
+
+class TestQueryConversationsEnrichmentFilter:
+    """Tests for enrichment_type/enrichment_value filters in query_conversations."""
+
+    def test_filter_by_enrichment_type(self, multi_db):
+        multi_db.save_enrichment("c1", "topic", "python", "claude")
+        multi_db.save_enrichment("c2", "summary", "A chat", "claude")
+        result = multi_db.query_conversations(enrichment_type="topic")
+        assert len(result["items"]) == 1
+        assert result["items"][0]["id"] == "c1"
+
+    def test_filter_by_enrichment_value(self, multi_db):
+        multi_db.save_enrichment("c1", "topic", "python programming", "claude")
+        multi_db.save_enrichment("c2", "topic", "rust systems", "claude")
+        result = multi_db.query_conversations(enrichment_value="python")
+        assert len(result["items"]) == 1
+        assert result["items"][0]["id"] == "c1"
+
+    def test_filter_combined(self, multi_db):
+        multi_db.save_enrichment("c1", "topic", "python", "claude")
+        multi_db.save_enrichment("c1", "importance", "high", "heuristic")
+        multi_db.save_enrichment("c2", "topic", "rust", "claude")
+        result = multi_db.query_conversations(
+            enrichment_type="topic", enrichment_value="python",
+        )
+        assert len(result["items"]) == 1
+        assert result["items"][0]["id"] == "c1"
+
+    def test_filter_with_existing_filters(self, multi_db):
+        multi_db.save_enrichment("c1", "topic", "python", "claude")
+        multi_db.save_enrichment("c3", "topic", "python", "claude")
+        # c1 is openai, c3 is anthropic
+        result = multi_db.query_conversations(
+            enrichment_type="topic", source="anthropic",
+        )
+        assert len(result["items"]) == 1
+        assert result["items"][0]["id"] == "c3"
+
+    def test_no_enrichments_returns_empty(self, multi_db):
+        result = multi_db.query_conversations(enrichment_type="topic")
+        assert len(result["items"]) == 0
+
 
 class TestBranchingConversation:
     """Test with a branching conversation tree."""
