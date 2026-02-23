@@ -217,7 +217,7 @@ def _register_tools(mcp: FastMCP):
                 if len(paths) > 1:
                     lines.append(f"\n## Path {i}\n")
                 for msg in path:
-                    lines.append(f"**{msg.role}**: {msg.get_text()}\n")
+                    lines.append(f"**{msg.role}**: {msg.get_content_md()}\n")
             return "\n".join(lines)
 
         # Messages mode: path_index or leaf_message_id specified

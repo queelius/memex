@@ -21,6 +21,8 @@ def main():
     imp = sub.add_parser("import", help="Import conversations from a file")
     imp.add_argument("file", help="File to import")
     imp.add_argument("--format", help="Force importer format (e.g. openai, anthropic, gemini)")
+    imp.add_argument("--no-copy-assets", action="store_true",
+                     help="Skip copying media assets into the database directory")
     imp.add_argument(
         "--db",
         help="Database directory",
@@ -71,13 +73,21 @@ def _get_version():
 
 def _cmd_import(args):
     from memex.db import Database
+    from memex.assets import resolve_source_assets, copy_assets
 
     db_path = os.path.expanduser(args.db)
+    source_dir = Path(args.file).resolve().parent
+    asset_dir = Path(db_path) / "assets"
     with Database(db_path) as db:
         convs = _auto_import(args.file, args.format)
         for conv in convs:
             # Extract provenance before save (pop to keep metadata clean)
             prov = conv.metadata.pop("_provenance", None)
+            # Resolve and copy media assets
+            if not args.no_copy_assets:
+                source_type = prov.get("source_type", "") if prov else ""
+                resolve_source_assets(conv, source_dir, source_type)
+                copy_assets(conv, asset_dir)
             db.save_conversation(conv)
             # Write provenance after save (CASCADE-safe ordering)
             if prov:
@@ -187,7 +197,7 @@ def _render_conversation_md(conv):
             lines.append("---")
             lines.append("")
         for msg in path_msgs:
-            text = msg.get_text()
+            text = msg.get_content_md()
             lines.append(f"### {msg.role}")
             lines.append("")
             lines.append(text)

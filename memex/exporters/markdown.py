@@ -17,7 +17,7 @@ def export(conversations: List[Conversation], path: str, **kwargs) -> None:
             lines.append(f"*Source: {conv.source}*\n")
         for path_msgs in conv.get_all_paths():
             for msg in path_msgs:
-                text = msg.get_text()
+                text = msg.get_content_md()
                 lines.append(f"**{msg.role}**: {text}\n")
             lines.append("---\n")
     with open(path, "w") as f:

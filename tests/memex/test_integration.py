@@ -303,6 +303,50 @@ class TestClaudeCodeImportRoundtrip:
         db.close()
 
 
+class TestMediaRoundtrip:
+    """Save conv with media blocks → load → export markdown → verify media rendered."""
+
+    def test_media_roundtrip(self, tmp_path):
+        import tempfile
+        from memex.models import media_block as mb
+        from memex.exporters.markdown import export as md_export
+
+        db = Database(str(tmp_path / "db"))
+        now = datetime(2024, 6, 1)
+        conv = Conversation(
+            id="media-conv", created_at=now, updated_at=now,
+            title="Media Test", source="test",
+        )
+        conv.add_message(Message(
+            id="m1", role="user",
+            content=[text_block("Look at this image")],
+        ))
+        conv.add_message(Message(
+            id="m2", role="assistant",
+            content=[
+                text_block("Here is the image:"),
+                mb("image/png", url="assets/photo.png", filename="photo.png"),
+            ],
+            parent_id="m1",
+        ))
+        db.save_conversation(conv)
+
+        # Load back
+        loaded = db.load_conversation("media-conv")
+        assert loaded is not None
+        assert loaded.message_count == 2
+
+        # Export as markdown
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "out.md")
+            md_export([loaded], out)
+            content = open(out).read()
+            assert "![photo.png](assets/photo.png)" in content
+            assert "Here is the image:" in content
+
+        db.close()
+
+
 class TestEnrichmentWorkflow:
     """Full enrichment workflow: create → enrich → query → filter → statistics."""
 

@@ -28,6 +28,38 @@ def tool_result_block(tool_use_id: str, content: Any = None, is_error: bool = Fa
 def thinking_block(text: str) -> ContentBlock:
     return {"type": "thinking", "text": text}
 
+
+def _render_media_md(block: ContentBlock) -> str:
+    """Render a media content block as markdown."""
+    media_type = block.get("media_type", "")
+    url = block.get("url", "")
+    filename = block.get("filename", "")
+    data = block.get("data", "")
+
+    # Build a data URI if we have base64 data but no URL
+    if not url and data:
+        url = f"data:{media_type};base64,{data}"
+
+    if not url:
+        return f"[{filename}]" if filename else ""
+
+    if media_type.startswith("image/"):
+        alt = filename or "image"
+        return f"![{alt}]({url})"
+    elif media_type.startswith("audio/"):
+        label = filename or "audio"
+        return f"[audio: {label}]({url})"
+    elif media_type.startswith("video/"):
+        label = filename or "video"
+        return f"[video: {label}]({url})"
+    elif media_type == "application/pdf":
+        label = filename or "document"
+        return f"[pdf: {label}]({url})"
+    else:
+        label = filename or "attachment"
+        return f"[attachment: {label}]({url})"
+
+
 @dataclass
 class Message:
     id: str
@@ -44,6 +76,20 @@ class Message:
             block["text"] for block in self.content
             if block.get("type") == "text" and block.get("text")
         )
+
+    def get_content_md(self) -> str:
+        """Render all content blocks as markdown, including media."""
+        parts = []
+        for block in self.content:
+            btype = block.get("type")
+            if btype == "text" and block.get("text"):
+                parts.append(block["text"])
+            elif btype == "media":
+                rendered = _render_media_md(block)
+                if rendered:
+                    parts.append(rendered)
+            # Skip tool_use, tool_result, thinking
+        return "\n\n".join(parts)
 
 @dataclass
 class Conversation:

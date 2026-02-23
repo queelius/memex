@@ -24,7 +24,8 @@ memex/
   db.py                # Database (raw sqlite3, WAL, FTS5, migrations)
   config.py            # YAML config, DatabaseRegistry
   mcp.py               # FastMCP server (8 tools, 2 resources)
-  cli.py               # argparse CLI (import, export, mcp)
+  assets.py            # Asset resolution, copying, media markdown rendering
+  cli.py               # argparse CLI (import, export, show, mcp)
   importers/           # Convention-based: detect() + import_file()
     openai.py
     anthropic.py
@@ -45,6 +46,8 @@ memex/
 - Schema versioning: `schema_version` table + `MIGRATIONS` dict for forward migrations
 - Enrichments: structured metadata (summaries, topics, importance) with source tracking
 - Provenance: `_provenance` metadata convention in importers, persisted by CLI
+- Media assets: `{db_dir}/assets/` stores copied media; URLs rewritten to `assets/{filename}` relative paths
+- `Message.get_content_md()` renders text + media as markdown; `get_text()` stays text-only for FTS
 
 ## MCP Tools
 
@@ -74,7 +77,7 @@ memex/
 
 ## Testing
 
-- Tests in `tests/memex/` -- ~290 tests, 80%+ coverage
+- Tests in `tests/memex/` -- ~326 tests, 83%+ coverage
 - `conftest.py` provides `tmp_db_path` fixture
 - Server tests exercise DB methods directly (MCP protocol testing deferred)
 
@@ -90,3 +93,5 @@ memex/
 - Enrichment types validated at MCP layer: summary, topic, importance, excerpt, note
 - Enrichment sources validated at MCP layer: user, claude, heuristic
 - Claude Code importer uses "conversation_only" mode (strips tool use, thinking, progress). Future `claude_code_full` importer can coexist for full-fidelity import
+- `--no-copy-assets` on import skips media asset resolution and copying
+- `copy_assets` is idempotent: skips blocks already having `assets/` relative URLs
