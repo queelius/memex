@@ -227,7 +227,7 @@ def _cmd_export(args):
             if not result["has_more"]:
                 break
             cursor = result["next_cursor"]
-        exporter_mod.export(convs, args.output)
+        exporter_mod.export(convs, args.output, db_path=db.db_path)
         print(f"Exported {len(convs)} conversation(s) to {args.output}")
 
 

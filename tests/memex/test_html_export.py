@@ -695,3 +695,217 @@ class TestHtmlAnthropicIntegration:
         html = get_template()
         assert '.settings-field' in html
         assert '.settings-actions' in html
+
+
+# ---------------------------------------------------------------------------
+# HTML exporter tests (Task 6)
+# ---------------------------------------------------------------------------
+import json
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+from memex.models import Conversation, Message
+
+
+def _make_conv(conv_id="c1", title="Test Conversation"):
+    """Create a minimal Conversation for testing."""
+    conv = Conversation(
+        id=conv_id,
+        created_at=datetime(2024, 1, 1),
+        updated_at=datetime(2024, 1, 2),
+        title=title,
+    )
+    msg = Message(id="m1", role="user", content=[{"type": "text", "text": "hello"}])
+    conv.add_message(msg)
+    return conv
+
+
+class TestHtmlExporter:
+    def test_export_creates_directory(self, tmp_path):
+        from memex.exporters.html import export
+
+        out_dir = tmp_path / "site"
+        export([_make_conv()], str(out_dir))
+        assert out_dir.is_dir()
+        assert (out_dir / "index.html").exists()
+
+    def test_export_index_is_valid_html(self, tmp_path):
+        from memex.exporters.html import export
+
+        out_dir = tmp_path / "site"
+        export([_make_conv()], str(out_dir))
+        html = (out_dir / "index.html").read_text()
+        assert html.startswith("<!DOCTYPE html>")
+        assert "</html>" in html
+        assert "sql-wasm.js" in html
+
+    def test_export_creates_existing_directory(self, tmp_path):
+        """Export into an already-existing directory should not fail."""
+        from memex.exporters.html import export
+
+        out_dir = tmp_path / "site"
+        out_dir.mkdir()
+        export([_make_conv()], str(out_dir))
+        assert (out_dir / "index.html").exists()
+
+    def test_export_no_db_path(self, tmp_path):
+        """Without db_path, only index.html is written."""
+        from memex.exporters.html import export
+
+        out_dir = tmp_path / "site"
+        export([_make_conv()], str(out_dir))
+        assert (out_dir / "index.html").exists()
+        assert not (out_dir / "conversations.db").exists()
+        assert not (out_dir / "assets").exists()
+
+    def test_export_copies_db(self, tmp_path):
+        from memex.db import Database
+        from memex.exporters.html import export
+
+        db_dir = tmp_path / "db"
+        db_dir.mkdir()
+        with Database(str(db_dir)) as db:
+            conv = _make_conv()
+            db.save_conversation(conv)
+
+        out_dir = tmp_path / "site"
+        db_path = str(db_dir / "conversations.db")
+        export([conv], str(out_dir), db_path=db_path)
+
+        assert (out_dir / "conversations.db").exists()
+        # Verify it's a valid SQLite copy
+        with Database(str(out_dir), readonly=True) as db2:
+            result = db2.query_conversations()
+            assert len(result["items"]) == 1
+
+    def test_export_copies_assets(self, tmp_path):
+        from memex.db import Database
+        from memex.exporters.html import export
+
+        db_dir = tmp_path / "db"
+        db_dir.mkdir()
+        with Database(str(db_dir)) as db:
+            db.save_conversation(_make_conv())
+
+        # Create an assets directory with a test file
+        assets_dir = db_dir / "assets"
+        assets_dir.mkdir()
+        (assets_dir / "test_image.png").write_bytes(b"\x89PNG fake image data")
+
+        out_dir = tmp_path / "site"
+        db_path = str(db_dir / "conversations.db")
+        export([_make_conv()], str(out_dir), db_path=db_path)
+
+        assert (out_dir / "assets").is_dir()
+        assert (out_dir / "assets" / "test_image.png").exists()
+        assert (out_dir / "assets" / "test_image.png").read_bytes() == b"\x89PNG fake image data"
+
+    def test_export_no_assets_dir(self, tmp_path):
+        """If there is no assets/ directory, export should still succeed."""
+        from memex.db import Database
+        from memex.exporters.html import export
+
+        db_dir = tmp_path / "db"
+        db_dir.mkdir()
+        with Database(str(db_dir)) as db:
+            db.save_conversation(_make_conv())
+
+        out_dir = tmp_path / "site"
+        db_path = str(db_dir / "conversations.db")
+        export([_make_conv()], str(out_dir), db_path=db_path)
+
+        assert (out_dir / "index.html").exists()
+        assert (out_dir / "conversations.db").exists()
+        assert not (out_dir / "assets").exists()
+
+    def test_export_memory_db_skips_copy(self, tmp_path):
+        """db_path=':memory:' should not attempt to copy."""
+        from memex.exporters.html import export
+
+        out_dir = tmp_path / "site"
+        export([_make_conv()], str(out_dir), db_path=":memory:")
+        assert (out_dir / "index.html").exists()
+        assert not (out_dir / "conversations.db").exists()
+
+    def test_export_replaces_existing_assets(self, tmp_path):
+        """If dest assets/ already exists, it should be replaced."""
+        from memex.db import Database
+        from memex.exporters.html import export
+
+        db_dir = tmp_path / "db"
+        db_dir.mkdir()
+        with Database(str(db_dir)) as db:
+            db.save_conversation(_make_conv())
+
+        # Source assets
+        assets_dir = db_dir / "assets"
+        assets_dir.mkdir()
+        (assets_dir / "new.png").write_bytes(b"new")
+
+        out_dir = tmp_path / "site"
+        out_dir.mkdir()
+        # Pre-existing dest assets with a stale file
+        dest_assets = out_dir / "assets"
+        dest_assets.mkdir()
+        (dest_assets / "old.png").write_bytes(b"old")
+
+        db_path = str(db_dir / "conversations.db")
+        export([_make_conv()], str(out_dir), db_path=db_path)
+
+        assert (out_dir / "assets" / "new.png").exists()
+        assert not (out_dir / "assets" / "old.png").exists()
+
+
+class TestCLIExportHtml:
+    def test_cli_export_html(self, tmp_path):
+        """Full CLI round-trip: import OpenAI data, export as html."""
+        db_dir = tmp_path / "db"
+        export_file = tmp_path / "export.json"
+        export_file.write_text(json.dumps([{
+            "id": "c1", "title": "HTML Export Test",
+            "create_time": 1700000000, "update_time": 1700000001,
+            "mapping": {
+                "m1": {
+                    "id": "m1", "parent": None, "children": [],
+                    "message": {
+                        "id": "m1", "author": {"role": "user"},
+                        "content": {"parts": ["hello world"]},
+                        "create_time": 1700000000,
+                    },
+                },
+            },
+        }]))
+
+        # Import
+        subprocess.run(
+            [sys.executable, "-m", "memex", "import", str(export_file),
+             "--db", str(db_dir)],
+            capture_output=True, text=True,
+        )
+
+        # Export as html
+        out_dir = tmp_path / "site"
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "export", str(out_dir),
+             "--format", "html", "--db", str(db_dir)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        assert "Exported 1 conversation" in result.stdout
+
+        # Verify directory structure
+        assert (out_dir / "index.html").exists()
+        assert (out_dir / "conversations.db").exists()
+
+        # Verify index.html content
+        html = (out_dir / "index.html").read_text()
+        assert "<!DOCTYPE html>" in html
+
+        # Verify the copied DB is usable
+        from memex.db import Database
+        with Database(str(out_dir), readonly=True) as db2:
+            result = db2.query_conversations()
+            assert len(result["items"]) == 1
+            assert result["items"][0]["title"] == "HTML Export Test"
