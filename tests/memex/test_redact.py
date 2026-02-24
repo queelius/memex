@@ -130,3 +130,120 @@ class TestMatchMode:
         matchers = compile_matchers(words=["fuck", "shit"])
         result = scan_message(content, matchers, "c1", "m1")
         assert check_match_mode(result.matches, "all", matchers) is True
+
+
+# ── Mutation Engine ─────────────────────────────────────────────
+
+
+class TestRedactWordLevel:
+    def test_replaces_match(self):
+        from memex.scripts.redact import Match, redact_word_level
+        content = [{"type": "text", "text": "what the fuck"}]
+        matches = [Match("c1", "m1", "fuck", 9, 13, 0)]
+        result = redact_word_level(content, matches)
+        assert result[0]["text"] == "what the [REDACTED]"
+
+    def test_preserves_non_text_blocks(self):
+        from memex.scripts.redact import Match, redact_word_level
+        content = [{"type": "text", "text": "fuck"}, {"type": "tool_use", "id": "x"}]
+        matches = [Match("c1", "m1", "fuck", 0, 4, 0)]
+        result = redact_word_level(content, matches)
+        assert result[1] == {"type": "tool_use", "id": "x"}
+
+    def test_multiple_matches_in_block(self):
+        from memex.scripts.redact import Match, redact_word_level
+        content = [{"type": "text", "text": "fuck this shit"}]
+        matches = [Match("c1", "m1", "fuck", 0, 4, 0), Match("c1", "m1", "shit", 10, 14, 0)]
+        result = redact_word_level(content, matches)
+        assert result[0]["text"] == "[REDACTED] this [REDACTED]"
+
+    def test_does_not_mutate_original(self):
+        from memex.scripts.redact import Match, redact_word_level
+        content = [{"type": "text", "text": "fuck"}]
+        matches = [Match("c1", "m1", "fuck", 0, 4, 0)]
+        redact_word_level(content, matches)
+        assert content[0]["text"] == "fuck"  # original unchanged
+
+
+class TestRedactMessageLevel:
+    def test_replaces_entire_content(self):
+        from memex.scripts.redact import redact_message_level
+        result = redact_message_level()
+        assert result == [{"type": "text", "text": "[REDACTED]"}]
+
+
+class TestRunDryRun:
+    def test_reports_but_no_changes(self, tmp_db_path):
+        """Dry run shows matches but doesn't modify DB."""
+        from memex.scripts.redact import run
+        db = Database(tmp_db_path)
+        conv = _make_conv_with_text("what the fuck")
+        db.save_conversation(conv)
+        args = _make_args(words="fuck", level="word")
+        stats = run(db, args, apply=False)
+        assert stats["word_redactions"] > 0
+        # DB unchanged
+        reloaded = db.load_conversation("c1")
+        assert "fuck" in reloaded.messages["m1"].get_text()
+        db.close()
+
+
+class TestRunApplyBatch:
+    def test_word_level(self, tmp_db_path):
+        from memex.scripts.redact import run
+        db = Database(tmp_db_path)
+        conv = _make_conv_with_text("what the fuck")
+        db.save_conversation(conv)
+        args = _make_args(words="fuck", level="word", yes=True)
+        stats = run(db, args, apply=True)
+        reloaded = db.load_conversation("c1")
+        assert "[REDACTED]" in reloaded.messages["m1"].get_text()
+        # Original stored as enrichment
+        enrichments = db.get_enrichments("c1")
+        originals = [e for e in enrichments if e["type"] == "original_content"]
+        assert len(originals) == 1
+        db.close()
+
+    def test_message_level(self, tmp_db_path):
+        from memex.scripts.redact import run
+        db = Database(tmp_db_path)
+        conv = _make_conv_with_text("what the fuck")
+        db.save_conversation(conv)
+        args = _make_args(words="fuck", level="message", yes=True)
+        run(db, args, apply=True)
+        reloaded = db.load_conversation("c1")
+        assert reloaded.messages["m1"].get_text() == "[REDACTED]"
+        db.close()
+
+    def test_conversation_level(self, tmp_db_path):
+        from memex.scripts.redact import run
+        db = Database(tmp_db_path)
+        conv = _make_conv_with_text("what the fuck")
+        db.save_conversation(conv)
+        args = _make_args(words="fuck", level="conversation", yes=True)
+        run(db, args, apply=True)
+        assert db.load_conversation("c1") is None
+        db.close()
+
+    def test_all_mode(self, tmp_db_path):
+        """--all requires every term to match."""
+        from memex.scripts.redact import run
+        db = Database(tmp_db_path)
+        conv = _make_conv_with_text("just drunk")
+        db.save_conversation(conv)
+        args = _make_args(words="drunk,kim", level="message", yes=True, all_mode=True)
+        run(db, args, apply=True)
+        # "kim" not present, so no redaction
+        reloaded = db.load_conversation("c1")
+        assert "drunk" in reloaded.messages["m1"].get_text()
+        db.close()
+
+    def test_no_matches_returns_zero_stats(self, tmp_db_path):
+        from memex.scripts.redact import run
+        db = Database(tmp_db_path)
+        conv = _make_conv_with_text("perfectly clean text")
+        db.save_conversation(conv)
+        args = _make_args(words="profanity", level="word", yes=True)
+        stats = run(db, args, apply=True)
+        assert stats["word_redactions"] == 0
+        db.close()
