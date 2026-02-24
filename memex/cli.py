@@ -52,7 +52,19 @@ def main():
     # mcp
     sub.add_parser("mcp", help="Start MCP server")
 
-    args = parser.parse_args()
+    # run
+    run_p = sub.add_parser("run", help="Run a memex script")
+    run_p.add_argument("name", nargs="?", help="Script name (omit or use --list to list)")
+    run_p.add_argument("--list", action="store_true", help="List available scripts")
+    run_p.add_argument("--apply", action="store_true", help="Commit changes (default: dry-run)")
+    run_p.add_argument("--verbose", action="store_true", help="Verbose output")
+    run_p.add_argument(
+        "--db",
+        help="Database directory",
+        default=os.environ.get("MEMEX_DATABASE_PATH", "~/.memex/default"),
+    )
+
+    args, remaining = parser.parse_known_args()
     if args.command == "import":
         _cmd_import(args)
     elif args.command == "show":
@@ -61,6 +73,8 @@ def main():
         _cmd_export(args)
     elif args.command == "mcp":
         _cmd_mcp(args)
+    elif args.command == "run":
+        _cmd_run(args, remaining)
     else:
         parser.print_help()
 
@@ -244,6 +258,39 @@ def _find_exporter(format_name):
             if hasattr(mod, "export"):
                 return mod
     return None
+
+
+def _cmd_run(args, remaining):
+    from memex.db import Database
+    from memex.scripts import discover_scripts, load_script
+
+    if args.list or not args.name:
+        scripts = discover_scripts()
+        if not scripts:
+            print("No scripts available.")
+            return
+        print("Available scripts:\n")
+        for name, info in sorted(scripts.items()):
+            print(f"  {name:20s}  {info['description']}")
+        print(f"\nUsage: memex run <name> [--apply] [script args...]")
+        return
+
+    try:
+        mod = load_script(args.name)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Build a sub-parser for the script's own arguments
+    script_parser = argparse.ArgumentParser(prog=f"memex run {args.name}")
+    mod.register_args(script_parser)
+    script_args = script_parser.parse_args(remaining)
+
+    db_path = os.path.expanduser(args.db)
+    with Database(db_path, readonly=not args.apply) as db:
+        result = mod.run(db, script_args, apply=args.apply)
+        if args.verbose and result:
+            print(f"\nResult: {result}")
 
 
 def _cmd_mcp(args):
