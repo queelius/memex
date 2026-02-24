@@ -34,6 +34,8 @@ memex/
   exporters/           # Convention-based: export()
     markdown.py
     json_export.py
+    html.py            # HTML SPA exporter (outputs directory: index.html + DB + assets)
+    html_template.py   # Self-contained HTML5 SPA template (sql.js Wasm, vanilla JS)
 ```
 
 **Key design decisions:**
@@ -48,6 +50,7 @@ memex/
 - Provenance: `_provenance` metadata convention in importers, persisted by CLI
 - Media assets: `{db_dir}/assets/` stores copied media; URLs rewritten to `assets/{filename}` relative paths
 - `Message.get_content_md()` renders text + media as markdown; `get_text()` stays text-only for FTS
+- HTML SPA export: sql.js 1.14.0 (Wasm) loads DB client-side; no FTS5 (uses LIKE search); Anthropic API for chat resumption via `anthropic-dangerous-direct-browser-access` CORS header
 
 ## MCP Tools
 
@@ -77,7 +80,7 @@ memex/
 
 ## Testing
 
-- Tests in `tests/memex/` -- ~326 tests, 83%+ coverage
+- Tests in `tests/memex/` -- ~418 tests, 83%+ coverage
 - `conftest.py` provides `tmp_db_path` fixture
 - Server tests exercise DB methods directly (MCP protocol testing deferred)
 
@@ -95,3 +98,6 @@ memex/
 - Claude Code importer uses "conversation_only" mode (strips tool use, thinking, progress). Future `claude_code_full` importer can coexist for full-fidelity import
 - `--no-copy-assets` on import skips media asset resolution and copying
 - `copy_assets` is idempotent: skips blocks already having `assets/` relative URLs
+- HTML exporter outputs a directory (not a file): `index.html` + `conversations.db` + `assets/`
+- `_cmd_export()` passes `db_path=db.db_path` to all exporters; markdown/json accept `**kwargs`
+- HTML SPA search uses `LIKE '%term%'` on raw `messages.content` JSON (no FTS5 in sql.js)

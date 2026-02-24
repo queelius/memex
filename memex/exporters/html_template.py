@@ -1209,7 +1209,7 @@ function renderMarkdown(text) {
 
   /* Extract fenced code blocks and replace with placeholders */
   var codeBlocks = [];
-  text = text.replace(/```(\w*)\n([\s\S]*?)```/g, function(m, lang, code) {
+  text = text.replace(/```(\w*)\\n([\s\S]*?)```/g, function(m, lang, code) {
     var idx = codeBlocks.length;
     var cls = lang ? ' class="language-' + lang + '"' : "";
     codeBlocks.push("<pre><code" + cls + ">" + code + "</code></pre>");
@@ -1218,7 +1218,7 @@ function renderMarkdown(text) {
 
   /* Extract inline code and replace with placeholders */
   var inlineCodes = [];
-  text = text.replace(/`([^`\n]+)`/g, function(m, code) {
+  text = text.replace(/`([^`\\n]+)`/g, function(m, code) {
     var idx = inlineCodes.length;
     inlineCodes.push("<code>" + code + "</code>");
     return "\x00IC" + idx + "\x00";
@@ -1235,7 +1235,7 @@ function renderMarkdown(text) {
 
   /* Unordered lists */
   text = text.replace(/^[*-] (.+)$/gm, "<li>$1</li>");
-  text = text.replace(/((?:<li>.*<\/li>\n?)+)/g, "<ul>$1</ul>");
+  text = text.replace(/((?:<li>.*<\/li>\\n?)+)/g, "<ul>$1</ul>");
 
   /* Images: ![alt](url) */
   text = text.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img src="$2" alt="$1" loading="lazy">');
@@ -1253,10 +1253,10 @@ function renderMarkdown(text) {
   text = text.replace(/\*(.+?)\*/g, "<em>$1</em>");
 
   /* Paragraph breaks: double newline */
-  text = text.replace(/\n\n+/g, "</p><p>");
+  text = text.replace(/\\n\\n+/g, "</p><p>");
 
   /* Single newlines to <br> (but not inside block elements) */
-  text = text.replace(/\n/g, "<br>");
+  text = text.replace(/\\n/g, "<br>");
 
   /* Wrap in paragraph if not starting with block element */
   if (!/^\s*<(h[1-4]|pre|ul|hr|p)/.test(text)) {
