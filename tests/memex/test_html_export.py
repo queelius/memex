@@ -396,3 +396,163 @@ class TestHtmlRendering:
         end = html.index("function renderConversation(")
         chunk = html[start:end]
         assert "ORDER BY created_at" in chunk
+
+
+class TestHtmlTimeline:
+    """Tests for timeline scrubber (Task 4)."""
+
+    def test_template_has_timeline_state_variables(self):
+        """Template should have timelineData and timelineSelection state."""
+        html = get_template()
+        assert "var timelineData = []" in html
+        assert "var timelineSelection = null" in html
+
+    def test_template_has_timeline_html_elements(self):
+        """Template should have timeline canvas and label spans."""
+        html = get_template()
+        assert 'id="timeline-canvas"' in html
+        assert 'id="timeline-start"' in html
+        assert 'id="timeline-end"' in html
+
+    def test_template_has_timeline_label_css(self):
+        """Template should have CSS for timeline labels."""
+        html = get_template()
+        assert ".timeline-label" in html
+
+    def test_init_timeline_queries_monthly_counts(self):
+        """initTimeline should query monthly conversation counts."""
+        html = get_template()
+        start = html.index("function initTimeline()")
+        end = html.index("function drawTimeline()")
+        chunk = html[start:end]
+        assert "strftime('%Y-%m', created_at)" in chunk
+        assert "GROUP BY month" in chunk
+        assert "ORDER BY month" in chunk
+
+    def test_init_timeline_sets_labels(self):
+        """initTimeline should set timeline-start and timeline-end labels."""
+        html = get_template()
+        start = html.index("function initTimeline()")
+        end = html.index("function drawTimeline()")
+        chunk = html[start:end]
+        assert "timeline-start" in chunk
+        assert "timeline-end" in chunk
+
+    def test_init_timeline_bails_on_no_conversations(self):
+        """initTimeline should bail early if no conversations."""
+        html = get_template()
+        start = html.index("function initTimeline()")
+        chunk = html[start:start + 200]
+        assert "totalConvCount === 0" in chunk
+        assert "return" in chunk
+
+    def test_init_timeline_has_mouse_events(self):
+        """initTimeline should wire mousedown, mousemove, mouseup, dblclick."""
+        html = get_template()
+        start = html.index("function initTimeline()")
+        end = html.index("function drawTimeline()")
+        chunk = html[start:end]
+        assert '"mousedown"' in chunk
+        assert '"mousemove"' in chunk
+        assert '"mouseup"' in chunk
+        assert '"dblclick"' in chunk
+
+    def test_init_timeline_mouseup_sets_date_filters(self):
+        """mouseup should set activeFilters.dateFrom and dateTo."""
+        html = get_template()
+        start = html.index("function initTimeline()")
+        end = html.index("function drawTimeline()")
+        chunk = html[start:end]
+        assert "activeFilters.dateFrom" in chunk
+        assert "activeFilters.dateTo" in chunk
+        assert "loadConversations()" in chunk
+
+    def test_init_timeline_dblclick_clears_selection(self):
+        """Double-click should clear selection and date filters."""
+        html = get_template()
+        start = html.index("function initTimeline()")
+        end = html.index("function drawTimeline()")
+        chunk = html[start:end]
+        # Find dblclick handler
+        dblclick_pos = chunk.index('"dblclick"')
+        after_dblclick = chunk[dblclick_pos:]
+        assert "timelineSelection = null" in after_dblclick
+        assert "activeFilters.dateFrom = null" in after_dblclick
+        assert "activeFilters.dateTo = null" in after_dblclick
+
+    def test_init_timeline_uses_resize_observer(self):
+        """initTimeline should use ResizeObserver to redraw on resize."""
+        html = get_template()
+        start = html.index("function initTimeline()")
+        end = html.index("function drawTimeline()")
+        chunk = html[start:end]
+        assert "ResizeObserver" in chunk
+        assert "drawTimeline()" in chunk
+
+    def test_draw_timeline_exists(self):
+        """Template should have drawTimeline function."""
+        html = get_template()
+        assert "function drawTimeline()" in html
+
+    def test_draw_timeline_handles_device_pixel_ratio(self):
+        """drawTimeline should handle devicePixelRatio for crisp rendering."""
+        html = get_template()
+        start = html.index("function drawTimeline()")
+        end = html.index("function sendMessage()")
+        chunk = html[start:end]
+        assert "devicePixelRatio" in chunk
+
+    def test_draw_timeline_reads_css_colors(self):
+        """drawTimeline should read colors from CSS custom properties."""
+        html = get_template()
+        start = html.index("function drawTimeline()")
+        end = html.index("function sendMessage()")
+        chunk = html[start:end]
+        assert "getComputedStyle" in chunk
+        assert "getPropertyValue" in chunk
+        assert "--border" in chunk
+        assert "--text-accent" in chunk
+
+    def test_draw_timeline_uses_canvas_2d(self):
+        """drawTimeline should use canvas 2d context."""
+        html = get_template()
+        start = html.index("function drawTimeline()")
+        end = html.index("function sendMessage()")
+        chunk = html[start:end]
+        assert "getContext" in chunk
+        assert '"2d"' in chunk
+
+    def test_draw_timeline_calculates_bar_dimensions(self):
+        """drawTimeline should calculate bar width and height from data."""
+        html = get_template()
+        start = html.index("function drawTimeline()")
+        end = html.index("function sendMessage()")
+        chunk = html[start:end]
+        assert "maxCount" in chunk
+        assert "fillRect" in chunk
+
+    def test_draw_timeline_uses_accent_for_selection(self):
+        """drawTimeline should use accent color for selected bars."""
+        html = get_template()
+        start = html.index("function drawTimeline()")
+        end = html.index("function sendMessage()")
+        chunk = html[start:end]
+        assert "accentColor" in chunk
+        assert "barColor" in chunk
+        assert "timelineSelection" in chunk
+
+    def test_draw_timeline_clears_canvas(self):
+        """drawTimeline should clear the canvas before redrawing."""
+        html = get_template()
+        start = html.index("function drawTimeline()")
+        end = html.index("function sendMessage()")
+        chunk = html[start:end]
+        assert "clearRect" in chunk
+
+    def test_init_timeline_calls_draw_timeline(self):
+        """initTimeline should call drawTimeline after loading data."""
+        html = get_template()
+        start = html.index("function initTimeline()")
+        end = html.index("function drawTimeline()")
+        chunk = html[start:end]
+        assert "drawTimeline()" in chunk

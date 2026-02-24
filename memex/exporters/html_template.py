@@ -288,8 +288,17 @@ html, body {
 }
 
 #timeline-canvas {
-  width: 100%;
+  flex: 1;
   height: 32px;
+  cursor: crosshair;
+}
+
+.timeline-label {
+  color: var(--text-muted);
+  font-size: 10px;
+  white-space: nowrap;
+  user-select: none;
+  min-width: 0;
 }
 
 /* Settings overlay */
@@ -580,7 +589,9 @@ html, body {
 
   <!-- Timeline bar -->
   <div id="timeline">
+    <span id="timeline-start" class="timeline-label"></span>
     <canvas id="timeline-canvas"></canvas>
+    <span id="timeline-end" class="timeline-label"></span>
   </div>
 
 </div>
@@ -745,6 +756,8 @@ var activeConvId = null;
 var searchTimer = null;
 var searchWired = false;
 var totalConvCount = 0;
+var timelineData = [];
+var timelineSelection = null;
 
 /* -- helpers --------------------------------------------------------- */
 
@@ -1208,7 +1221,138 @@ function renderMarkdown(text) {
 
 /** Initialize the timeline bar at the bottom. */
 function initTimeline() {
-  // TODO: implemented in Task 4
+  if (totalConvCount === 0) return;
+
+  /* Query monthly conversation counts */
+  var rows = query(
+    "SELECT strftime('%Y-%m', created_at) AS month, COUNT(*) AS count FROM conversations GROUP BY month ORDER BY month"
+  );
+  if (rows.length === 0) return;
+
+  timelineData = rows;
+  timelineSelection = null;
+
+  /* Set start/end labels */
+  var startLabel = document.getElementById("timeline-start");
+  var endLabel = document.getElementById("timeline-end");
+  startLabel.textContent = rows[0].month;
+  endLabel.textContent = rows[rows.length - 1].month;
+
+  drawTimeline();
+
+  /* Mouse interaction state */
+  var canvas = document.getElementById("timeline-canvas");
+  var dragging = false;
+  var dragStartIdx = -1;
+
+  canvas.addEventListener("mousedown", function(e) {
+    if (timelineData.length === 0) return;
+    dragging = true;
+    var rect = canvas.getBoundingClientRect();
+    var x = e.clientX - rect.left;
+    var barW = rect.width / timelineData.length;
+    dragStartIdx = Math.min(Math.floor(x / barW), timelineData.length - 1);
+    dragStartIdx = Math.max(0, dragStartIdx);
+    timelineSelection = { start: dragStartIdx, end: dragStartIdx };
+    drawTimeline();
+  });
+
+  canvas.addEventListener("mousemove", function(e) {
+    if (!dragging || timelineData.length === 0) return;
+    var rect = canvas.getBoundingClientRect();
+    var x = e.clientX - rect.left;
+    var barW = rect.width / timelineData.length;
+    var idx = Math.min(Math.floor(x / barW), timelineData.length - 1);
+    idx = Math.max(0, idx);
+    timelineSelection = { start: Math.min(dragStartIdx, idx), end: Math.max(dragStartIdx, idx) };
+    drawTimeline();
+  });
+
+  canvas.addEventListener("mouseup", function() {
+    if (!dragging) return;
+    dragging = false;
+    if (!timelineSelection || timelineData.length === 0) return;
+    var fromMonth = timelineData[timelineSelection.start].month;
+    var toMonth = timelineData[timelineSelection.end].month;
+    activeFilters.dateFrom = fromMonth + "-01";
+    /* Set dateTo to end of month */
+    var toYear = parseInt(toMonth.substring(0, 4));
+    var toMon = parseInt(toMonth.substring(5, 7));
+    if (toMon === 12) { toYear++; toMon = 1; } else { toMon++; }
+    var nextMonth = toYear + "-" + (toMon < 10 ? "0" + toMon : toMon) + "-01";
+    activeFilters.dateTo = nextMonth;
+    loadConversations();
+  });
+
+  canvas.addEventListener("dblclick", function() {
+    timelineSelection = null;
+    activeFilters.dateFrom = null;
+    activeFilters.dateTo = null;
+    drawTimeline();
+    loadConversations();
+  });
+
+  /* Redraw on resize */
+  if (typeof ResizeObserver !== "undefined") {
+    new ResizeObserver(function() {
+      drawTimeline();
+    }).observe(canvas.parentElement);
+  }
+}
+
+/**
+ * Draw the timeline bar chart on the canvas.
+ * Each month is a vertical bar, height proportional to count/maxCount.
+ * Selected range bars use accent color, others use border color.
+ * Handles devicePixelRatio for crisp rendering.
+ */
+function drawTimeline() {
+  var canvas = document.getElementById("timeline-canvas");
+  if (!canvas || timelineData.length === 0) return;
+  var ctx = canvas.getContext("2d");
+  var dpr = window.devicePixelRatio || 1;
+
+  /* Size canvas to match CSS layout */
+  var rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  var w = rect.width;
+  var h = rect.height;
+  var n = timelineData.length;
+  var barW = w / n;
+  var gap = Math.max(1, barW * 0.15);
+  var margin = 2;
+
+  /* Find max count */
+  var maxCount = 0;
+  for (var i = 0; i < n; i++) {
+    if (timelineData[i].count > maxCount) maxCount = timelineData[i].count;
+  }
+  if (maxCount === 0) return;
+
+  /* Read colors from CSS custom properties */
+  var style = getComputedStyle(canvas);
+  var barColor = style.getPropertyValue("--border").trim() || "#30363d";
+  var accentColor = style.getPropertyValue("--text-accent").trim() || "#58a6ff";
+
+  ctx.save();
+  ctx.scale(dpr, dpr);
+
+  for (var j = 0; j < n; j++) {
+    var barH = (timelineData[j].count / maxCount) * (h - margin * 2);
+    var x = j * barW + gap / 2;
+    var y = h - margin - barH;
+
+    var selected = timelineSelection &&
+      j >= timelineSelection.start && j <= timelineSelection.end;
+    ctx.fillStyle = selected ? accentColor : barColor;
+    ctx.fillRect(x, y, barW - gap, barH);
+  }
+
+  ctx.restore();
 }
 
 /**
