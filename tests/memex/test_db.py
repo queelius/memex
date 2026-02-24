@@ -1008,3 +1008,97 @@ class TestMigrationV1toV2:
         db2 = Database(tmp_db_path)
         assert len(db2.get_enrichments("c1")) == 1
         assert db2.execute_sql("SELECT version FROM schema_version")[0]["version"] == 2
+
+
+class TestUpdateMessageContent:
+    def test_updates_content(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        new_content = [{"type": "text", "text": "replaced"}]
+        db.update_message_content("c1", "m1", new_content)
+        conv = db.load_conversation("c1")
+        assert conv.messages["m1"].content == new_content
+
+    def test_updates_fts(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())  # m1 has "hello"
+        db.update_message_content("c1", "m1", [{"type": "text", "text": "replaced text"}])
+        # New text findable
+        results = db.search_messages("replaced")
+        assert len(results) >= 1
+        # Old text not findable
+        results = db.search_messages("hello")
+        assert len(results) == 0
+
+    def test_nonexistent_raises(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        with pytest.raises(ValueError):
+            db.update_message_content("c1", "no_such_msg", [])
+
+    def test_readonly_fails(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        db.close()
+        db = Database(tmp_db_path, readonly=True)
+        with pytest.raises(Exception):
+            db.update_message_content("c1", "m1", [{"type": "text", "text": "nope"}])
+
+    def test_empty_text_removes_fts(self, tmp_db_path):
+        """Updating to non-text content removes FTS entry."""
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        db.update_message_content("c1", "m1", [{"type": "tool_use", "id": "t1"}])
+        results = db.search_messages("hello")
+        assert len(results) == 0
+
+    def test_preserves_other_messages(self, tmp_db_path):
+        """Updating one message doesn't affect others."""
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        db.update_message_content("c1", "m1", [{"type": "text", "text": "new"}])
+        conv = db.load_conversation("c1")
+        assert conv.messages["m2"].content == [{"type": "text", "text": "hi"}]
+        results = db.search_messages("hi")
+        assert len(results) >= 1
+
+
+class TestDeleteConversation:
+    def test_deletes_conversation(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        assert db.delete_conversation("c1") is True
+        assert db.load_conversation("c1") is None
+
+    def test_cascades_fts(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        db.delete_conversation("c1")
+        results = db.search_messages("hello")
+        assert len(results) == 0
+
+    def test_cascades_enrichments(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        db.save_enrichment("c1", "topic", "test", "heuristic")
+        db.delete_conversation("c1")
+        assert db.get_enrichments("c1") == []
+
+    def test_cascades_tags(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())  # has tags ["python", "testing"]
+        db.delete_conversation("c1")
+        rows = db.execute_sql("SELECT * FROM tags WHERE conversation_id='c1'")
+        assert len(rows) == 0
+
+    def test_nonexistent_returns_false(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        assert db.delete_conversation("nope") is False
+
+    def test_readonly_fails(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.save_conversation(_make_conv())
+        db.close()
+        db = Database(tmp_db_path, readonly=True)
+        with pytest.raises(Exception):
+            db.delete_conversation("c1")

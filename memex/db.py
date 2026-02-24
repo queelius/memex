@@ -720,6 +720,62 @@ class Database:
             self.conn.rollback()
             raise
 
+    def update_message_content(
+        self, conversation_id: str, message_id: str, content: list
+    ) -> None:
+        """Update a message's content and re-index FTS5."""
+        existing = self.execute_sql(
+            "SELECT id FROM messages WHERE conversation_id=? AND id=?",
+            (conversation_id, message_id),
+        )
+        if not existing:
+            raise ValueError(
+                f"Message not found: {message_id} in conversation {conversation_id}"
+            )
+        try:
+            self.conn.execute(
+                "UPDATE messages SET content=? WHERE conversation_id=? AND id=?",
+                (json.dumps(content), conversation_id, message_id),
+            )
+            # Re-index FTS: delete old entry, insert new if text content exists
+            self.conn.execute(
+                "DELETE FROM messages_fts WHERE conversation_id=? AND message_id=?",
+                (conversation_id, message_id),
+            )
+            text = " ".join(
+                b.get("text", "") for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            ).strip()
+            if text:
+                self.conn.execute(
+                    "INSERT INTO messages_fts "
+                    "(conversation_id,message_id,text) VALUES (?,?,?)",
+                    (conversation_id, message_id, text),
+                )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def delete_conversation(self, conversation_id: str) -> bool:
+        """Delete a conversation and all related data. Returns True if found."""
+        try:
+            # Clean FTS first (not covered by CASCADE)
+            self.conn.execute(
+                "DELETE FROM messages_fts WHERE conversation_id=?",
+                (conversation_id,),
+            )
+            # CASCADE handles messages, tags, enrichments, provenance
+            cursor = self.conn.execute(
+                "DELETE FROM conversations WHERE id=?",
+                (conversation_id,),
+            )
+            self.conn.commit()
+            return cursor.rowcount > 0
+        except Exception:
+            self.conn.rollback()
+            raise
+
     # ── Enrichments ──────────────────────────────────────────────
 
     def save_enrichment(
