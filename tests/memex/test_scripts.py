@@ -1,11 +1,15 @@
 """Tests for scripts framework discovery and CLI integration."""
 import argparse
+import json
 import types
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from memex.db import Database
+from memex.models import Conversation, Message, text_block
 from memex.scripts import discover_scripts, load_script
 
 
@@ -157,3 +161,59 @@ class TestCLIRun:
                 _cmd_run(args, [])
         out = capsys.readouterr().out
         assert "hello from script" in out
+
+
+def _make_conv(id="c1", title="Test", msg_text="hello"):
+    now = datetime.now()
+    conv = Conversation(id=id, created_at=now, updated_at=now, title=title,
+                        source="test", model="gpt-4")
+    conv.add_message(Message(id="m1", role="user", content=[text_block(msg_text)]))
+    return conv
+
+
+class TestEnrichTrivialScript:
+    def test_has_convention_interface(self):
+        mod = load_script("enrich_trivial")
+        assert hasattr(mod, "register_args")
+        assert hasattr(mod, "run")
+        assert mod.__doc__
+
+    def test_dry_run_returns_stats(self, tmp_db_path):
+        """Dry run scans but doesn't write."""
+        db = Database(tmp_db_path)
+        conv = _make_conv(msg_text="hi")
+        conv.message_count = 1
+        db.save_conversation(conv)
+        db.close()
+
+        db = Database(tmp_db_path, readonly=True)
+        mod = load_script("enrich_trivial")
+        script_args = argparse.Namespace(max_messages=4)
+        stats = mod.run(db, script_args, apply=False)
+        assert stats["greeting"] >= 0  # returns stats dict
+        # DB unchanged — no enrichments
+        db.close()
+        db = Database(tmp_db_path, readonly=True)
+        enrichments = db.get_enrichments("c1")
+        assert len(enrichments) == 0
+        db.close()
+
+    def test_apply_writes_enrichments(self, tmp_db_path):
+        """Apply mode writes enrichments to DB."""
+        db = Database(tmp_db_path)
+        # Empty conversation (0 messages) — trivial with confidence 1.0
+        now = datetime.now()
+        conv = Conversation(id="empty1", created_at=now, updated_at=now,
+                            title="Empty", message_count=0, source="test")
+        db.save_conversation(conv)
+
+        mod = load_script("enrich_trivial")
+        script_args = argparse.Namespace(max_messages=4)
+        stats = mod.run(db, script_args, apply=True)
+        assert stats["trivial"] >= 1
+
+        enrichments = db.get_enrichments("empty1")
+        importance_vals = [e for e in enrichments if e["type"] == "importance"]
+        assert len(importance_vals) == 1
+        assert importance_vals[0]["value"] == "trivial"
+        db.close()
