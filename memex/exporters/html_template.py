@@ -246,7 +246,6 @@ html, body {
 .message.assistant .message-role { color: var(--success); }
 
 .message-content {
-  white-space: pre-wrap;
   word-break: break-word;
 }
 
@@ -435,6 +434,115 @@ html, body {
   border-color: var(--text-accent);
   color: var(--bg);
 }
+
+/* Conversation header */
+.conv-header {
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.conv-header h2 {
+  font-size: var(--font-size-lg);
+  color: var(--text-strong);
+  margin-bottom: 4px;
+}
+
+.conv-header-meta {
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+  margin-bottom: 6px;
+}
+
+.conv-header-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.conv-tag {
+  display: inline-block;
+  padding: 1px 6px;
+  font-size: 11px;
+  color: var(--text-accent);
+  background: var(--selection);
+  border: 1px solid var(--border-accent);
+  border-radius: 10px;
+}
+
+/* Message content rendering */
+.message-content pre {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px;
+  overflow-x: auto;
+  margin: 8px 0;
+  white-space: pre;
+}
+
+.message-content code {
+  background: var(--bg);
+  padding: 1px 4px;
+  border-radius: 2px;
+  font-size: var(--font-size-sm);
+}
+
+.message-content pre code {
+  background: none;
+  padding: 0;
+}
+
+.message-content img {
+  max-width: 100%;
+  border-radius: var(--radius);
+  margin: 4px 0;
+}
+
+.message-content audio,
+.message-content video {
+  max-width: 100%;
+  margin: 4px 0;
+}
+
+.message-content h1,
+.message-content h2,
+.message-content h3,
+.message-content h4 {
+  color: var(--text-strong);
+  margin: 12px 0 4px 0;
+}
+
+.message-content ul {
+  padding-left: 20px;
+  margin: 4px 0;
+}
+
+.message-content hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 8px 0;
+}
+
+.message-content a {
+  color: var(--text-accent);
+  text-decoration: none;
+}
+
+.message-content a:hover {
+  text-decoration: underline;
+}
+
+.message-content p {
+  margin: 4px 0;
+}
+
+/* System role messages */
+.message.system {
+  border-left: 3px solid var(--warning);
+}
+
+.message.system .message-role { color: var(--warning); }
 
 /* Utility classes */
 .hidden { display: none !important; }
@@ -633,6 +741,7 @@ function showFilePicker(SQL) {
 
 /* -- state ----------------------------------------------------------- */
 var activeFilters = { source: null, tag: null, starred: false, dateFrom: null, dateTo: null };
+var activeConvId = null;
 var searchTimer = null;
 var searchWired = false;
 var totalConvCount = 0;
@@ -866,7 +975,235 @@ function loadConversations() {
  * @param {string} convId - Conversation ID
  */
 function openConversation(convId) {
-  // TODO: implemented in Task 3
+  activeConvId = convId;
+
+  /* Highlight active sidebar item */
+  var items = document.querySelectorAll(".conv-item");
+  for (var i = 0; i < items.length; i++) {
+    items[i].classList.toggle("active", items[i].getAttribute("data-id") === convId);
+  }
+
+  /* Query conversation metadata */
+  var convRows = query("SELECT * FROM conversations WHERE id = ?", [convId]);
+  if (convRows.length === 0) return;
+  var conv = convRows[0];
+
+  /* Query messages ordered by created_at */
+  var messages = query(
+    "SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC",
+    [convId]
+  );
+
+  /* Query tags */
+  var tagRows = query("SELECT tag FROM tags WHERE conversation_id = ?", [convId]);
+  var tags = [];
+  for (var t = 0; t < tagRows.length; t++) tags.push(tagRows[t].tag);
+
+  renderConversation(conv, messages, tags);
+}
+
+/**
+ * Render conversation header, messages, and input area.
+ * @param {Object} conv - Conversation row
+ * @param {Array} messages - Message rows
+ * @param {Array<string>} tags - Tag strings
+ */
+function renderConversation(conv, messages, tags) {
+  var container = document.getElementById("messages");
+  var titleEl = document.getElementById("conv-title");
+  var inputArea = document.getElementById("input-area");
+
+  /* Update header title */
+  titleEl.textContent = conv.title || "Untitled";
+
+  /* Build messages HTML */
+  var html = "";
+
+  /* Conversation header block */
+  html += '<div class="conv-header">';
+  html += "<h2>" + esc(conv.title || "Untitled") + "</h2>";
+  var meta = [];
+  if (conv.source) meta.push(esc(conv.source));
+  if (conv.model) meta.push(esc(conv.model));
+  meta.push(messages.length + " messages");
+  if (conv.created_at) meta.push(fmtDate(conv.created_at));
+  html += '<div class="conv-header-meta">' + meta.join(" &middot; ") + "</div>";
+  if (tags.length > 0) {
+    html += '<div class="conv-header-tags">';
+    for (var t = 0; t < tags.length; t++) {
+      html += '<span class="conv-tag">' + esc(tags[t]) + "</span>";
+    }
+    html += "</div>";
+  }
+  html += "</div>";
+
+  /* Render each message */
+  for (var i = 0; i < messages.length; i++) {
+    var msg = messages[i];
+    var role = msg.role || "unknown";
+    var roleCls = (role === "user" || role === "assistant" || role === "system") ? role : "";
+    html += '<div class="message ' + roleCls + '">';
+    html += '<div class="message-role">' + esc(role) + "</div>";
+    html += '<div class="message-content">';
+
+    /* Parse content blocks from JSON */
+    var blocks = [];
+    try {
+      var parsed = JSON.parse(msg.content);
+      if (Array.isArray(parsed)) {
+        blocks = parsed;
+      } else if (typeof parsed === "string") {
+        blocks = [{ type: "text", text: parsed }];
+      } else {
+        blocks = [parsed];
+      }
+    } catch (e) {
+      /* If not JSON, treat as plain text */
+      blocks = [{ type: "text", text: String(msg.content || "") }];
+    }
+
+    html += renderContent(blocks);
+    html += "</div></div>";
+  }
+
+  container.innerHTML = html;
+
+  /* Show input area */
+  inputArea.classList.remove("hidden");
+}
+
+/**
+ * Render an array of content blocks to HTML.
+ * @param {Array<Object>} blocks - Content blocks
+ * @returns {string} HTML string
+ */
+function renderContent(blocks) {
+  var parts = [];
+  for (var i = 0; i < blocks.length; i++) {
+    var b = blocks[i];
+    var btype = b.type || "";
+    if (btype === "text" && b.text) {
+      parts.push(renderMarkdown(b.text));
+    } else if (btype === "media") {
+      parts.push(renderMedia(b));
+    }
+    /* Skip tool_use, tool_result, thinking */
+  }
+  return parts.join("");
+}
+
+/**
+ * Render a media content block to HTML.
+ * @param {Object} block - Media block with media_type, url, data, filename
+ * @returns {string} HTML string
+ */
+function renderMedia(block) {
+  var mt = block.media_type || "";
+  var url = block.url || "";
+  var data = block.data || "";
+  var fname = block.filename || "";
+
+  /* Build data URI if we have base64 data and no url */
+  if (!url && data && mt) {
+    url = "data:" + mt + ";base64," + data;
+  }
+
+  if (!url) {
+    return fname ? "<span>[" + esc(fname) + "]</span>" : "";
+  }
+
+  if (mt.startsWith("image/")) {
+    return '<img src="' + esc(url) + '" alt="' + esc(fname || "image") + '" loading="lazy">';
+  }
+  if (mt.startsWith("audio/")) {
+    return '<audio controls src="' + esc(url) + '"></audio>';
+  }
+  if (mt.startsWith("video/")) {
+    return '<video controls src="' + esc(url) + '"></video>';
+  }
+  return '<a href="' + esc(url) + '" target="_blank">' + esc(fname || "attachment") + "</a>";
+}
+
+/**
+ * Lightweight markdown-to-HTML renderer.
+ * Handles fenced code blocks, inline code, headings, bold, italic,
+ * images, links, horizontal rules, unordered lists, and paragraphs.
+ * @param {string} text - Raw markdown text
+ * @returns {string} HTML string
+ */
+function renderMarkdown(text) {
+  if (!text) return "";
+
+  /* Escape HTML entities first */
+  text = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+  /* Extract fenced code blocks and replace with placeholders */
+  var codeBlocks = [];
+  text = text.replace(/```(\w*)\n([\s\S]*?)```/g, function(m, lang, code) {
+    var idx = codeBlocks.length;
+    var cls = lang ? ' class="language-' + lang + '"' : "";
+    codeBlocks.push("<pre><code" + cls + ">" + code + "</code></pre>");
+    return "\x00CB" + idx + "\x00";
+  });
+
+  /* Extract inline code and replace with placeholders */
+  var inlineCodes = [];
+  text = text.replace(/`([^`\n]+)`/g, function(m, code) {
+    var idx = inlineCodes.length;
+    inlineCodes.push("<code>" + code + "</code>");
+    return "\x00IC" + idx + "\x00";
+  });
+
+  /* Headings */
+  text = text.replace(/^#### (.+)$/gm, "<h4>$1</h4>");
+  text = text.replace(/^### (.+)$/gm, "<h3>$1</h3>");
+  text = text.replace(/^## (.+)$/gm, "<h2>$1</h2>");
+  text = text.replace(/^# (.+)$/gm, "<h1>$1</h1>");
+
+  /* Horizontal rules */
+  text = text.replace(/^---+$/gm, "<hr>");
+
+  /* Unordered lists */
+  text = text.replace(/^[*-] (.+)$/gm, "<li>$1</li>");
+  text = text.replace(/((?:<li>.*<\/li>\n?)+)/g, "<ul>$1</ul>");
+
+  /* Images: ![alt](url) */
+  text = text.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img src="$2" alt="$1" loading="lazy">');
+
+  /* Links: [text](url) */
+  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+
+  /* Bold+italic: ***text*** */
+  text = text.replace(/\*\*\*(.+?)\*\*\*/g, "<strong><em>$1</em></strong>");
+
+  /* Bold: **text** */
+  text = text.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+
+  /* Italic: *text* */
+  text = text.replace(/\*(.+?)\*/g, "<em>$1</em>");
+
+  /* Paragraph breaks: double newline */
+  text = text.replace(/\n\n+/g, "</p><p>");
+
+  /* Single newlines to <br> (but not inside block elements) */
+  text = text.replace(/\n/g, "<br>");
+
+  /* Wrap in paragraph if not starting with block element */
+  if (!/^\s*<(h[1-4]|pre|ul|hr|p)/.test(text)) {
+    text = "<p>" + text + "</p>";
+  }
+
+  /* Restore inline code placeholders */
+  text = text.replace(/\x00IC(\d+)\x00/g, function(m, idx) {
+    return inlineCodes[parseInt(idx)];
+  });
+
+  /* Restore code block placeholders */
+  text = text.replace(/\x00CB(\d+)\x00/g, function(m, idx) {
+    return codeBlocks[parseInt(idx)];
+  });
+
+  return text;
 }
 
 /** Initialize the timeline bar at the bottom. */
