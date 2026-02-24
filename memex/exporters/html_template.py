@@ -553,6 +553,46 @@ html, body {
 
 .message.system .message-role { color: var(--warning); }
 
+/* Settings form */
+.settings-field {
+  margin-bottom: 12px;
+}
+
+.settings-field label {
+  display: block;
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+  margin-bottom: 4px;
+}
+
+.settings-field input,
+.settings-field textarea {
+  width: 100%;
+  padding: 6px 8px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  outline: none;
+}
+
+.settings-field input:focus,
+.settings-field textarea:focus {
+  border-color: var(--border-accent);
+}
+
+.settings-field textarea {
+  resize: vertical;
+}
+
+.settings-actions {
+  display: flex;
+  gap: var(--gap);
+  margin-top: 16px;
+}
+
 /* Utility classes */
 .hidden { display: none !important; }
 </style>
@@ -600,8 +640,22 @@ html, body {
 <div id="settings-overlay">
   <div id="settings-panel">
     <h3>settings</h3>
-    <p>Settings panel placeholder.</p>
-    <button class="btn" onclick="toggleSettings()">close</button>
+    <div class="settings-field">
+      <label for="setting-api-key">Anthropic API key</label>
+      <input type="password" id="setting-api-key" placeholder="sk-ant-..." autocomplete="off" spellcheck="false">
+    </div>
+    <div class="settings-field">
+      <label for="setting-model">Model</label>
+      <input type="text" id="setting-model" placeholder="claude-sonnet-4-6" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="settings-field">
+      <label for="setting-system-prompt">System prompt (optional)</label>
+      <textarea id="setting-system-prompt" rows="4" placeholder="You are a helpful assistant..."></textarea>
+    </div>
+    <div class="settings-actions">
+      <button class="btn btn-primary" onclick="saveSettings()">save</button>
+      <button class="btn" onclick="toggleSettings()">close</button>
+    </div>
   </div>
 </div>
 
@@ -822,6 +876,9 @@ function onDbLoaded() {
     });
     searchWired = true;
   }
+
+  /* Load settings from localStorage */
+  loadSettings();
 }
 
 /**
@@ -1359,8 +1416,164 @@ function drawTimeline() {
  * Send a message via Anthropic API (resume chat).
  * Requires API key configured in settings (anthropic-dangerous-direct-browser-access).
  */
-function sendMessage() {
-  // TODO: implemented in Task 5
+async function sendMessage() {
+  if (!db || !activeConvId) return;
+
+  var apiKey = localStorage.getItem("memex_api_key") || "";
+  if (!apiKey) {
+    toggleSettings();
+    return;
+  }
+
+  var input = document.getElementById("message-input");
+  var sendBtn = document.getElementById("send-btn");
+  var userText = input.value.trim();
+  if (!userText) return;
+
+  /* Disable input during streaming */
+  input.value = "";
+  sendBtn.disabled = true;
+
+  var model = localStorage.getItem("memex_model") || "claude-sonnet-4-6";
+  var systemPrompt = localStorage.getItem("memex_system_prompt") || "";
+
+  /* Build message history from DB */
+  var dbMessages = query(
+    "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY created_at ASC",
+    [activeConvId]
+  );
+  var history = [];
+  for (var i = 0; i < dbMessages.length; i++) {
+    var msg = dbMessages[i];
+    var text = "";
+    try {
+      var parsed = JSON.parse(msg.content);
+      if (Array.isArray(parsed)) {
+        for (var j = 0; j < parsed.length; j++) {
+          if (parsed[j].type === "text" && parsed[j].text) text += parsed[j].text;
+        }
+      } else if (typeof parsed === "string") {
+        text = parsed;
+      }
+    } catch (e) {
+      text = String(msg.content || "");
+    }
+    if (text && (msg.role === "user" || msg.role === "assistant")) {
+      history.push({ role: msg.role, content: text });
+    }
+  }
+
+  /* Add user's new message */
+  history.push({ role: "user", content: userText });
+
+  /* Get the last message ID for parent_id */
+  var lastMsgRows = query(
+    "SELECT id FROM messages WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 1",
+    [activeConvId]
+  );
+  var parentId = lastMsgRows.length > 0 ? lastMsgRows[0].id : null;
+
+  /* INSERT user message into DB */
+  var userMsgId = crypto.randomUUID();
+  var now = new Date().toISOString();
+  var userContent = JSON.stringify([{ type: "text", text: userText }]);
+  exec(
+    "INSERT INTO messages (conversation_id, id, role, content, parent_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    [activeConvId, userMsgId, "user", userContent, parentId, now]
+  );
+
+  /* Render user message in the conversation view */
+  var container = document.getElementById("messages");
+  var userDiv = document.createElement("div");
+  userDiv.className = "message user";
+  userDiv.innerHTML = '<div class="message-role">user</div><div class="message-content">' + renderMarkdown(userText) + "</div>";
+  container.appendChild(userDiv);
+
+  /* Create assistant message div for streaming */
+  var assistDiv = document.createElement("div");
+  assistDiv.className = "message assistant";
+  assistDiv.innerHTML = '<div class="message-role">assistant</div><div class="message-content"></div>';
+  container.appendChild(assistDiv);
+  var assistContent = assistDiv.querySelector(".message-content");
+  container.scrollTop = container.scrollHeight;
+
+  /* Build request body */
+  var body = { model: model, max_tokens: 4096, stream: true, messages: history };
+  if (systemPrompt) body.system = systemPrompt;
+
+  var accumulated = "";
+  try {
+    var response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "anthropic-dangerous-direct-browser-access": "true"
+      },
+      body: JSON.stringify(body)
+    });
+
+    if (!response.ok) {
+      var errText = await response.text();
+      throw new Error("API error " + response.status + ": " + errText);
+    }
+
+    /* Read SSE stream */
+    var reader = response.body.getReader();
+    var decoder = new TextDecoder();
+    var buffer = "";
+
+    while (true) {
+      var result = await reader.read();
+      if (result.done) break;
+      buffer += decoder.decode(result.value, { stream: true });
+
+      var lines = buffer.split("\\n");
+      buffer = lines.pop();
+
+      for (var k = 0; k < lines.length; k++) {
+        var line = lines[k].trim();
+        if (!line.startsWith("data: ")) continue;
+        var data = line.substring(6);
+        if (data === "[DONE]") continue;
+        try {
+          var evt = JSON.parse(data);
+          if (evt.type === "content_block_delta" && evt.delta && evt.delta.type === "text_delta") {
+            accumulated += evt.delta.text;
+            assistContent.innerHTML = renderMarkdown(accumulated);
+            container.scrollTop = container.scrollHeight;
+          }
+        } catch (e) {
+          /* Skip unparseable SSE lines */
+        }
+      }
+    }
+  } catch (err) {
+    if (!accumulated) {
+      assistContent.innerHTML = '<span style="color: var(--danger);">Error: ' + esc(err.message) + "</span>";
+    }
+    console.error("sendMessage error:", err);
+  }
+
+  /* INSERT assistant message into DB */
+  if (accumulated) {
+    var assistMsgId = crypto.randomUUID();
+    var assistNow = new Date().toISOString();
+    var assistContentJson = JSON.stringify([{ type: "text", text: accumulated }]);
+    exec(
+      "INSERT INTO messages (conversation_id, id, role, content, parent_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      [activeConvId, assistMsgId, "assistant", assistContentJson, userMsgId, assistNow]
+    );
+
+    /* Update conversation metadata */
+    exec(
+      "UPDATE conversations SET message_count = (SELECT count(*) FROM messages WHERE conversation_id = ?), updated_at = ? WHERE id = ?",
+      [activeConvId, assistNow, activeConvId]
+    );
+  }
+
+  sendBtn.disabled = false;
 }
 
 /** Download the current database as a .db file. */
@@ -1374,6 +1587,27 @@ function downloadDb() {
   a.download = "conversations.db";
   a.click();
   URL.revokeObjectURL(url);
+}
+
+/** Load settings from localStorage into form fields. */
+function loadSettings() {
+  var apiKey = localStorage.getItem("memex_api_key") || "";
+  var model = localStorage.getItem("memex_model") || "";
+  var systemPrompt = localStorage.getItem("memex_system_prompt") || "";
+  document.getElementById("setting-api-key").value = apiKey;
+  document.getElementById("setting-model").value = model;
+  document.getElementById("setting-system-prompt").value = systemPrompt;
+}
+
+/** Save settings from form fields to localStorage. */
+function saveSettings() {
+  var apiKey = document.getElementById("setting-api-key").value.trim();
+  var model = document.getElementById("setting-model").value.trim();
+  var systemPrompt = document.getElementById("setting-system-prompt").value.trim();
+  localStorage.setItem("memex_api_key", apiKey);
+  localStorage.setItem("memex_model", model);
+  localStorage.setItem("memex_system_prompt", systemPrompt);
+  toggleSettings();
 }
 
 /** Toggle the settings overlay visibility. */

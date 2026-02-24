@@ -556,3 +556,142 @@ class TestHtmlTimeline:
         end = html.index("function drawTimeline()")
         chunk = html[start:end]
         assert "drawTimeline()" in chunk
+
+
+class TestHtmlAnthropicIntegration:
+    """Tests for Anthropic API integration, settings, and DB download (Task 5)."""
+
+    def test_template_has_anthropic_api_code(self):
+        from memex.exporters.html_template import get_template
+        html = get_template()
+        assert 'api.anthropic.com/v1/messages' in html
+        assert 'anthropic-dangerous-direct-browser-access' in html
+        assert 'function sendMessage(' in html
+        assert 'function downloadDb(' in html
+        assert 'localStorage' in html
+
+    def test_template_has_settings_form_fields(self):
+        """Settings panel should have API key, model, and system prompt fields."""
+        html = get_template()
+        assert 'id="setting-api-key"' in html
+        assert 'id="setting-model"' in html
+        assert 'id="setting-system-prompt"' in html
+        assert 'type="password"' in html
+
+    def test_template_has_load_save_settings(self):
+        """Template should have loadSettings and saveSettings functions."""
+        html = get_template()
+        assert 'function loadSettings()' in html
+        assert 'function saveSettings()' in html
+
+    def test_load_settings_reads_localstorage(self):
+        """loadSettings should read memex_api_key, memex_model, memex_system_prompt."""
+        html = get_template()
+        start = html.index("function loadSettings()")
+        chunk = html[start:start + 500]
+        assert 'memex_api_key' in chunk
+        assert 'memex_model' in chunk
+        assert 'memex_system_prompt' in chunk
+        assert 'localStorage.getItem' in chunk
+
+    def test_save_settings_writes_localstorage(self):
+        """saveSettings should write to localStorage."""
+        html = get_template()
+        start = html.index("function saveSettings()")
+        chunk = html[start:start + 500]
+        assert 'localStorage.setItem' in chunk
+
+    def test_on_db_loaded_calls_load_settings(self):
+        """onDbLoaded should call loadSettings()."""
+        html = get_template()
+        start = html.index("function onDbLoaded()")
+        end = html.index("function renderFilters()")
+        chunk = html[start:end]
+        assert "loadSettings()" in chunk
+
+    def test_send_message_checks_api_key(self):
+        """sendMessage should check for API key and open settings if missing."""
+        html = get_template()
+        start = html.index("function sendMessage()")
+        chunk = html[start:start + 600]
+        assert 'memex_api_key' in chunk
+        assert 'toggleSettings()' in chunk
+
+    def test_send_message_builds_history(self):
+        """sendMessage should query message history from DB."""
+        html = get_template()
+        start = html.index("function sendMessage()")
+        chunk = html[start:start + 3000]
+        assert 'FROM messages WHERE conversation_id' in chunk
+        assert 'ORDER BY created_at ASC' in chunk
+
+    def test_send_message_streams_response(self):
+        """sendMessage should use streaming (getReader + TextDecoder)."""
+        html = get_template()
+        start = html.index("function sendMessage()")
+        end = html.index("function downloadDb()")
+        chunk = html[start:end]
+        assert 'getReader()' in chunk
+        assert 'TextDecoder' in chunk
+        assert 'content_block_delta' in chunk
+        assert 'text_delta' in chunk
+
+    def test_send_message_inserts_messages(self):
+        """sendMessage should INSERT both user and assistant messages."""
+        html = get_template()
+        start = html.index("function sendMessage()")
+        end = html.index("function downloadDb()")
+        chunk = html[start:end]
+        assert 'INSERT INTO messages' in chunk
+        assert 'crypto.randomUUID()' in chunk
+
+    def test_send_message_updates_conversation(self):
+        """sendMessage should UPDATE conversation message_count and updated_at."""
+        html = get_template()
+        start = html.index("function sendMessage()")
+        end = html.index("function downloadDb()")
+        chunk = html[start:end]
+        assert 'UPDATE conversations SET message_count' in chunk
+
+    def test_send_message_disables_button_during_stream(self):
+        """Send button should be disabled during streaming."""
+        html = get_template()
+        start = html.index("function sendMessage()")
+        end = html.index("function downloadDb()")
+        chunk = html[start:end]
+        assert 'sendBtn.disabled = true' in chunk
+        assert 'sendBtn.disabled = false' in chunk
+
+    def test_send_message_uses_correct_headers(self):
+        """sendMessage should send correct Anthropic API headers."""
+        html = get_template()
+        start = html.index("function sendMessage()")
+        end = html.index("function downloadDb()")
+        chunk = html[start:end]
+        assert 'x-api-key' in chunk
+        assert 'anthropic-version' in chunk
+        assert '2023-06-01' in chunk
+        assert 'anthropic-dangerous-direct-browser-access' in chunk
+
+    def test_send_message_default_model(self):
+        """sendMessage should default to claude-sonnet-4-6."""
+        html = get_template()
+        start = html.index("function sendMessage()")
+        chunk = html[start:start + 2000]
+        assert 'claude-sonnet-4-6' in chunk
+
+    def test_download_db_exists(self):
+        """downloadDb should export the database as a Blob download."""
+        html = get_template()
+        assert 'function downloadDb()' in html
+        start = html.index("function downloadDb()")
+        chunk = html[start:start + 500]
+        assert 'db.export()' in chunk
+        assert 'Blob' in chunk
+        assert 'conversations.db' in chunk
+
+    def test_settings_css_exists(self):
+        """Template should have CSS for settings form fields."""
+        html = get_template()
+        assert '.settings-field' in html
+        assert '.settings-actions' in html
