@@ -247,3 +247,116 @@ class TestRunApplyBatch:
         stats = run(db, args, apply=True)
         assert stats["word_redactions"] == 0
         db.close()
+
+
+# ── Interactive Review ──────────────────────────────────────────
+
+
+class TestInteractiveMode:
+    def _setup_conv(self, tmp_db_path, text="what the fuck"):
+        from memex.scripts.redact import compile_matchers, scan_message, ScanResult
+        db = Database(tmp_db_path)
+        conv = _make_conv_with_text(text)
+        db.save_conversation(conv)
+        return db
+
+    def test_redact_choice(self, tmp_db_path):
+        """'r' redacts the match."""
+        from memex.scripts.redact import interactive_review, compile_matchers, scan_message
+        db = self._setup_conv(tmp_db_path)
+        matchers = compile_matchers(words=["fuck"])
+        content = [{"type": "text", "text": "what the fuck"}]
+        result = scan_message(content, matchers, "c1", "m1")
+        responses = iter(["r"])
+        stats = interactive_review([result], db, "word", input_fn=lambda _: next(responses))
+        assert stats["redacted"] == 1
+        reloaded = db.load_conversation("c1")
+        assert "[REDACTED]" in reloaded.messages["m1"].get_text()
+        db.close()
+
+    def test_skip_choice(self, tmp_db_path):
+        """'s' skips without modifying."""
+        from memex.scripts.redact import interactive_review, compile_matchers, scan_message
+        db = self._setup_conv(tmp_db_path)
+        matchers = compile_matchers(words=["fuck"])
+        content = [{"type": "text", "text": "what the fuck"}]
+        result = scan_message(content, matchers, "c1", "m1")
+        responses = iter(["s"])
+        stats = interactive_review([result], db, "word", input_fn=lambda _: next(responses))
+        assert stats["skipped"] == 1
+        reloaded = db.load_conversation("c1")
+        assert "fuck" in reloaded.messages["m1"].get_text()
+        db.close()
+
+    def test_quit_stops_early(self, tmp_db_path):
+        """'q' stops and returns what's been done."""
+        from memex.scripts.redact import interactive_review, compile_matchers, scan_message
+        db = Database(tmp_db_path)
+        # Two conversations with profanity
+        conv1 = _make_conv_with_text("what the fuck", id="c1")
+        conv2 = _make_conv_with_text("oh shit", id="c2")
+        db.save_conversation(conv1)
+        db.save_conversation(conv2)
+        matchers = compile_matchers(words=["fuck", "shit"])
+        result1 = scan_message([{"type": "text", "text": "what the fuck"}], matchers, "c1", "m1")
+        result2 = scan_message([{"type": "text", "text": "oh shit"}], matchers, "c2", "m1")
+        responses = iter(["r", "q"])
+        stats = interactive_review([result1, result2], db, "word",
+                                   input_fn=lambda _: next(responses))
+        assert stats["redacted"] == 1
+        # First redacted, second untouched
+        r1 = db.load_conversation("c1")
+        assert "[REDACTED]" in r1.messages["m1"].get_text()
+        r2 = db.load_conversation("c2")
+        assert "shit" in r2.messages["m1"].get_text()
+        db.close()
+
+    def test_all_choice_auto_redacts(self, tmp_db_path):
+        """'a' redacts this and all same-term matches."""
+        from memex.scripts.redact import interactive_review, compile_matchers, scan_message
+        db = Database(tmp_db_path)
+        conv1 = _make_conv_with_text("what the fuck", id="c1")
+        conv2 = _make_conv_with_text("oh fuck again", id="c2")
+        db.save_conversation(conv1)
+        db.save_conversation(conv2)
+        matchers = compile_matchers(words=["fuck"])
+        result1 = scan_message([{"type": "text", "text": "what the fuck"}], matchers, "c1", "m1")
+        result2 = scan_message([{"type": "text", "text": "oh fuck again"}], matchers, "c2", "m1")
+        # Only prompted once — 'a' auto-applies to second
+        responses = iter(["a"])
+        stats = interactive_review([result1, result2], db, "word",
+                                   input_fn=lambda _: next(responses))
+        assert stats["redacted"] == 2
+        r1 = db.load_conversation("c1")
+        assert "[REDACTED]" in r1.messages["m1"].get_text()
+        r2 = db.load_conversation("c2")
+        assert "[REDACTED]" in r2.messages["m1"].get_text()
+        db.close()
+
+    def test_message_level_interactive(self, tmp_db_path):
+        """Interactive mode works for message-level redaction."""
+        from memex.scripts.redact import interactive_review, compile_matchers, scan_message
+        db = self._setup_conv(tmp_db_path)
+        matchers = compile_matchers(words=["fuck"])
+        content = [{"type": "text", "text": "what the fuck"}]
+        result = scan_message(content, matchers, "c1", "m1")
+        responses = iter(["r"])
+        stats = interactive_review([result], db, "message", input_fn=lambda _: next(responses))
+        assert stats["redacted"] == 1
+        reloaded = db.load_conversation("c1")
+        assert reloaded.messages["m1"].get_text() == "[REDACTED]"
+        db.close()
+
+    def test_run_interactive_via_apply_no_yes(self, tmp_db_path):
+        """run() with apply=True, yes=False triggers interactive review."""
+        from memex.scripts.redact import run
+        db = Database(tmp_db_path)
+        conv = _make_conv_with_text("what the fuck")
+        db.save_conversation(conv)
+        args = _make_args(words="fuck", level="word", yes=False)
+        # Patch input to auto-respond 'r'
+        with patch("memex.scripts.redact.interactive_review") as mock_review:
+            mock_review.return_value = {"redacted": 1, "skipped": 0}
+            stats = run(db, args, apply=True)
+            assert mock_review.called
+        db.close()
