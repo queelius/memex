@@ -395,6 +395,47 @@ html, body {
   font-size: var(--font-size-lg);
 }
 
+/* Filter chips */
+#filters {
+  padding: 4px var(--gap);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+#filters:empty {
+  display: none;
+  padding: 0;
+  border: 0;
+}
+
+.filter-chip {
+  display: inline-block;
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: background 0.1s, border-color 0.1s, color 0.1s;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.filter-chip:hover {
+  border-color: var(--text-muted);
+  color: var(--text);
+}
+
+.filter-chip.active {
+  background: var(--text-accent);
+  border-color: var(--text-accent);
+  color: var(--bg);
+}
+
 /* Utility classes */
 .hidden { display: none !important; }
 </style>
@@ -407,6 +448,7 @@ html, body {
     <div id="sidebar-header">
       <input type="text" id="search-box" placeholder="search conversations..." autocomplete="off" spellcheck="false">
     </div>
+    <div id="filters"></div>
     <div id="conv-list"></div>
     <div id="sidebar-footer">
       <span class="status" id="db-status">no database loaded</span>
@@ -589,21 +631,234 @@ function showFilePicker(SQL) {
   });
 }
 
-/* -- placeholder functions (filled in by later tasks) ---------------- */
+/* -- state ----------------------------------------------------------- */
+var activeFilters = { source: null, tag: null, starred: false, dateFrom: null, dateTo: null };
+var searchTimer = null;
+var searchWired = false;
+var totalConvCount = 0;
+
+/* -- helpers --------------------------------------------------------- */
+
+/**
+ * XSS-safe HTML escaping.
+ * @param {string} s - Raw string
+ * @returns {string} Escaped HTML string
+ */
+function esc(s) {
+  if (s == null) return "";
+  var d = document.createElement("div");
+  d.textContent = String(s);
+  return d.innerHTML;
+}
+
+/**
+ * Format an ISO date string to a short display format.
+ * @param {string} iso - ISO date string
+ * @returns {string} Formatted date
+ */
+function fmtDate(iso) {
+  if (!iso) return "";
+  try {
+    var d = new Date(iso);
+    return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+  } catch (e) {
+    return String(iso).substring(0, 10);
+  }
+}
+
+/* -- app lifecycle --------------------------------------------------- */
 
 /** Called after a database is successfully loaded. */
 function onDbLoaded() {
   var status = document.getElementById("db-status");
   var loading = document.getElementById("loading");
-  status.textContent = "database loaded";
+
+  /* Update status */
+  var countRow = query("SELECT count(*) AS n FROM conversations");
+  totalConvCount = countRow.length > 0 ? countRow[0].n : 0;
+  status.textContent = totalConvCount + " conversation" + (totalConvCount !== 1 ? "s" : "");
   status.style.color = "var(--success)";
   loading.textContent = "select a conversation";
+
+  /* Render filter chips */
+  renderFilters();
+
+  /* Initialize timeline (stub called, filled in Task 4) */
+  initTimeline();
+
+  /* Load conversations */
   loadConversations();
+
+  /* Wire up debounced search (once only) */
+  if (!searchWired) {
+    var searchBox = document.getElementById("search-box");
+    searchBox.addEventListener("input", function() {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(function() {
+        loadConversations();
+      }, 200);
+    });
+    searchWired = true;
+  }
 }
 
-/** Load the conversation list into the sidebar. */
+/**
+ * Render source chips, tag chips (top 10), and starred toggle.
+ * Click toggles activeFilters and reloads the conversation list.
+ *
+ * All user-provided strings are escaped via esc() before insertion
+ * to prevent XSS. The esc() function uses textContent assignment
+ * on a detached element, which is a standard safe escaping pattern.
+ */
+function renderFilters() {
+  var container = document.getElementById("filters");
+  var chips = [];
+
+  /* Source chips */
+  var sources = query("SELECT DISTINCT source FROM conversations WHERE source IS NOT NULL AND source != '' ORDER BY source");
+  for (var i = 0; i < sources.length; i++) {
+    var src = sources[i].source;
+    var cls = activeFilters.source === src ? "filter-chip active" : "filter-chip";
+    chips.push({cls: cls, filter: "source", value: src, label: src});
+  }
+
+  /* Tag chips (top 10 by frequency) */
+  var tags = query("SELECT tag, count(*) AS n FROM tags GROUP BY tag ORDER BY n DESC LIMIT 10");
+  for (var j = 0; j < tags.length; j++) {
+    var tag = tags[j].tag;
+    var cls2 = activeFilters.tag === tag ? "filter-chip active" : "filter-chip";
+    chips.push({cls: cls2, filter: "tag", value: tag, label: "#" + tag});
+  }
+
+  /* Starred toggle */
+  var starCls = activeFilters.starred ? "filter-chip active" : "filter-chip";
+  chips.push({cls: starCls, filter: "starred", value: "", label: "starred"});
+
+  /* Build DOM safely */
+  container.textContent = "";
+  for (var k = 0; k < chips.length; k++) {
+    var chip = chips[k];
+    var span = document.createElement("span");
+    span.className = chip.cls;
+    span.setAttribute("data-filter", chip.filter);
+    span.setAttribute("data-value", chip.value);
+    span.textContent = chip.label;
+    span.addEventListener("click", function() {
+      var filterType = this.getAttribute("data-filter");
+      var filterValue = this.getAttribute("data-value");
+      if (filterType === "source") {
+        activeFilters.source = activeFilters.source === filterValue ? null : filterValue;
+      } else if (filterType === "tag") {
+        activeFilters.tag = activeFilters.tag === filterValue ? null : filterValue;
+      } else if (filterType === "starred") {
+        activeFilters.starred = !activeFilters.starred;
+      }
+      renderFilters();
+      loadConversations();
+    });
+    container.appendChild(span);
+  }
+}
+
+/**
+ * Load the conversation list into the sidebar.
+ *
+ * Builds SQL dynamically based on search term and active filters.
+ * All user-provided strings are escaped via esc() before insertion
+ * to prevent XSS. Uses parameterized queries for SQL injection safety.
+ */
 function loadConversations() {
-  // TODO: implemented in Task 2
+  var searchBox = document.getElementById("search-box");
+  var searchTerm = searchBox ? searchBox.value.trim() : "";
+  var convList = document.getElementById("conv-list");
+
+  var sql, params = [];
+
+  if (searchTerm) {
+    sql = "SELECT DISTINCT c.id, c.title, c.source, c.model, c.message_count, c.updated_at, c.starred_at FROM conversations c JOIN messages m ON m.conversation_id = c.id WHERE m.content LIKE '%' || ? || '%'";
+    params.push(searchTerm);
+  } else {
+    sql = "SELECT c.id, c.title, c.source, c.model, c.message_count, c.updated_at, c.starred_at FROM conversations c WHERE 1=1";
+  }
+
+  /* Apply filters */
+  if (activeFilters.source) {
+    sql += " AND c.source = ?";
+    params.push(activeFilters.source);
+  }
+  if (activeFilters.tag) {
+    sql += " AND EXISTS (SELECT 1 FROM tags t WHERE t.conversation_id = c.id AND t.tag = ?)";
+    params.push(activeFilters.tag);
+  }
+  if (activeFilters.starred) {
+    sql += " AND c.starred_at IS NOT NULL";
+  }
+  if (activeFilters.dateFrom) {
+    sql += " AND c.updated_at >= ?";
+    params.push(activeFilters.dateFrom);
+  }
+  if (activeFilters.dateTo) {
+    sql += " AND c.updated_at <= ?";
+    params.push(activeFilters.dateTo);
+  }
+
+  sql += " ORDER BY c.updated_at DESC LIMIT 500";
+
+  var rows;
+  try {
+    rows = query(sql, params.length > 0 ? params : undefined);
+  } catch (e) {
+    console.error("loadConversations query error:", e);
+    rows = [];
+  }
+
+  /* Build DOM safely using createElement + textContent */
+  convList.textContent = "";
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    var title = r.title || "Untitled";
+    var meta = [];
+    if (r.source) meta.push(r.source);
+    if (r.message_count != null) meta.push(r.message_count + " msgs");
+    if (r.updated_at) meta.push(fmtDate(r.updated_at));
+
+    var item = document.createElement("div");
+    item.className = "conv-item";
+    item.setAttribute("data-id", r.id);
+
+    var titleDiv = document.createElement("div");
+    titleDiv.className = "conv-item-title";
+    titleDiv.textContent = (r.starred_at ? "* " : "") + title;
+    item.appendChild(titleDiv);
+
+    var metaDiv = document.createElement("div");
+    metaDiv.className = "conv-item-meta";
+    metaDiv.textContent = meta.join(" \u00b7 ");
+    item.appendChild(metaDiv);
+
+    (function(convId) {
+      item.addEventListener("click", function() { openConversation(convId); });
+    })(r.id);
+
+    convList.appendChild(item);
+  }
+
+  if (rows.length === 0) {
+    var empty = document.createElement("div");
+    empty.style.cssText = "padding: var(--gap); color: var(--text-muted); font-size: var(--font-size-sm);";
+    empty.textContent = "no conversations found";
+    convList.appendChild(empty);
+  }
+
+  /* Update footer count (uses cached totalConvCount from onDbLoaded) */
+  var status = document.getElementById("db-status");
+  if (status) {
+    if (searchTerm || activeFilters.source || activeFilters.tag || activeFilters.starred) {
+      status.textContent = rows.length + " / " + totalConvCount + " conversations";
+    } else {
+      status.textContent = totalConvCount + " conversation" + (totalConvCount !== 1 ? "s" : "");
+    }
+  }
 }
 
 /**
