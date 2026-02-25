@@ -11,6 +11,12 @@ pytest tests/memex/ --cov=memex --cov-report=term-missing
 
 # Install in development mode
 pip install -e ".[dev]"
+
+# Run a script
+memex run --list
+memex run redact --words "word1,word2" --level word
+memex run redact --pattern-file api_keys.txt --level word --apply --yes
+memex run enrich_trivial --apply
 ```
 
 ## Architecture
@@ -25,7 +31,14 @@ memex/
   config.py            # YAML config, DatabaseRegistry
   mcp.py               # FastMCP server (8 tools, 2 resources)
   assets.py            # Asset resolution, copying, media markdown rendering
-  cli.py               # argparse CLI (import, export, show, mcp)
+  cli.py               # argparse CLI (import, export, show, mcp, run)
+  scripts/
+    __init__.py          # Discovery + runner utilities
+    enrich_trivial.py    # Bulk-enrich trivial conversations
+    redact.py            # Content redaction (word/message/conversation level)
+    patterns/            # Built-in regex pattern files
+      api_keys.txt
+      pii.txt
   importers/           # Convention-based: detect() + import_file()
     openai.py
     anthropic.py
@@ -43,6 +56,7 @@ memex/
 - Content blocks as plain dicts with "type" key -- not classes
 - Conversation trees: Dict[str, Message] with parent_id links, _children index
 - Convention-based plugins: modules with detect()/import_file() or export()
+- Convention-based scripts: modules with `register_args()` + `run()` in `memex/scripts/` and `~/.memex/scripts/`
 - FastMCP 2.x with lifespan pattern for DB lifecycle
 - Cursor-based keyset pagination (base64-encoded updated_at + id)
 - Schema versioning: `schema_version` table + `MIGRATIONS` dict for forward migrations
@@ -77,10 +91,12 @@ memex/
 - Schema versioning: `schema_version` table, `MIGRATIONS` dict, auto-applied on open
 - PRAGMA query_only=ON when readonly=True (enforced at SQLite engine level)
 - Database supports context manager: `with Database(path) as db:`
+- `update_message_content()` — updates content + re-indexes FTS5
+- `delete_conversation()` — deletes with CASCADE + FTS5 cleanup
 
 ## Testing
 
-- Tests in `tests/memex/` -- ~418 tests, 83%+ coverage
+- Tests in `tests/memex/` -- ~484 tests, 84%+ coverage
 - `conftest.py` provides `tmp_db_path` fixture
 - Server tests exercise DB methods directly (MCP protocol testing deferred)
 
@@ -101,3 +117,7 @@ memex/
 - HTML exporter outputs a directory (not a file): `index.html` + `conversations.db` + `assets/`
 - `_cmd_export()` passes `db_path=db.db_path` to all exporters; markdown/json accept `**kwargs`
 - HTML SPA search uses `LIKE '%term%'` on raw `messages.content` JSON (no FTS5 in sql.js)
+- Enrichment type `original_content` used by redact script, not validated by MCP (DB layer has no type constraints)
+- `update_message_content` must manually maintain FTS5 (no triggers)
+- `delete_conversation` must clean FTS5 before DELETE (not CASCADE-covered)
+- Redact script uses `parse_known_args` remainder for script-specific args; `--apply`/`--db`/`--verbose` handled by framework
