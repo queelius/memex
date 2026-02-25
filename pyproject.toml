@@ -24,3 +24,6 @@ asyncio_mode = "auto"
 
 [tool.setuptools.packages.find]
 include = ["memex*"]
+
+[tool.setuptools.package-data]
+"memex.scripts" = ["patterns/*.txt"]

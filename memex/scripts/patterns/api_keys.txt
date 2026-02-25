@@ -1,0 +1,12 @@
+# OpenAI API keys (legacy sk- and newer sk-proj- formats)
+sk-[a-zA-Z0-9_-]{20,}
+# GitHub personal access tokens and fine-grained tokens
+gh[ps]_[A-Za-z0-9_]{36,}
+# AWS access key IDs
+AKIA[0-9A-Z]{16}
+# AWS secret access keys (40-char base64)
+(?<![A-Za-z0-9/+=])[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])
+# Anthropic API keys
+sk-ant-[a-zA-Z0-9_-]{20,}
+# Slack tokens
+xox[bpors]-[0-9A-Za-z-]{10,}

@@ -360,3 +360,54 @@ class TestInteractiveMode:
             stats = run(db, args, apply=True)
             assert mock_review.called
         db.close()
+
+
+# ── Built-in Pattern Files ──────────────────────────────────────
+
+
+class TestBuiltinPatterns:
+    def test_api_keys_file_exists(self):
+        from pathlib import Path
+        p = Path(__file__).parent.parent.parent / "memex" / "scripts" / "patterns" / "api_keys.txt"
+        assert p.exists()
+
+    def test_pii_file_exists(self):
+        from pathlib import Path
+        p = Path(__file__).parent.parent.parent / "memex" / "scripts" / "patterns" / "pii.txt"
+        assert p.exists()
+
+    def test_api_keys_matches_openai(self):
+        from memex.scripts.redact import compile_matchers
+        matchers = compile_matchers(pattern_file="api_keys.txt")
+        assert any(m[0].search("sk-proj-abc123def456ghi789jkl012mno") for m in matchers)
+
+    def test_api_keys_matches_github(self):
+        from memex.scripts.redact import compile_matchers
+        matchers = compile_matchers(pattern_file="api_keys.txt")
+        assert any(m[0].search("ghp_ABCDEFghijklmnopqrstuvwxyz0123456789") for m in matchers)
+
+    def test_api_keys_matches_aws(self):
+        from memex.scripts.redact import compile_matchers
+        matchers = compile_matchers(pattern_file="api_keys.txt")
+        assert any(m[0].search("AKIAIOSFODNN7EXAMPLE") for m in matchers)
+
+    def test_pii_matches_email(self):
+        from memex.scripts.redact import compile_matchers
+        matchers = compile_matchers(pattern_file="pii.txt")
+        assert any(m[0].search("user@example.com") for m in matchers)
+
+    def test_pii_matches_phone(self):
+        from memex.scripts.redact import compile_matchers
+        matchers = compile_matchers(pattern_file="pii.txt")
+        assert any(m[0].search("555-123-4567") for m in matchers)
+
+    def test_pii_matches_ssn(self):
+        from memex.scripts.redact import compile_matchers
+        matchers = compile_matchers(pattern_file="pii.txt")
+        assert any(m[0].search("123-45-6789") for m in matchers)
+
+    def test_load_via_bare_filename(self):
+        """Bare filename resolves to built-in patterns/ dir."""
+        from memex.scripts.redact import load_pattern_file
+        patterns = load_pattern_file("api_keys.txt")
+        assert len(patterns) >= 3  # at least OpenAI, GitHub, AWS
