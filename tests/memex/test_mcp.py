@@ -336,6 +336,40 @@ class TestUpdateConversationsEnrichments:
         assert "new_topic" in values
         assert "old_topic" not in values
 
+    def test_remove_enrichments_missing_keys(self, db):
+        """remove_enrichments with missing type/value raises ToolError."""
+        from fastmcp.exceptions import ToolError
+        server = create_server(db=db, sql_write=True)
+        tool_fn = _get_tool_fn(server, "update_conversations")
+        with pytest.raises(ToolError, match="must have 'type' and 'value'"):
+            tool_fn(ids=["c1"], remove_enrichments=[{"type": "topic"}])
+
+    def test_add_enrichments_missing_value(self, db):
+        """add_enrichments with missing value raises ToolError."""
+        from fastmcp.exceptions import ToolError
+        server = create_server(db=db, sql_write=True)
+        tool_fn = _get_tool_fn(server, "update_conversations")
+        with pytest.raises(ToolError, match="non-empty 'value'"):
+            tool_fn(
+                ids=["c1"],
+                add_enrichments=[{"type": "topic", "source": "claude"}],
+            )
+
+    def test_enrichments_applied_to_multiple_conversations(self, multi_db):
+        """Enrichments are applied to all conversation IDs in the batch."""
+        server = create_server(db=multi_db, sql_write=True)
+        tool_fn = _get_tool_fn(server, "update_conversations")
+        result = tool_fn(
+            ids=["c1", "c2"],
+            add_enrichments=[
+                {"type": "topic", "value": "shared_topic", "source": "claude"},
+            ],
+        )
+        assert len(result["updated"]) == 2
+        for conv in result["updated"]:
+            topics = [e["value"] for e in conv["enrichments"] if e["type"] == "topic"]
+            assert "shared_topic" in topics
+
 
 class TestAppendMessage:
     def test_append(self, db):

@@ -124,7 +124,7 @@ List conversations:
 FTS message search:
   SELECT m.conversation_id, c.title, m.id, m.role, m.content
   FROM messages_fts f
-  JOIN messages m ON m.conversation_id = f.conversation_id AND m.id = f.id
+  JOIN messages m ON m.conversation_id = f.conversation_id AND m.id = f.message_id
   JOIN conversations c ON c.id = m.conversation_id
   WHERE messages_fts MATCH 'search terms'
   LIMIT 20
@@ -244,6 +244,8 @@ Starred/pinned (use IS NOT NULL for boolean timestamp columns):
         # Validate enrichments upfront (before touching any conversations)
         if add_enrichments:
             for e in add_enrichments:
+                if not e.get("value"):
+                    raise ToolError("Enrichment must have a non-empty 'value'")
                 if e.get("type") not in VALID_ENRICHMENT_TYPES:
                     raise ToolError(
                         f"Invalid enrichment type: {e.get('type')}. "
@@ -257,6 +259,10 @@ Starred/pinned (use IS NOT NULL for boolean timestamp columns):
                 conf = e.get("confidence")
                 if conf is not None and (conf < 0.0 or conf > 1.0):
                     raise ToolError(f"Confidence must be 0.0-1.0, got: {conf}")
+        if remove_enrichments:
+            for e in remove_enrichments:
+                if "type" not in e or "value" not in e:
+                    raise ToolError("Each remove_enrichments entry must have 'type' and 'value'")
 
         database = _get_db_from_ctx(mcp, ctx, db)
         updated = []
