@@ -14,6 +14,12 @@ from memex.models import Conversation, Message, text_block
 from memex.mcp import create_server, _conv_metadata
 
 
+def _get_tool_fn(server, name):
+    """Extract a tool's underlying function from the FastMCP server."""
+    tool = server._tool_manager._tools[name]
+    return tool.fn
+
+
 @pytest.fixture
 def db(tmp_db_path):
     """Database with one conversation containing two messages."""
@@ -324,6 +330,108 @@ class TestUpdateConversations:
         db.update_conversation("c1", metadata={"key": "value"})
         conv = db.load_conversation("c1")
         assert conv.metadata["key"] == "value"
+
+
+class TestUpdateConversationsEnrichments:
+    """Tests for enrichment support in update_conversations MCP tool."""
+
+    def test_add_enrichments(self, db):
+        """Adding enrichments via update_conversations saves them."""
+        server = create_server(db=db, sql_write=True)
+        tool_fn = _get_tool_fn(server, "update_conversations")
+        result = tool_fn(
+            ids=["c1"],
+            add_enrichments=[
+                {"type": "topic", "value": "greetings", "source": "claude"},
+            ],
+        )
+        assert len(result["updated"]) == 1
+        enrichments = result["updated"][0]["enrichments"]
+        assert len(enrichments) == 1
+        assert enrichments[0]["type"] == "topic"
+        assert enrichments[0]["value"] == "greetings"
+
+    def test_add_multiple_enrichments(self, db):
+        """Can add multiple enrichments in one call."""
+        server = create_server(db=db, sql_write=True)
+        tool_fn = _get_tool_fn(server, "update_conversations")
+        result = tool_fn(
+            ids=["c1"],
+            add_enrichments=[
+                {"type": "topic", "value": "greetings", "source": "claude"},
+                {"type": "importance", "value": "low", "source": "heuristic", "confidence": 0.3},
+            ],
+        )
+        enrichments = result["updated"][0]["enrichments"]
+        assert len(enrichments) == 2
+
+    def test_remove_enrichments(self, db):
+        """Removing enrichments via update_conversations deletes them."""
+        db.save_enrichment("c1", "topic", "greetings", "claude")
+        server = create_server(db=db, sql_write=True)
+        tool_fn = _get_tool_fn(server, "update_conversations")
+        result = tool_fn(
+            ids=["c1"],
+            remove_enrichments=[{"type": "topic", "value": "greetings"}],
+        )
+        enrichments = result["updated"][0]["enrichments"]
+        assert len(enrichments) == 0
+
+    def test_enrichment_validation_invalid_type(self, db):
+        """Invalid enrichment type raises ToolError."""
+        from fastmcp.exceptions import ToolError
+        server = create_server(db=db, sql_write=True)
+        tool_fn = _get_tool_fn(server, "update_conversations")
+        with pytest.raises(ToolError, match="Invalid enrichment type"):
+            tool_fn(
+                ids=["c1"],
+                add_enrichments=[
+                    {"type": "invalid_type", "value": "x", "source": "claude"},
+                ],
+            )
+
+    def test_enrichment_validation_invalid_source(self, db):
+        """Invalid enrichment source raises ToolError."""
+        from fastmcp.exceptions import ToolError
+        server = create_server(db=db, sql_write=True)
+        tool_fn = _get_tool_fn(server, "update_conversations")
+        with pytest.raises(ToolError, match="Invalid enrichment source"):
+            tool_fn(
+                ids=["c1"],
+                add_enrichments=[
+                    {"type": "topic", "value": "x", "source": "invalid_source"},
+                ],
+            )
+
+    def test_enrichment_validation_confidence_range(self, db):
+        """Confidence outside 0.0-1.0 raises ToolError."""
+        from fastmcp.exceptions import ToolError
+        server = create_server(db=db, sql_write=True)
+        tool_fn = _get_tool_fn(server, "update_conversations")
+        with pytest.raises(ToolError, match="Confidence must be"):
+            tool_fn(
+                ids=["c1"],
+                add_enrichments=[
+                    {"type": "topic", "value": "x", "source": "claude", "confidence": 1.5},
+                ],
+            )
+
+    def test_add_and_remove_enrichments_same_call(self, db):
+        """Can add and remove enrichments in same update call."""
+        db.save_enrichment("c1", "topic", "old_topic", "claude")
+        server = create_server(db=db, sql_write=True)
+        tool_fn = _get_tool_fn(server, "update_conversations")
+        result = tool_fn(
+            ids=["c1"],
+            add_enrichments=[
+                {"type": "topic", "value": "new_topic", "source": "claude"},
+            ],
+            remove_enrichments=[{"type": "topic", "value": "old_topic"}],
+        )
+        enrichments = result["updated"][0]["enrichments"]
+        values = [e["value"] for e in enrichments]
+        assert "new_topic" in values
+        assert "old_topic" not in values
 
 
 class TestAppendMessage:

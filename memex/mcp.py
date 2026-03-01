@@ -282,6 +282,9 @@ def _register_tools(mcp: FastMCP):
             results.append(entry)
         return results
 
+    VALID_ENRICHMENT_TYPES = {"summary", "topic", "importance", "excerpt", "note"}
+    VALID_ENRICHMENT_SOURCES = {"user", "claude", "heuristic"}
+
     @mcp.tool(annotations={"idempotentHint": True})
     def update_conversations(
         ids: Annotated[list[str], Field(description="Conversation IDs to update (1..N)")],
@@ -294,10 +297,29 @@ def _register_tools(mcp: FastMCP):
         add_tags: Annotated[list[str] | None, Field(description="Tags to add")] = None,
         remove_tags: Annotated[list[str] | None, Field(description="Tags to remove")] = None,
         metadata: Annotated[dict | None, Field(description="Metadata to merge")] = None,
+        add_enrichments: Annotated[list[dict] | None, Field(description="Enrichments to add: [{type, value, source, confidence?}]")] = None,
+        remove_enrichments: Annotated[list[dict] | None, Field(description="Enrichments to remove: [{type, value}]")] = None,
         db: Annotated[str | None, Field(description="Target database")] = None,
         ctx: Context = None,
     ) -> dict:
         """Update conversation properties. Only provided fields change."""
+        # Validate enrichments upfront (before touching any conversations)
+        if add_enrichments:
+            for e in add_enrichments:
+                if e.get("type") not in VALID_ENRICHMENT_TYPES:
+                    raise ToolError(
+                        f"Invalid enrichment type: {e.get('type')}. "
+                        f"Must be one of: {', '.join(sorted(VALID_ENRICHMENT_TYPES))}"
+                    )
+                if e.get("source") not in VALID_ENRICHMENT_SOURCES:
+                    raise ToolError(
+                        f"Invalid enrichment source: {e.get('source')}. "
+                        f"Must be one of: {', '.join(sorted(VALID_ENRICHMENT_SOURCES))}"
+                    )
+                conf = e.get("confidence")
+                if conf is not None and (conf < 0.0 or conf > 1.0):
+                    raise ToolError(f"Confidence must be 0.0-1.0, got: {conf}")
+
         database = _get_db_from_ctx(mcp, ctx, db)
         updated = []
         errors = []
@@ -309,6 +331,11 @@ def _register_tools(mcp: FastMCP):
                     add_tags=add_tags, remove_tags=remove_tags,
                     metadata=metadata,
                 )
+                if remove_enrichments:
+                    for e in remove_enrichments:
+                        database.delete_enrichment(cid, e["type"], e["value"])
+                if add_enrichments:
+                    database.save_enrichments(cid, add_enrichments)
                 conv = database.load_conversation(cid)
                 updated.append(_conv_metadata(conv, database))
             except ValueError as e:
