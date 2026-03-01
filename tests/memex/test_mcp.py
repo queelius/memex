@@ -74,13 +74,12 @@ class TestCreateServer:
         server = create_server(db=db)
         assert server._test_db is db
 
-    def test_server_has_eight_tools(self, db):
+    def test_server_has_four_tools(self, db):
         server = create_server(db=db)
         tool_names = [t.name for t in server._tool_manager._tools.values()]
         assert sorted(tool_names) == sorted([
-            "execute_sql", "query_conversations", "get_conversation",
-            "search_messages", "update_conversations", "append_message",
-            "enrich_conversation", "query_enrichments",
+            "execute_sql", "get_conversation",
+            "update_conversations", "append_message",
         ])
 
     def test_server_has_two_resources(self, db):
@@ -105,58 +104,6 @@ class TestExecuteSQL:
     def test_pragma(self, db):
         result = db.execute_sql("PRAGMA table_info(conversations)")
         assert len(result) > 0
-
-
-class TestQueryConversations:
-    def test_query_all(self, db):
-        result = db.query_conversations()
-        assert len(result["items"]) == 1
-
-    def test_query_has_tags_csv(self, db):
-        result = db.query_conversations()
-        assert "tags_csv" in result["items"][0]
-        assert result["items"][0]["tags_csv"] == "python"
-
-    def test_query_by_title(self, db):
-        result = db.query_conversations(title="Test")
-        assert len(result["items"]) == 1
-
-    def test_query_by_title_no_match(self, db):
-        result = db.query_conversations(title="nonexistent")
-        assert len(result["items"]) == 0
-
-    def test_query_by_tag(self, db):
-        result = db.query_conversations(tag="python")
-        assert len(result["items"]) == 1
-
-    def test_query_by_tag_no_match(self, db):
-        result = db.query_conversations(tag="nonexistent")
-        assert len(result["items"]) == 0
-
-    def test_query_by_source(self, db):
-        result = db.query_conversations(source="openai")
-        assert len(result["items"]) == 1
-
-    def test_query_by_source_no_match(self, db):
-        result = db.query_conversations(source="anthropic")
-        assert len(result["items"]) == 0
-
-    def test_query_fts(self, db):
-        result = db.query_conversations(query="hello")
-        assert len(result["items"]) == 1
-
-    def test_query_fts_no_match(self, db):
-        result = db.query_conversations(query="zzzznotfound")
-        assert len(result["items"]) == 0
-
-    def test_query_with_limit(self, db):
-        result = db.query_conversations(limit=1)
-        assert len(result["items"]) <= 1
-
-    def test_query_has_pagination(self, db):
-        result = db.query_conversations()
-        assert "has_more" in result
-        assert "next_cursor" in result
 
 
 class TestGetConversation:
@@ -235,50 +182,6 @@ class TestGetConversation:
         data = json.loads(exported)
         assert data["id"] == "c1"
         assert len(data["messages"]) == 2
-
-
-class TestSearchMessages:
-    def test_fts_search(self, multi_db):
-        results = multi_db.search_messages("topic")
-        assert len(results) >= 1
-        assert all("message_id" in r for r in results)
-
-    def test_phrase_search(self, multi_db):
-        results = multi_db.search_messages("topic 2", mode="phrase")
-        assert len(results) >= 1
-        found = any("topic 2" in r["content"] for r in results)
-        assert found
-
-    def test_like_search(self, multi_db):
-        results = multi_db.search_messages("%answer%", mode="like")
-        assert len(results) >= 1
-
-    def test_filter_by_conversation(self, multi_db):
-        results = multi_db.search_messages("topic", conversation_id="c1")
-        assert all(r["conversation_id"] == "c1" for r in results)
-
-    def test_filter_by_role(self, multi_db):
-        results = multi_db.search_messages("answer", role="assistant")
-        assert all(r["role"] == "assistant" for r in results)
-
-    def test_no_results(self, multi_db):
-        results = multi_db.search_messages("zzz_nonexistent_zzz")
-        assert len(results) == 0
-
-    def test_context_messages(self, multi_db):
-        results = multi_db.search_messages("topic 1")
-        # With default context=1, get_context_messages should return neighbors
-        assert len(results) >= 1
-        ctx = multi_db.get_context_messages(
-            results[0]["conversation_id"],
-            results[0]["message_id"],
-            context=1,
-        )
-        assert len(ctx) >= 1
-
-    def test_invalid_mode(self, multi_db):
-        with pytest.raises(ValueError, match="Invalid search mode"):
-            multi_db.search_messages("test", mode="invalid")
 
 
 class TestUpdateConversations:
@@ -539,48 +442,6 @@ class TestConvMetadata:
         assert meta["provenance"] == []
 
 
-class TestQueryConversationsEnrichmentFilter:
-    """Tests for enrichment_type/enrichment_value filters in query_conversations."""
-
-    def test_filter_by_enrichment_type(self, multi_db):
-        multi_db.save_enrichment("c1", "topic", "python", "claude")
-        multi_db.save_enrichment("c2", "summary", "A chat", "claude")
-        result = multi_db.query_conversations(enrichment_type="topic")
-        assert len(result["items"]) == 1
-        assert result["items"][0]["id"] == "c1"
-
-    def test_filter_by_enrichment_value(self, multi_db):
-        multi_db.save_enrichment("c1", "topic", "python programming", "claude")
-        multi_db.save_enrichment("c2", "topic", "rust systems", "claude")
-        result = multi_db.query_conversations(enrichment_value="python")
-        assert len(result["items"]) == 1
-        assert result["items"][0]["id"] == "c1"
-
-    def test_filter_combined(self, multi_db):
-        multi_db.save_enrichment("c1", "topic", "python", "claude")
-        multi_db.save_enrichment("c1", "importance", "high", "heuristic")
-        multi_db.save_enrichment("c2", "topic", "rust", "claude")
-        result = multi_db.query_conversations(
-            enrichment_type="topic", enrichment_value="python",
-        )
-        assert len(result["items"]) == 1
-        assert result["items"][0]["id"] == "c1"
-
-    def test_filter_with_existing_filters(self, multi_db):
-        multi_db.save_enrichment("c1", "topic", "python", "claude")
-        multi_db.save_enrichment("c3", "topic", "python", "claude")
-        # c1 is openai, c3 is anthropic
-        result = multi_db.query_conversations(
-            enrichment_type="topic", source="anthropic",
-        )
-        assert len(result["items"]) == 1
-        assert result["items"][0]["id"] == "c3"
-
-    def test_no_enrichments_returns_empty(self, multi_db):
-        result = multi_db.query_conversations(enrichment_type="topic")
-        assert len(result["items"]) == 0
-
-
 class TestBranchingConversation:
     """Test with a branching conversation tree."""
 
@@ -612,70 +473,3 @@ class TestBranchingConversation:
         assert msgs_b[1]["id"] == "m2b"
 
 
-class TestEnrichConversation:
-    """Tests for the enrich_conversation MCP tool (via DB methods)."""
-
-    def test_enrich_single(self, db):
-        db.save_enrichments("c1", [
-            {"type": "summary", "value": "A greeting", "source": "claude", "confidence": 0.9},
-        ])
-        enrichments = db.get_enrichments("c1")
-        assert len(enrichments) == 1
-        assert enrichments[0]["type"] == "summary"
-
-    def test_enrich_batch(self, db):
-        db.save_enrichments("c1", [
-            {"type": "topic", "value": "greetings", "source": "claude"},
-            {"type": "topic", "value": "testing", "source": "claude"},
-            {"type": "importance", "value": "low", "source": "heuristic", "confidence": 0.3},
-        ])
-        enrichments = db.get_enrichments("c1")
-        assert len(enrichments) == 3
-
-    def test_enrich_upsert(self, db):
-        db.save_enrichments("c1", [
-            {"type": "summary", "value": "old summary", "source": "claude"},
-        ])
-        db.save_enrichments("c1", [
-            {"type": "summary", "value": "old summary", "source": "user"},
-        ])
-        enrichments = db.get_enrichments("c1")
-        assert len(enrichments) == 1
-        assert enrichments[0]["source"] == "user"
-
-    def test_enrich_not_found(self, db):
-        # save_enrichments doesn't validate conversation existence at DB level
-        # (that's the MCP layer's job), so this just tests the DB FK constraint
-        import sqlite3 as _sqlite3
-        with pytest.raises(_sqlite3.IntegrityError):
-            db.save_enrichments("nonexistent", [
-                {"type": "summary", "value": "test", "source": "claude"},
-            ])
-
-
-class TestQueryEnrichments:
-    """Tests for the query_enrichments MCP tool (via DB methods)."""
-
-    def test_query_all(self, multi_db):
-        multi_db.save_enrichment("c1", "topic", "python", "claude")
-        multi_db.save_enrichment("c2", "topic", "rust", "claude")
-        results = multi_db.query_enrichments()
-        assert len(results) == 2
-
-    def test_query_by_type(self, multi_db):
-        multi_db.save_enrichment("c1", "topic", "python", "claude")
-        multi_db.save_enrichment("c1", "summary", "A chat", "claude")
-        results = multi_db.query_enrichments(type="topic")
-        assert len(results) == 1
-        assert results[0]["type"] == "topic"
-
-    def test_query_by_value(self, multi_db):
-        multi_db.save_enrichment("c1", "topic", "python programming", "claude")
-        multi_db.save_enrichment("c2", "topic", "rust systems", "claude")
-        results = multi_db.query_enrichments(value="python")
-        assert len(results) == 1
-
-    def test_query_includes_title(self, multi_db):
-        multi_db.save_enrichment("c1", "topic", "python", "claude")
-        results = multi_db.query_enrichments(type="topic")
-        assert results[0]["conversation_title"] == "Chat 1"

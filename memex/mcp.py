@@ -125,53 +125,6 @@ def _register_tools(mcp: FastMCP):
             raise ToolError(str(e))
 
     @mcp.tool(annotations={"readOnlyHint": True})
-    def query_conversations(
-        query: Annotated[str | None, Field(description="FTS5 search text")] = None,
-        title: Annotated[str | None, Field(description="LIKE substring match on title")] = None,
-        starred: Annotated[bool | None, Field(description="Filter by starred")] = None,
-        pinned: Annotated[bool | None, Field(description="Filter by pinned")] = None,
-        archived: Annotated[bool | None, Field(description="Filter by archived")] = None,
-        sensitive: Annotated[bool | None, Field(description="Filter by sensitive")] = None,
-        source: Annotated[str | None, Field(description="Filter by source")] = None,
-        model: Annotated[str | None, Field(description="Filter by model")] = None,
-        tag: Annotated[str | None, Field(description="Filter by tag")] = None,
-        before: Annotated[str | None, Field(description="Only conversations created before this date (YYYY-MM-DD)")] = None,
-        after: Annotated[str | None, Field(description="Only conversations created after this date (YYYY-MM-DD)")] = None,
-        enrichment_type: Annotated[str | None, Field(description="Filter by enrichment type (e.g. topic, summary)")] = None,
-        enrichment_value: Annotated[str | None, Field(description="Filter by enrichment value substring")] = None,
-        include_paths: Annotated[bool, Field(description="Include path summaries to eliminate follow-up list_paths call")] = False,
-        limit: Annotated[int, Field(description="Max results", ge=1, le=100)] = 20,
-        cursor: Annotated[str | None, Field(description="Pagination cursor")] = None,
-        db: Annotated[str | None, Field(description="Target database")] = None,
-        ctx: Context = None,
-    ) -> dict:
-        """Search and list conversations. FTS5 when query provided, otherwise chronological."""
-        database = _get_db_from_ctx(mcp, ctx, db)
-        result = database.query_conversations(
-            query=query, title=title, starred=starred, pinned=pinned,
-            archived=archived, sensitive=sensitive, source=source,
-            model=model, tag=tag, before=before, after=after,
-            enrichment_type=enrichment_type, enrichment_value=enrichment_value,
-            limit=limit, cursor=cursor,
-        )
-        # Post-process: convert tags_csv to list, timestamps to booleans
-        for item in result["items"]:
-            csv = item.pop("tags_csv", None)
-            item["tags"] = csv.split(",") if csv else []
-            item["starred"] = item.pop("starred_at", None) is not None
-            item["pinned"] = item.pop("pinned_at", None) is not None
-            item["archived"] = item.pop("archived_at", None) is not None
-            item["sensitive"] = bool(item.get("sensitive", 0))
-        # Optionally inline path summaries
-        if include_paths:
-            for item in result["items"]:
-                try:
-                    item["paths"] = database.list_paths(item["id"])
-                except ValueError:
-                    item["paths"] = []
-        return result
-
-    @mcp.tool(annotations={"readOnlyHint": True})
     def get_conversation(
         id: Annotated[str, Field(description="Conversation ID")],
         path_index: Annotated[int | None, Field(description="Path index to read messages from")] = None,
@@ -239,48 +192,6 @@ def _register_tools(mcp: FastMCP):
         meta = _conv_metadata(conv, database)
         meta["paths"] = database.list_paths(id)
         return meta
-
-    @mcp.tool(annotations={"readOnlyHint": True})
-    def search_messages(
-        query: Annotated[str, Field(description="Search text")],
-        mode: Annotated[str, Field(description="Search mode: 'fts' (token OR), 'phrase' (exact substring), 'like' (SQL LIKE pattern)")] = "fts",
-        conversation_id: Annotated[str | None, Field(description="Restrict to one conversation")] = None,
-        role: Annotated[str | None, Field(description="Filter by message role")] = None,
-        limit: Annotated[int, Field(description="Max results", ge=1, le=100)] = 20,
-        context_messages: Annotated[int, Field(description="Include N surrounding messages for context", ge=0, le=5)] = 1,
-        db: Annotated[str | None, Field(description="Target database")] = None,
-        ctx: Context = None,
-    ) -> list[dict]:
-        """Message-level search with context snippets. Returns matches grouped with conversation metadata."""
-        database = _get_db_from_ctx(mcp, ctx, db)
-        try:
-            matches = database.search_messages(
-                query, mode=mode, conversation_id=conversation_id,
-                role=role, limit=limit,
-            )
-        except ValueError as e:
-            raise ToolError(str(e))
-
-        results = []
-        for match in matches:
-            entry = {
-                "conversation_id": match["conversation_id"],
-                "conversation_title": match["conversation_title"],
-                "message_id": match["message_id"],
-                "role": match["role"],
-                "content": json.loads(match["content"]) if isinstance(match["content"], str) else match["content"],
-            }
-            if context_messages > 0:
-                entry["context"] = database.get_context_messages(
-                    match["conversation_id"], match["message_id"],
-                    context=context_messages,
-                )
-                # Parse content JSON in context messages
-                for cm in entry["context"]:
-                    if isinstance(cm.get("content"), str):
-                        cm["content"] = json.loads(cm["content"])
-            results.append(entry)
-        return results
 
     VALID_ENRICHMENT_TYPES = {"summary", "topic", "importance", "excerpt", "note"}
     VALID_ENRICHMENT_SOURCES = {"user", "claude", "heuristic"}
@@ -369,60 +280,6 @@ def _register_tools(mcp: FastMCP):
             }
         except ValueError as e:
             raise ToolError(str(e))
-
-    VALID_ENRICHMENT_TYPES = {"summary", "topic", "importance", "excerpt", "note"}
-    VALID_ENRICHMENT_SOURCES = {"user", "claude", "heuristic"}
-
-    @mcp.tool(annotations={"idempotentHint": True})
-    def enrich_conversation(
-        conversation_id: Annotated[str, Field(description="Conversation ID")],
-        enrichments: Annotated[list[dict], Field(description="List of enrichments: [{type, value, source, confidence?}]")],
-        db: Annotated[str | None, Field(description="Target database name")] = None,
-        ctx: Context = None,
-    ) -> dict:
-        """Add enrichments (summaries, topics, importance, excerpts, notes) to a conversation. Idempotent -- re-sending the same enrichment updates it."""
-        database = _get_db_from_ctx(mcp, ctx, db)
-        # Validate conversation exists
-        conv = database.load_conversation(conversation_id)
-        if conv is None:
-            raise ToolError(f"Conversation not found: {conversation_id}")
-        # Validate each enrichment
-        for e in enrichments:
-            if e.get("type") not in VALID_ENRICHMENT_TYPES:
-                raise ToolError(
-                    f"Invalid enrichment type: {e.get('type')}. "
-                    f"Must be one of: {', '.join(sorted(VALID_ENRICHMENT_TYPES))}"
-                )
-            if e.get("source") not in VALID_ENRICHMENT_SOURCES:
-                raise ToolError(
-                    f"Invalid enrichment source: {e.get('source')}. "
-                    f"Must be one of: {', '.join(sorted(VALID_ENRICHMENT_SOURCES))}"
-                )
-            conf = e.get("confidence")
-            if conf is not None and (conf < 0.0 or conf > 1.0):
-                raise ToolError(f"Confidence must be 0.0-1.0, got: {conf}")
-        database.save_enrichments(conversation_id, enrichments)
-        return {
-            "conversation_id": conversation_id,
-            "enrichments": database.get_enrichments(conversation_id),
-        }
-
-    @mcp.tool(annotations={"readOnlyHint": True})
-    def query_enrichments(
-        type: Annotated[str | None, Field(description="Filter by enrichment type")] = None,
-        value: Annotated[str | None, Field(description="Substring match on value")] = None,
-        source: Annotated[str | None, Field(description="Filter by source (user/claude/heuristic)")] = None,
-        conversation_id: Annotated[str | None, Field(description="Filter by conversation ID")] = None,
-        limit: Annotated[int, Field(description="Max results", ge=1, le=100)] = 20,
-        db: Annotated[str | None, Field(description="Target database name")] = None,
-        ctx: Context = None,
-    ) -> list[dict]:
-        """Search enrichments across conversations. Filter by type, value, source, or conversation."""
-        database = _get_db_from_ctx(mcp, ctx, db)
-        return database.query_enrichments(
-            type=type, value=value, source=source,
-            conversation_id=conversation_id, limit=limit,
-        )
 
 
 def _register_resources(mcp: FastMCP):
