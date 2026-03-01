@@ -39,15 +39,12 @@ memex mcp
 
 ## MCP Tools
 
-When running as an MCP server, memex exposes:
+When running as an MCP server, memex exposes 4 tools:
 
-- `execute_sql` -- Run SQL queries (read-only by default)
-- `query_conversations` -- FTS5 search with filters and pagination
-- `list_paths` -- List conversation tree paths
-- `get_path_messages` -- Read messages along a path
-- `update_conversation` -- Star, pin, tag, annotate
-- `append_message` -- Add messages to conversations
-- `export_conversation` -- Export as markdown or JSON
+- `execute_sql` -- Primary read interface: all queries via SQL (read-only by default)
+- `get_conversation` -- Tree-aware retrieval + export (metadata, messages, markdown/JSON)
+- `update_conversations` -- Modify properties, tags, and enrichments (bulk)
+- `append_message` -- Add messages to conversation trees
 
 ## Development
 

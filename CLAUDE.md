@@ -29,7 +29,7 @@ memex/
   models.py            # ContentBlock, Message, Conversation (tree)
   db.py                # Database (raw sqlite3, WAL, FTS5, migrations)
   config.py            # YAML config, DatabaseRegistry
-  mcp.py               # FastMCP server (8 tools, 2 resources)
+  mcp.py               # FastMCP server (4 tools, 2 resources)
   assets.py            # Asset resolution, copying, media markdown rendering
   cli.py               # argparse CLI (import, export, show, mcp, run)
   scripts/
@@ -70,16 +70,12 @@ memex/
 
 | Tool | Purpose |
 |---|---|
-| `query_conversations` | Search/list conversations (FTS, title, filters, tags, enrichment filtering) |
-| `get_conversation` | One tool for metadata, messages, or export (3 modes based on parameters) |
-| `search_messages` | Message-level search with fts/phrase/like modes and context snippets |
-| `update_conversations` | Bulk update 1..N conversations, returns updated state |
-| `append_message` | Add message, returns created message + updated conversation metadata |
-| `enrich_conversation` | Add enrichments (summary/topic/importance/excerpt/note) with validation |
-| `query_enrichments` | Search enrichments by type, value, source, or conversation |
-| `execute_sql` | Read-only SQL escape hatch (PRAGMA query_only enforced) |
+| `execute_sql` | Primary read interface — all queries via SQL. Schema available via `memex://schema`. |
+| `get_conversation` | Tree-aware retrieval + export (3 modes: metadata, messages, export) |
+| `update_conversations` | Modify conversation properties, tags, enrichments. Bulk 1..N. |
+| `append_message` | Add message to conversation tree with consistency guarantees. |
 
-**Resources:** `memex://schema` (DDL for execute_sql users), `memex://databases` (multi-db discovery)
+**Resources:** `memex://schema` (DDL + relationships + FTS5 docs), `memex://databases` (multi-db discovery)
 
 ## Database
 
@@ -109,8 +105,8 @@ memex/
 - `append_message` and `update_conversation` have try/except/rollback
 - `save_conversation` uses INSERT OR REPLACE (triggers CASCADE delete on messages/tags/enrichments/provenance)
 - Importers set `conv.metadata["_provenance"]` -- CLI pops it before save, writes to provenance table after (CASCADE-safe)
-- Enrichment types validated at MCP layer: summary, topic, importance, excerpt, note
-- Enrichment sources validated at MCP layer: user, claude, heuristic
+- Enrichment types validated in `update_conversations`: summary, topic, importance, excerpt, note
+- Enrichment sources validated in `update_conversations`: user, claude, heuristic
 - Claude Code importer uses "conversation_only" mode (strips tool use, thinking, progress). Future `claude_code_full` importer can coexist for full-fidelity import
 - `--no-copy-assets` on import skips media asset resolution and copying
 - `copy_assets` is idempotent: skips blocks already having `assets/` relative URLs
