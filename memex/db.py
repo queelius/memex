@@ -234,10 +234,44 @@ class Database:
         return cursor.fetchall()
 
     def get_schema(self) -> str:
+        # Filter out FTS5 internal tables (shadow tables) -- they're
+        # implementation details that confuse LLMs trying to write SQL.
+        skip_prefixes = ("messages_fts_", "schema_version")
         rows = self.execute_sql(
-            "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name"
+            "SELECT name, sql FROM sqlite_master "
+            "WHERE sql IS NOT NULL ORDER BY type, name"
         )
-        return "\n\n".join(r["sql"] for r in rows)
+        ddl = "\n\n".join(
+            r["sql"] for r in rows
+            if not any(r["name"].startswith(p) for p in skip_prefixes)
+        )
+        # Append relationship and query documentation
+        docs = """
+-- ══ Relationships ══════════════════════════════════════════════
+-- messages.conversation_id   → conversations.id  (CASCADE delete)
+-- tags.conversation_id       → conversations.id  (CASCADE delete)
+-- enrichments.conversation_id → conversations.id (CASCADE delete)
+-- provenance.conversation_id → conversations.id  (CASCADE delete)
+-- messages.parent_id         → messages.id (same conversation, tree structure)
+
+-- ══ FTS5 Full-Text Search ══════════════════════════════════════
+-- messages_fts indexes message text with porter stemming + unicode61.
+-- Columns: conversation_id (UNINDEXED), message_id (UNINDEXED), text
+--
+-- FTS search query pattern:
+--   SELECT m.conversation_id, c.title, m.id, m.role, m.content
+--   FROM messages_fts f
+--   JOIN messages m ON m.conversation_id = f.conversation_id AND m.id = f.message_id
+--   JOIN conversations c ON c.id = m.conversation_id
+--   WHERE messages_fts MATCH 'search terms'
+--   LIMIT 20
+--
+-- MATCH syntax: 'word1 word2' (OR), 'word1 AND word2', '"exact phrase"'
+
+-- ══ Boolean Timestamp Columns ══════════════════════════════════
+-- starred_at, pinned_at, archived_at are NULL (false) or DATETIME (true).
+-- Filter: WHERE starred_at IS NOT NULL (starred conversations)"""
+        return ddl + docs
 
     def save_conversation(self, conv: Conversation) -> None:
         c = self.conn.cursor()

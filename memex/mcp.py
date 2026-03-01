@@ -314,7 +314,7 @@ def _register_resources(mcp: FastMCP):
 
     @mcp.resource("memex://schema")
     def schema_resource(ctx: Context = None) -> str:
-        """Database schema -- tables, columns, types, indexes."""
+        """Database schema: DDL, indexes, relationships, FTS5 docs, and query patterns. Read this before writing SQL."""
         db = _get_db_from_ctx(mcp, ctx)
         return db.get_schema()
 
