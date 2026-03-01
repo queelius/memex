@@ -113,7 +113,34 @@ def _register_tools(mcp: FastMCP):
         db: Annotated[str | None, Field(description="Target database name")] = None,
         ctx: Context = None,
     ) -> list[dict]:
-        """Run a SQL query against the database. Read-only by default (enforced by SQLite PRAGMA query_only)."""
+        """Run a SQL query against the database. Read-only by default (enforced by SQLite PRAGMA query_only).
+
+Use memex://schema resource for full DDL. Common queries:
+
+List conversations:
+  SELECT id, title, source, model, message_count, created_at, updated_at
+  FROM conversations ORDER BY updated_at DESC LIMIT 20
+
+FTS message search:
+  SELECT m.conversation_id, c.title, m.id, m.role, m.content
+  FROM messages_fts f
+  JOIN messages m ON m.conversation_id = f.conversation_id AND m.id = f.id
+  JOIN conversations c ON c.id = m.conversation_id
+  WHERE messages_fts MATCH 'search terms'
+  LIMIT 20
+
+Filter by tag:
+  SELECT c.id, c.title FROM conversations c
+  JOIN tags t ON c.id = t.conversation_id WHERE t.tag = 'python'
+
+Enrichments:
+  SELECT e.*, c.title FROM enrichments e
+  JOIN conversations c ON c.id = e.conversation_id
+  WHERE e.type = 'topic'
+
+Starred/pinned (use IS NOT NULL for boolean timestamp columns):
+  SELECT id, title FROM conversations WHERE starred_at IS NOT NULL
+"""
         database = _get_db_from_ctx(mcp, ctx, db)
         try:
             return database.execute_sql(sql, tuple(params) if params else ())
