@@ -70,7 +70,12 @@ class TestDatabaseSchema:
         schema = db.get_schema()
         assert "CREATE TABLE conversations" in schema
         assert "CREATE TABLE messages" in schema
-        assert "CREATE TABLE schema_version" in schema
+        # Internal tables (schema_version, FTS5 shadow tables) are filtered out
+        assert "schema_version" not in schema
+        assert "messages_fts_config" not in schema
+        # Relationship and FTS5 docs are appended
+        assert "Relationships" in schema
+        assert "FTS5" in schema
 
     def test_memory_db(self):
         db = Database(":memory:")
@@ -124,10 +129,11 @@ class TestSchemaVersioning:
         assert len(rows) == 1
         assert rows[0]["version"] == SCHEMA_VERSION
 
-    def test_schema_version_table_in_schema(self, tmp_db_path):
+    def test_schema_version_filtered_from_schema(self, tmp_db_path):
+        """schema_version is internal bookkeeping, filtered from get_schema() output."""
         db = Database(tmp_db_path)
         schema = db.get_schema()
-        assert "schema_version" in schema
+        assert "schema_version" not in schema
 
 
 class TestSaveLoad:
