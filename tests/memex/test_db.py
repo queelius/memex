@@ -291,9 +291,6 @@ class TestSearch:
             assert item["id"] in ("c4", "c5")
 
 
-import pytest
-
-
 class TestUpdate:
     def test_title(self, tmp_db_path):
         db = Database(tmp_db_path)

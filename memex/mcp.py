@@ -12,6 +12,7 @@ from fastmcp.exceptions import ToolError
 from pydantic import Field
 
 from memex.config import load_config, DatabaseRegistry
+from memex.db import _fmt_dt
 from memex.models import Message
 
 
@@ -35,7 +36,6 @@ def create_server(db=None, sql_write=False):
     """
     mcp = FastMCP("memex", lifespan=lifespan if db is None else None)
     if db is not None:
-        # Enforce readonly at the SQLite level when sql_write is disabled
         if not sql_write and not db.readonly:
             db.conn.execute("PRAGMA query_only=ON")
             db.readonly = True
@@ -46,37 +46,24 @@ def create_server(db=None, sql_write=False):
     return mcp
 
 
-def _has_lifespan_ctx(ctx) -> bool:
-    """Check whether a real lifespan context is available (vs test injection)."""
-    return (ctx is not None
-            and hasattr(ctx, 'request_context')
-            and ctx.request_context is not None
-            and hasattr(ctx.request_context, 'lifespan_context')
-            and ctx.request_context.lifespan_context is not None)
-
-
-def _get_registry(ctx: Context) -> DatabaseRegistry:
-    """Get the DatabaseRegistry from the lifespan context."""
-    return ctx.request_context.lifespan_context["registry"]
+def _get_registry(ctx) -> DatabaseRegistry | None:
+    """Get the DatabaseRegistry from the lifespan context, or None for test injection."""
+    try:
+        return ctx.request_context.lifespan_context["registry"]
+    except (AttributeError, TypeError, KeyError):
+        return None
 
 
 def _get_db_from_ctx(mcp, ctx, db_name=None):
     """Get database from either lifespan context or test injection."""
-    if _has_lifespan_ctx(ctx):
-        return _get_registry(ctx).get_db(db_name)
+    registry = _get_registry(ctx)
+    if registry is not None:
+        return registry.get_db(db_name)
     return mcp._test_db
-
-
-def _get_sql_write(mcp, ctx):
-    """Check sql_write setting for informational error messages."""
-    if _has_lifespan_ctx(ctx):
-        return _get_registry(ctx).sql_write
-    return getattr(mcp, '_test_sql_write', False)
 
 
 def _conv_metadata(conv, db) -> dict:
     """Build conversation metadata dict with boolean flags, tags, enrichments, provenance."""
-    from memex.db import _fmt_dt
     tags = [
         t["tag"]
         for t in db.execute_sql(
@@ -241,7 +228,7 @@ Starred/pinned (use IS NOT NULL for boolean timestamp columns):
         ctx: Context = None,
     ) -> dict:
         """Update conversation properties. Only provided fields change."""
-        # Validate enrichments upfront (before touching any conversations)
+        # Validate all enrichments upfront to avoid partial updates
         if add_enrichments:
             for e in add_enrichments:
                 if not e.get("value"):
@@ -305,7 +292,6 @@ Starred/pinned (use IS NOT NULL for boolean timestamp columns):
         )
         try:
             database.append_message(conversation_id, msg)
-            # Fetch updated conversation metadata for the response
             conv = database.load_conversation(conversation_id)
             return {
                 "message_id": msg_id,
@@ -327,8 +313,8 @@ def _register_resources(mcp: FastMCP):
     @mcp.resource("memex://databases")
     def databases_resource(ctx: Context = None) -> str:
         """Registered databases with statistics."""
-        if _has_lifespan_ctx(ctx):
-            registry = _get_registry(ctx)
+        registry = _get_registry(ctx)
+        if registry is not None:
             result = {}
             for name, db in registry.all_dbs().items():
                 result[name] = db.get_statistics()
@@ -337,6 +323,7 @@ def _register_resources(mcp: FastMCP):
         stats = mcp._test_db.get_statistics()
         stats["primary"] = True
         return json.dumps({"default": stats}, indent=2)
+
 
 def main():
     """Entry point for `memex mcp`."""

@@ -134,6 +134,27 @@ def _parse_dt(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def _escape_like(value: str) -> str:
+    """Escape LIKE wildcards (%, _) and the escape char itself."""
+    return (
+        value.replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+
+
+def _sanitize_fts_query(query: str) -> str:
+    """Sanitize a user query for FTS5 MATCH: strip quotes, quote each token, join with OR.
+
+    Returns empty string if no usable tokens remain.
+    """
+    sanitized = query.replace('"', "").replace("'", "")
+    tokens = sanitized.split()
+    if not tokens:
+        return ""
+    return " OR ".join(f'"{t}"' for t in tokens if t)
+
+
 def _encode_cursor(updated_at: str, id: str) -> str:
     return base64.b64encode(
         json.dumps({"u": updated_at, "id": id}).encode()
@@ -400,13 +421,8 @@ class Database:
             )
             params.extend(fts_ids)
         if title:
-            escaped = (
-                title.replace("\\", "\\\\")
-                .replace("%", "\\%")
-                .replace("_", "\\_")
-            )
             conds.append("c.title LIKE ? ESCAPE '\\'")
-            params.append(f"%{escaped}%")
+            params.append(f"%{_escape_like(title)}%")
         if starred is True:
             conds.append("c.starred_at IS NOT NULL")
         elif starred is False:
@@ -441,13 +457,8 @@ class Database:
                 e_conds.append("e.type=?")
                 params.append(enrichment_type)
             if enrichment_value:
-                escaped = (
-                    enrichment_value.replace("\\", "\\\\")
-                    .replace("%", "\\%")
-                    .replace("_", "\\_")
-                )
                 e_conds.append("e.value LIKE ? ESCAPE '\\'")
-                params.append(f"%{escaped}%")
+                params.append(f"%{_escape_like(enrichment_value)}%")
             conds.append(
                 f"EXISTS(SELECT 1 FROM enrichments e "
                 f"WHERE {' AND '.join(e_conds)})"
@@ -486,13 +497,7 @@ class Database:
         return {"items": items, "next_cursor": nc, "has_more": has_more}
 
     def _fts_search(self, query: str) -> List[str]:
-        # Sanitize: strip characters that are FTS5 operators/syntax
-        sanitized = query.replace('"', "").replace("'", "")
-        tokens = sanitized.split()
-        if not tokens:
-            return []
-        # Quote each token individually and join with OR for keyword search
-        fts_q = " OR ".join(f'"{t}"' for t in tokens if t)
+        fts_q = _sanitize_fts_query(query)
         if not fts_q:
             return []
         try:
@@ -502,16 +507,10 @@ class Database:
                 (fts_q,),
             )
         except sqlite3.OperationalError:
-            # Escape LIKE wildcards then fall back to LIKE search
-            escaped = (
-                query.replace("\\", "\\\\")
-                .replace("%", "\\%")
-                .replace("_", "\\_")
-            )
             rows = self.execute_sql(
                 "SELECT DISTINCT conversation_id FROM messages "
                 "WHERE content LIKE ? ESCAPE '\\' LIMIT 1000",
-                (f"%{escaped}%",),
+                (f"%{_escape_like(query)}%",),
             )
         return [r["conversation_id"] for r in rows]
 
@@ -534,15 +533,9 @@ class Database:
         params: List[Any] = []
 
         if mode == "fts":
-            # Use FTS5 to find matching (conversation_id, message_id) pairs
-            sanitized = query.replace('"', "").replace("'", "")
-            tokens = sanitized.split()
-            if not tokens:
-                return []
-            fts_q = " OR ".join(f'"{t}"' for t in tokens if t)
+            fts_q = _sanitize_fts_query(query)
             if not fts_q:
                 return []
-            # Join FTS results with messages table
             join_clause = (
                 "INNER JOIN messages_fts f "
                 "ON m.conversation_id=f.conversation_id AND m.id=f.message_id"
@@ -551,13 +544,8 @@ class Database:
             params.append(fts_q)
         elif mode == "phrase":
             join_clause = ""
-            escaped = (
-                query.replace("\\", "\\\\")
-                .replace("%", "\\%")
-                .replace("_", "\\_")
-            )
             conds.append("m.content LIKE ? ESCAPE '\\'")
-            params.append(f"%{escaped}%")
+            params.append(f"%{_escape_like(query)}%")
         elif mode == "like":
             join_clause = ""
             conds.append("m.content LIKE ?")
@@ -776,7 +764,7 @@ class Database:
                 "DELETE FROM messages_fts WHERE conversation_id=? AND message_id=?",
                 (conversation_id, message_id),
             )
-            text = " ".join(
+            text = "\n".join(
                 b.get("text", "") for b in content
                 if isinstance(b, dict) and b.get("type") == "text"
             ).strip()
@@ -820,18 +808,9 @@ class Database:
         source: str,
         confidence: float | None = None,
     ) -> None:
-        now = _fmt_dt(datetime.now())
-        try:
-            self.conn.execute(
-                "INSERT OR REPLACE INTO enrichments "
-                "(conversation_id,type,value,source,confidence,created_at) "
-                "VALUES (?,?,?,?,?,?)",
-                (conversation_id, type, value, source, confidence, now),
-            )
-            self.conn.commit()
-        except Exception:
-            self.conn.rollback()
-            raise
+        self.save_enrichments(conversation_id, [
+            {"type": type, "value": value, "source": source, "confidence": confidence},
+        ])
 
     def save_enrichments(
         self, conversation_id: str, enrichments: List[Dict[str, Any]]
@@ -879,13 +858,8 @@ class Database:
             conds.append("e.type=?")
             params.append(type)
         if value:
-            escaped = (
-                value.replace("\\", "\\\\")
-                .replace("%", "\\%")
-                .replace("_", "\\_")
-            )
             conds.append("e.value LIKE ? ESCAPE '\\'")
-            params.append(f"%{escaped}%")
+            params.append(f"%{_escape_like(value)}%")
         if source:
             conds.append("e.source=?")
             params.append(source)
