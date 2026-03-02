@@ -22,20 +22,40 @@ memex export output.md --format markdown
 memex export output.json --format json
 ```
 
+**Browse and search:**
+```bash
+memex show                               # list conversations
+memex show <id>                          # view a conversation
+```
+
+**HTML export (self-contained SPA):**
+```bash
+memex export ./site --format html        # outputs index.html + DB + assets
+```
+
 **MCP server** (for Claude Desktop, etc.):
 ```bash
 memex mcp
 ```
 
+**Scripts:**
+```bash
+memex run --list                         # available scripts
+memex run redact --words "secret" --level word --apply
+memex run enrich_trivial --apply
+```
+
 ## Supported Formats
 
-| Provider  | Import | Export |
-|-----------|--------|--------|
-| OpenAI    | Yes    | -      |
-| Anthropic | Yes    | -      |
-| Gemini    | Yes    | -      |
-| Markdown  | -      | Yes    |
-| JSON      | -      | Yes    |
+| Format      | Import | Export |
+|-------------|--------|--------|
+| OpenAI      | Yes    | -      |
+| Anthropic   | Yes    | -      |
+| Gemini      | Yes    | -      |
+| Claude Code | Yes    | -      |
+| Markdown    | -      | Yes    |
+| JSON        | -      | Yes    |
+| HTML (SPA)  | -      | Yes    |
 
 ## MCP Tools
 
