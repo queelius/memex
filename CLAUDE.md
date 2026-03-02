@@ -81,6 +81,7 @@ memex/
 
 - Composite PK on messages: (conversation_id, id)
 - FTS5 virtual table (messages_fts) with porter unicode61 tokenizer
+- FTS5 columns: `conversation_id` (UNINDEXED), `message_id` (UNINDEXED), `text` — note `message_id` not `id` (differs from messages table PK)
 - Tags in separate table with (conversation_id, tag) PK
 - Enrichments table: PK (conversation_id, type, value), types: summary|topic|importance|excerpt|note
 - Provenance table: PK (conversation_id, source_type), tracks import origin
@@ -89,19 +90,24 @@ memex/
 - Database supports context manager: `with Database(path) as db:`
 - `update_message_content()` — updates content + re-indexes FTS5
 - `delete_conversation()` — deletes with CASCADE + FTS5 cleanup
+- `_escape_like()` — shared LIKE wildcard escaping; use for all user-supplied LIKE patterns
+- `_sanitize_fts_query()` — shared FTS5 query sanitization; strips quotes, tokenizes, joins with OR
 
 ## Testing
 
-- Tests in `tests/memex/` -- ~484 tests, 84%+ coverage
+- Tests in `tests/memex/` -- ~461 tests, 87%+ coverage
 - `conftest.py` provides `tmp_db_path` fixture
 - Server tests exercise DB methods directly (MCP protocol testing deferred)
+- `create_server(db=db)` sets PRAGMA query_only=ON; use `sql_write=True` for tests that call write tools directly
+- `_get_tool_fn(server, name)` extracts the underlying function from FastMCP for direct invocation in tests
 
 ## Gotchas
 
 - `Database(path, readonly=True)` sets PRAGMA query_only -- no writes possible
 - `_auto_import` searches built-in importers first, user dir (~/.memex/importers/) second
 - `get_all_paths()` is iterative (not recursive) to handle 1000+ message chains
-- FTS queries sanitize quotes; LIKE fallback escapes % and _ wildcards
+- FTS queries sanitize quotes via `_sanitize_fts_query()`; LIKE fallback uses `_escape_like()`
+- `get_schema()` filters out FTS5 shadow tables and `schema_version` from output (for LLM consumption)
 - `append_message` and `update_conversation` have try/except/rollback
 - `save_conversation` uses INSERT OR REPLACE (triggers CASCADE delete on messages/tags/enrichments/provenance)
 - Importers set `conv.metadata["_provenance"]` -- CLI pops it before save, writes to provenance table after (CASCADE-safe)
