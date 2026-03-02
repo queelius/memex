@@ -374,6 +374,131 @@ class TestCLIImportAssets:
         assert not (db_dir / "assets").exists()
 
 
+class TestCLIListFormats:
+    def test_import_list_formats(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "import", "--list-formats"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "Available import formats:" in result.stdout
+        # Check all built-in importers are listed
+        for name in ("openai", "anthropic", "gemini", "claude_code"):
+            assert name in result.stdout
+
+    def test_export_list_formats(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "export", "--list-formats"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "Available export formats:" in result.stdout
+        # Check all built-in exporters are listed (json_export.py → json)
+        for name in ("json", "markdown", "html"):
+            assert name in result.stdout
+
+    def test_import_unknown_format_shows_available(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "import", "/dev/null",
+             "--format", "nonexistent"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 1
+        assert "unknown format" in result.stderr
+        assert "openai" in result.stderr  # lists available formats
+
+    def test_export_unknown_format_shows_available(self, tmp_path):
+        db_dir = tmp_path / "db"
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "export", str(tmp_path / "out.txt"),
+             "--format", "nonexistent", "--db", str(db_dir)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 1
+        assert "unknown export format" in result.stderr
+        assert "json" in result.stderr  # lists available formats
+
+    def test_import_list_formats_without_file(self):
+        """--list-formats should work without providing a file argument."""
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "import", "--list-formats"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "Available import formats:" in result.stdout
+
+    def test_export_list_formats_without_output(self):
+        """--list-formats should work without providing an output argument."""
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "export", "--list-formats"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "Available export formats:" in result.stdout
+
+
+class TestDiscoverFormats:
+    """Unit tests for _discover_formats, _discover_importers, _discover_exporters."""
+
+    def test_discover_importers_returns_all_builtins(self):
+        from memex.cli import _discover_importers
+        importers = _discover_importers()
+        assert "openai" in importers
+        assert "anthropic" in importers
+        assert "gemini" in importers
+        assert "claude_code" in importers
+
+    def test_discover_importers_have_descriptions(self):
+        from memex.cli import _discover_importers
+        importers = _discover_importers()
+        for name, info in importers.items():
+            assert info["description"], f"Importer {name} has no description"
+
+    def test_discover_exporters_returns_all_builtins(self):
+        from memex.cli import _discover_exporters
+        exporters = _discover_exporters()
+        assert "json" in exporters
+        assert "markdown" in exporters
+        assert "html" in exporters
+
+    def test_discover_exporters_strips_suffix(self):
+        """json_export.py should be discovered as 'json', not 'json_export'."""
+        from memex.cli import _discover_exporters
+        exporters = _discover_exporters()
+        assert "json" in exporters
+        assert "json_export" not in exporters
+
+    def test_discover_exporters_have_descriptions(self):
+        from memex.cli import _discover_exporters
+        exporters = _discover_exporters()
+        for name, info in exporters.items():
+            assert info["description"], f"Exporter {name} has no description"
+
+    def test_discover_formats_skips_underscored_files(self):
+        from memex.cli import _discover_importers
+        importers = _discover_importers()
+        # __init__.py should not appear
+        assert "__init__" not in importers
+
+    def test_user_plugin_directory(self, tmp_path, monkeypatch):
+        """User plugins from ~/.memex/importers/ are discovered."""
+        from memex.cli import _discover_formats
+        user_dir = tmp_path / "user_importers"
+        user_dir.mkdir()
+        # Write a minimal importer plugin
+        plugin = user_dir / "custom.py"
+        plugin.write_text(
+            '"""Custom test importer."""\n'
+            'def detect(f): return False\n'
+            'def import_file(f): return []\n'
+        )
+        builtin_dir = tmp_path / "empty_builtins"
+        builtin_dir.mkdir()
+        formats = _discover_formats(builtin_dir, user_dir, ("detect", "import_file"))
+        assert "custom" in formats
+        assert "Custom test importer." in formats["custom"]["description"]
+
+
 class TestCLIHelp:
     def test_no_command_shows_help(self):
         result = subprocess.run(

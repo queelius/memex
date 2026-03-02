@@ -19,8 +19,9 @@ def main():
 
     # import
     imp = sub.add_parser("import", help="Import conversations from a file")
-    imp.add_argument("file", help="File to import")
-    imp.add_argument("--format", help="Force importer format (e.g. openai, anthropic, gemini)")
+    imp.add_argument("file", nargs="?", help="File to import")
+    imp.add_argument("--format", help="Force importer format (use --list-formats to see available)")
+    imp.add_argument("--list-formats", action="store_true", help="List available import formats")
     imp.add_argument("--no-copy-assets", action="store_true",
                      help="Skip copying media assets into the database directory")
     imp.add_argument(
@@ -31,8 +32,9 @@ def main():
 
     # export
     exp = sub.add_parser("export", help="Export conversations")
-    exp.add_argument("output", help="Output file path")
-    exp.add_argument("--format", default="markdown", help="Export format (markdown, json)")
+    exp.add_argument("output", nargs="?", help="Output file path")
+    exp.add_argument("--format", default="markdown", help="Export format (use --list-formats to see available)")
+    exp.add_argument("--list-formats", action="store_true", help="List available export formats")
     exp.add_argument(
         "--db",
         help="Database directory",
@@ -85,7 +87,22 @@ def _get_version():
     return __version__
 
 
+def _list_formats(formats, label):
+    """Print available formats with descriptions."""
+    print(f"Available {label} formats:\n")
+    for name, info in sorted(formats.items()):
+        print(f"  {name:20s}  {info['description']}")
+    print()
+
+
 def _cmd_import(args):
+    if args.list_formats:
+        _list_formats(_discover_importers(), "import")
+        return
+    if not args.file:
+        print("Error: the following arguments are required: file", file=sys.stderr)
+        sys.exit(1)
+
     from memex.db import Database
     from memex.assets import resolve_source_assets, copy_assets
 
@@ -115,47 +132,79 @@ def _cmd_import(args):
         print(f"Imported {len(convs)} conversation(s) into {db_path}")
 
 
-def _auto_import(file_path, format_name=None):
-    """Auto-detect importer and import file.
+def _discover_formats(directory, user_directory, required_attrs, strip_suffix=""):
+    """Discover plugin modules from built-in and user directories.
 
-    Search order: built-in importers first, then user importers (~/.memex/importers/).
-    Warns if a user plugin shadows a built-in name.
+    Returns dict mapping name to {"path": Path, "description": str, "module": mod}.
+    User plugins shadow built-in plugins of the same name (with warning).
+    strip_suffix removes a naming suffix (e.g. "_export") so json_export.py → "json".
     """
-    importers_dir = Path(__file__).parent / "importers"
-    user_dir = Path.home() / ".memex" / "importers"
-
-    # Collect built-in importer names for shadow detection
+    formats = {}
     builtin_names = set()
-    if importers_dir.exists():
-        for py_file in importers_dir.glob("*.py"):
-            if not py_file.name.startswith("_"):
-                builtin_names.add(py_file.stem)
 
-    # Warn about shadows in user directory
-    if user_dir.exists():
-        for py_file in user_dir.glob("*.py"):
-            if not py_file.name.startswith("_") and py_file.stem in builtin_names:
-                print(
-                    f"Warning: user importer '{py_file.stem}' shadows built-in. "
-                    f"Rename to avoid conflicts, or use --format to select explicitly.",
-                    file=sys.stderr,
-                )
-
-    # Search built-ins first, then user importers
-    for d in [importers_dir, user_dir]:
+    for d in [directory, user_directory]:
         if not d.exists():
             continue
         for py_file in sorted(d.glob("*.py")):
             if py_file.name.startswith("_"):
                 continue
-            if format_name and py_file.stem != format_name:
+            name = py_file.stem
+            if strip_suffix and name.endswith(strip_suffix):
+                name = name[: -len(strip_suffix)]
+            if d == directory:
+                builtin_names.add(name)
+            elif name in builtin_names:
+                print(
+                    f"Warning: user plugin '{name}' shadows built-in. "
+                    f"Rename to avoid conflicts, or use --format to select explicitly.",
+                    file=sys.stderr,
+                )
+            try:
+                spec = importlib.util.spec_from_file_location(name, py_file)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+            except Exception:
                 continue
-            spec = importlib.util.spec_from_file_location(py_file.stem, py_file)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            if hasattr(mod, "detect") and hasattr(mod, "import_file"):
-                if format_name or mod.detect(file_path):
-                    return mod.import_file(file_path)
+            if all(hasattr(mod, a) for a in required_attrs):
+                doc = getattr(mod, "__doc__", None) or ""
+                formats[name] = {
+                    "path": py_file,
+                    "description": doc.strip().split("\n")[0].strip(),
+                    "module": mod,
+                }
+    return formats
+
+
+def _discover_importers():
+    return _discover_formats(
+        Path(__file__).parent / "importers",
+        Path.home() / ".memex" / "importers",
+        ("detect", "import_file"),
+    )
+
+
+def _discover_exporters():
+    return _discover_formats(
+        Path(__file__).parent / "exporters",
+        Path.home() / ".memex" / "exporters",
+        ("export",),
+        strip_suffix="_export",
+    )
+
+
+def _auto_import(file_path, format_name=None):
+    """Auto-detect importer and import file."""
+    importers = _discover_importers()
+    if format_name:
+        if format_name not in importers:
+            print(f"Error: unknown format '{format_name}'. "
+                  f"Available: {', '.join(sorted(importers))}",
+                  file=sys.stderr)
+            sys.exit(1)
+        return importers[format_name]["module"].import_file(file_path)
+    for name, info in importers.items():
+        if info["module"].detect(file_path):
+            return info["module"].import_file(file_path)
     print(f"Error: no importer found for {file_path}", file=sys.stderr)
     sys.exit(1)
 
@@ -221,14 +270,24 @@ def _render_conversation_md(conv):
 
 
 def _cmd_export(args):
+    if args.list_formats:
+        _list_formats(_discover_exporters(), "export")
+        return
+    if not args.output:
+        print("Error: the following arguments are required: output", file=sys.stderr)
+        sys.exit(1)
+
     from memex.db import Database
 
+    exporters = _discover_exporters()
+    if args.format not in exporters:
+        print(f"Error: unknown export format '{args.format}'. "
+              f"Available: {', '.join(sorted(exporters))}",
+              file=sys.stderr)
+        sys.exit(1)
+    exporter_mod = exporters[args.format]["module"]
+
     with Database(os.path.expanduser(args.db)) as db:
-        # Find exporter module first
-        exporter_mod = _find_exporter(args.format)
-        if exporter_mod is None:
-            print(f"Unknown export format: {args.format}", file=sys.stderr)
-            sys.exit(1)
         # Load conversations in chunks to avoid memory exhaustion
         convs = []
         cursor = None
@@ -243,21 +302,6 @@ def _cmd_export(args):
             cursor = result["next_cursor"]
         exporter_mod.export(convs, args.output, db_path=db.db_path)
         print(f"Exported {len(convs)} conversation(s) to {args.output}")
-
-
-def _find_exporter(format_name):
-    """Find an exporter module by format name."""
-    exporters_dir = Path(__file__).parent / "exporters"
-    for py_file in exporters_dir.glob("*.py"):
-        if py_file.name.startswith("_"):
-            continue
-        if py_file.stem == format_name or py_file.stem == f"{format_name}_export":
-            spec = importlib.util.spec_from_file_location(py_file.stem, py_file)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            if hasattr(mod, "export"):
-                return mod
-    return None
 
 
 def _cmd_run(args, remaining):
