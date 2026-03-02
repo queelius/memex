@@ -99,6 +99,13 @@ def _cmd_import(args):
     if args.list_formats:
         _list_formats(_discover_importers(), "import")
         return
+    if args.format:
+        importers = _discover_importers()
+        if args.format not in importers:
+            print(f"Error: unknown format '{args.format}'. "
+                  f"Available: {', '.join(sorted(importers))}",
+                  file=sys.stderr)
+            sys.exit(1)
     if not args.file:
         print("Error: the following arguments are required: file", file=sys.stderr)
         sys.exit(1)
@@ -273,18 +280,17 @@ def _cmd_export(args):
     if args.list_formats:
         _list_formats(_discover_exporters(), "export")
         return
-    if not args.output:
-        print("Error: the following arguments are required: output", file=sys.stderr)
-        sys.exit(1)
-
-    from memex.db import Database
-
     exporters = _discover_exporters()
     if args.format not in exporters:
         print(f"Error: unknown export format '{args.format}'. "
               f"Available: {', '.join(sorted(exporters))}",
               file=sys.stderr)
         sys.exit(1)
+    if not args.output:
+        print("Error: the following arguments are required: output", file=sys.stderr)
+        sys.exit(1)
+
+    from memex.db import Database
     exporter_mod = exporters[args.format]["module"]
 
     with Database(os.path.expanduser(args.db)) as db:

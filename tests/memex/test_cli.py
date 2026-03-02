@@ -407,6 +407,16 @@ class TestCLIListFormats:
         assert "unknown format" in result.stderr
         assert "openai" in result.stderr  # lists available formats
 
+    def test_import_unknown_format_without_file(self):
+        """Bad --format should error about the format, not about missing file."""
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "import", "--format", "bogus"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 1
+        assert "unknown format" in result.stderr
+        assert "file" not in result.stderr.lower()  # not a "missing file" error
+
     def test_export_unknown_format_shows_available(self, tmp_path):
         db_dir = tmp_path / "db"
         result = subprocess.run(
