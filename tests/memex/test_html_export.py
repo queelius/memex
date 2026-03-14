@@ -564,17 +564,17 @@ class TestHtmlAnthropicIntegration:
     def test_template_has_anthropic_api_code(self):
         from memex.exporters.html_template import get_template
         html = get_template()
-        assert 'api.anthropic.com/v1/messages' in html
+        assert 'metafunctor-edge.queelius.workers.dev/v1/messages' in html
         assert 'anthropic-dangerous-direct-browser-access' in html
         assert 'function sendMessage(' in html
         assert 'function downloadDb(' in html
         assert 'localStorage' in html
 
     def test_template_has_settings_form_fields(self):
-        """Settings panel should have API key, model, and system prompt fields."""
+        """Settings panel should have API key and system prompt fields."""
         html = get_template()
         assert 'id="setting-api-key"' in html
-        assert 'id="setting-model"' in html
+        assert 'id="setting-endpoint"' in html
         assert 'id="setting-system-prompt"' in html
         assert 'type="password"' in html
 
@@ -585,12 +585,12 @@ class TestHtmlAnthropicIntegration:
         assert 'function saveSettings()' in html
 
     def test_load_settings_reads_localstorage(self):
-        """loadSettings should read memex_api_key, memex_model, memex_system_prompt."""
+        """loadSettings should read memex_api_key, memex_endpoint, memex_system_prompt."""
         html = get_template()
         start = html.index("function loadSettings()")
         chunk = html[start:start + 500]
         assert 'memex_api_key' in chunk
-        assert 'memex_model' in chunk
+        assert 'memex_endpoint' in chunk
         assert 'memex_system_prompt' in chunk
         assert 'localStorage.getItem' in chunk
 
@@ -610,17 +610,17 @@ class TestHtmlAnthropicIntegration:
         assert "loadSettings()" in chunk
 
     def test_send_message_checks_api_key(self):
-        """sendMessage should check for API key and open settings if missing."""
+        """resumeConversation should check for API key and open settings if missing."""
         html = get_template()
-        start = html.index("function sendMessage()")
+        start = html.index("function resumeConversation(")
         chunk = html[start:start + 600]
         assert 'memex_api_key' in chunk
         assert 'toggleSettings()' in chunk
 
     def test_send_message_builds_history(self):
-        """sendMessage should query message history from DB."""
+        """resumeConversation should query message history from DB."""
         html = get_template()
-        start = html.index("function sendMessage()")
+        start = html.index("function resumeConversation(")
         chunk = html[start:start + 3000]
         assert 'FROM messages WHERE conversation_id' in chunk
         assert 'ORDER BY created_at ASC' in chunk
