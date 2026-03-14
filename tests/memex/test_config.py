@@ -69,7 +69,14 @@ class TestLoadConfig:
 
 
 class TestDatabaseRegistry:
+    @staticmethod
+    def _init_db(path):
+        """Create an empty database so readonly opens succeed."""
+        from memex.db import Database
+        Database(str(path)).close()
+
     def test_single_db(self, tmp_path):
+        self._init_db(tmp_path / "main")
         reg = DatabaseRegistry({
             "databases": {"main": {"path": str(tmp_path / "main")}},
             "primary": "main",
@@ -80,6 +87,7 @@ class TestDatabaseRegistry:
         reg.close()
 
     def test_get_db_default(self, tmp_path):
+        self._init_db(tmp_path / "main")
         reg = DatabaseRegistry({
             "databases": {"main": {"path": str(tmp_path / "main")}},
             "primary": "main",
@@ -89,6 +97,7 @@ class TestDatabaseRegistry:
         reg.close()
 
     def test_get_db_unknown(self, tmp_path):
+        self._init_db(tmp_path / "main")
         reg = DatabaseRegistry({
             "databases": {"main": {"path": str(tmp_path / "main")}},
             "primary": "main",
@@ -99,6 +108,8 @@ class TestDatabaseRegistry:
         reg.close()
 
     def test_all_dbs(self, tmp_path):
+        self._init_db(tmp_path / "a")
+        self._init_db(tmp_path / "b")
         reg = DatabaseRegistry({
             "databases": {
                 "a": {"path": str(tmp_path / "a")},
@@ -111,6 +122,7 @@ class TestDatabaseRegistry:
         reg.close()
 
     def test_close_clears_dbs(self, tmp_path):
+        self._init_db(tmp_path / "main")
         reg = DatabaseRegistry({
             "databases": {"main": {"path": str(tmp_path / "main")}},
             "primary": "main",
@@ -121,6 +133,7 @@ class TestDatabaseRegistry:
 
     def test_expanduser_in_path(self, tmp_path):
         """Paths with ~ should be expanded."""
+        self._init_db(tmp_path / "main")
         reg = DatabaseRegistry({
             "databases": {"main": {"path": str(tmp_path / "main")}},
             "primary": "main",

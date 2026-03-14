@@ -4,9 +4,25 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "memex"
-version = "0.1.0"
-description = "Personal conversation knowledge base"
+version = "0.9.0"
+description = "Personal conversation knowledge base — import, search, and analyze conversations from ChatGPT, Claude, Gemini, and Claude Code"
 requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Alex Towell", email = "lex@metafunctor.com"},
+]
+readme = "README.md"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "fastmcp<3",
     "pyyaml",
@@ -14,6 +30,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-cov", "pytest-asyncio"]
+
+[project.urls]
+Homepage = "https://github.com/queelius/memex"
+Repository = "https://github.com/queelius/memex"
+Issues = "https://github.com/queelius/memex/issues"
 
 [project.scripts]
 memex = "memex.cli:main"

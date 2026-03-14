@@ -909,6 +909,7 @@ class TestMigrationV1toV2:
     def test_migration_creates_tables(self, tmp_db_path):
         """Simulate v1 DB and verify migration adds enrichments+provenance."""
         import sqlite3 as _sqlite3
+        from memex.db import SCHEMA_VERSION
         db_file = str(Path(tmp_db_path) / "conversations.db")
         conn = _sqlite3.connect(db_file)
         # Create v1 schema (no enrichments, no provenance)
@@ -953,8 +954,8 @@ class TestMigrationV1toV2:
         )]
         assert "enrichments" in tables
         assert "provenance" in tables
-        # Schema version should be 2 now
-        assert db.execute_sql("SELECT version FROM schema_version")[0]["version"] == 2
+        # Schema version should be current after all migrations
+        assert db.execute_sql("SELECT version FROM schema_version")[0]["version"] == SCHEMA_VERSION
 
     def test_migration_backfills_provenance(self, tmp_db_path):
         """Source field from conversations should be backfilled into provenance."""
@@ -1004,13 +1005,14 @@ class TestMigrationV1toV2:
 
     def test_migration_idempotent(self, tmp_db_path):
         """Opening the DB multiple times shouldn't fail or duplicate data."""
+        from memex.db import SCHEMA_VERSION
         db = Database(tmp_db_path)
         db.save_conversation(_make_conv())
         db.save_enrichment("c1", "topic", "test", "claude")
         db.close()
         db2 = Database(tmp_db_path)
         assert len(db2.get_enrichments("c1")) == 1
-        assert db2.execute_sql("SELECT version FROM schema_version")[0]["version"] == 2
+        assert db2.execute_sql("SELECT version FROM schema_version")[0]["version"] == SCHEMA_VERSION
 
 
 class TestUpdateMessageContent:

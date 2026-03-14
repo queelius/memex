@@ -104,6 +104,7 @@ class Conversation:
     starred_at: Optional[datetime] = None
     pinned_at: Optional[datetime] = None
     archived_at: Optional[datetime] = None
+    parent_conversation_id: Optional[str] = None
     sensitive: bool = False
     tags: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)

@@ -79,6 +79,7 @@ def _conv_metadata(conv, db) -> dict:
         "message_count": conv.message_count,
         "created_at": _fmt_dt(conv.created_at),
         "updated_at": _fmt_dt(conv.updated_at),
+        "parent_conversation_id": conv.parent_conversation_id,
         "starred": conv.starred_at is not None,
         "pinned": conv.pinned_at is not None,
         "archived": conv.archived_at is not None,

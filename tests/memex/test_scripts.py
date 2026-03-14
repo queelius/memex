@@ -171,6 +171,35 @@ def _make_conv(id="c1", title="Test", msg_text="hello"):
     return conv
 
 
+class TestScriptDiscoveryEdgeCases:
+    def test_discover_skips_modules_that_raise_on_import(self, tmp_path):
+        """Modules that raise ImportError during load are silently skipped."""
+        (tmp_path / "badmod.py").write_text(
+            'import nonexistent_module_xyz\n'
+            'def register_args(p): pass\n'
+            'def run(d,a,apply=False): return {}\n'
+        )
+        (tmp_path / "goodmod.py").write_text(
+            '"""Good module."""\ndef register_args(p): pass\ndef run(d,a,apply=False): return {}'
+        )
+        with patch("memex.scripts._builtin_dir", return_value=tmp_path):
+            with patch("memex.scripts._user_dir", return_value=tmp_path / "nope"):
+                scripts = discover_scripts()
+        assert "badmod" not in scripts
+        assert "goodmod" in scripts
+
+    def test_extract_description_no_docstring(self, tmp_path):
+        """Module without docstring gets empty description."""
+        (tmp_path / "nodoc.py").write_text(
+            'def register_args(p): pass\ndef run(d,a,apply=False): return {}'
+        )
+        with patch("memex.scripts._builtin_dir", return_value=tmp_path):
+            with patch("memex.scripts._user_dir", return_value=tmp_path / "nope"):
+                scripts = discover_scripts()
+        assert "nodoc" in scripts
+        assert scripts["nodoc"]["description"] == ""
+
+
 class TestEnrichTrivialScript:
     def test_has_convention_interface(self):
         mod = load_script("enrich_trivial")
@@ -217,3 +246,136 @@ class TestEnrichTrivialScript:
         assert len(importance_vals) == 1
         assert importance_vals[0]["value"] == "trivial"
         db.close()
+
+    def test_skips_already_enriched_conversations(self, tmp_db_path):
+        """Conversations with existing importance enrichments are skipped."""
+        db = Database(tmp_db_path)
+        now = datetime.now()
+        conv = Conversation(id="already", created_at=now, updated_at=now,
+                            title="Already Done", message_count=0, source="test")
+        db.save_conversation(conv)
+        db.save_enrichment("already", "importance", "high", "user")
+
+        mod = load_script("enrich_trivial")
+        script_args = argparse.Namespace(max_messages=4)
+        stats = mod.run(db, script_args, apply=True)
+        assert stats["skipped"] >= 1
+        # Original enrichment still there, not overwritten
+        enrichments = db.get_enrichments("already")
+        assert len(enrichments) == 1
+        assert enrichments[0]["value"] == "high"
+        db.close()
+
+
+class TestClassifyConversation:
+    """Unit tests for classify_conversation covering all classification branches."""
+
+    def _make_conv_dict(self, msg_count=1, title="Test"):
+        return {"id": "c1", "message_count": msg_count, "title": title, "source": "test"}
+
+    def _make_msg(self, text, role="user"):
+        return {"role": role, "content": json.dumps([{"type": "text", "text": text}])}
+
+    def test_trivial_pattern_match(self):
+        """Messages matching TRIVIAL_PATTERNS (e.g. 'test', 'asdf') are trivial."""
+        from memex.scripts.enrich_trivial import classify_conversation
+        conv = self._make_conv_dict(msg_count=1)
+        messages = [self._make_msg("test")]
+        enrichments = classify_conversation(conv, messages)
+        importance = [e for e in enrichments if e["type"] == "importance"]
+        assert len(importance) == 1
+        assert importance[0]["value"] == "trivial"
+        assert importance[0]["confidence"] == 0.95
+
+    def test_trivial_pattern_aaa(self):
+        """Repeated characters like 'aaa' are trivial."""
+        from memex.scripts.enrich_trivial import classify_conversation
+        conv = self._make_conv_dict(msg_count=1)
+        messages = [self._make_msg("aaaa")]
+        enrichments = classify_conversation(conv, messages)
+        importance = [e for e in enrichments if e["type"] == "importance"]
+        assert len(importance) == 1
+        assert importance[0]["value"] == "trivial"
+
+    def test_no_user_text_is_trivial(self):
+        """Conversation with messages but no user text content is trivial."""
+        from memex.scripts.enrich_trivial import classify_conversation
+        conv = self._make_conv_dict(msg_count=1)
+        # Only assistant messages, no user text
+        messages = [{"role": "assistant", "content": json.dumps([{"type": "text", "text": "hi"}])}]
+        enrichments = classify_conversation(conv, messages)
+        importance = [e for e in enrichments if e["type"] == "importance"]
+        assert len(importance) == 1
+        assert importance[0]["value"] == "trivial"
+        assert importance[0]["confidence"] == 0.95
+
+    def test_untitled_with_short_text_is_trivial(self):
+        """Untitled conversation with short first user text is trivial."""
+        from memex.scripts.enrich_trivial import classify_conversation
+        conv = self._make_conv_dict(msg_count=1, title="Untitled")
+        messages = [self._make_msg("ok")]
+        enrichments = classify_conversation(conv, messages)
+        importance = [e for e in enrichments if e["type"] == "importance"]
+        assert len(importance) == 1
+        assert importance[0]["value"] == "trivial"
+        assert importance[0]["confidence"] == 0.9
+
+    def test_short_two_message_conv_is_trivial(self):
+        """2-message conversation with very short user text is trivial."""
+        from memex.scripts.enrich_trivial import classify_conversation
+        conv = self._make_conv_dict(msg_count=2, title="Named Conversation")
+        messages = [self._make_msg("hi"), self._make_msg("ok", role="assistant")]
+        enrichments = classify_conversation(conv, messages)
+        importance = [e for e in enrichments if e["type"] == "importance"]
+        assert len(importance) == 1
+        assert importance[0]["value"] == "trivial"
+        assert importance[0]["confidence"] == 0.85
+
+    def test_short_two_message_conv_is_brief(self):
+        """2-message conversation with moderate text is classified as brief."""
+        from memex.scripts.enrich_trivial import classify_conversation
+        conv = self._make_conv_dict(msg_count=2, title="Named Conversation")
+        # Text longer than 20 chars but under 100
+        messages = [
+            self._make_msg("How do I install numpy in Python?"),
+            self._make_msg("pip install numpy", role="assistant"),
+        ]
+        enrichments = classify_conversation(conv, messages)
+        importance = [e for e in enrichments if e["type"] == "importance"]
+        assert len(importance) == 1
+        assert importance[0]["value"] == "brief"
+        assert importance[0]["confidence"] == 0.7
+
+    def test_greeting_detected(self):
+        """Greeting patterns produce a topic=greeting enrichment."""
+        from memex.scripts.enrich_trivial import classify_conversation
+        conv = self._make_conv_dict(msg_count=1)
+        messages = [self._make_msg("hello there, how are you doing today?")]
+        enrichments = classify_conversation(conv, messages)
+        topic = [e for e in enrichments if e["type"] == "topic" and e["value"] == "greeting"]
+        assert len(topic) == 1
+        assert topic[0]["confidence"] == 0.9
+
+    def test_non_trivial_conversation_no_enrichments(self):
+        """Substantive conversation with enough content gets no enrichments."""
+        from memex.scripts.enrich_trivial import classify_conversation
+        conv = self._make_conv_dict(msg_count=4, title="Named Conversation")
+        messages = [
+            self._make_msg("Can you explain how Python generators work? I want to understand "
+                           "yield and how they differ from regular functions that return lists."),
+            self._make_msg("Generators are a special type of function...", role="assistant"),
+            self._make_msg("Can you show an example with send()?"),
+            self._make_msg("Sure, here's an example...", role="assistant"),
+        ]
+        enrichments = classify_conversation(conv, messages)
+        assert len(enrichments) == 0
+
+    def test_extract_user_text_with_invalid_json(self):
+        """extract_user_text handles invalid JSON gracefully."""
+        from memex.scripts.enrich_trivial import extract_user_text
+        assert extract_user_text("not valid json{{{") == ""
+
+    def test_extract_user_text_with_non_list_json(self):
+        """extract_user_text handles non-list JSON gracefully."""
+        from memex.scripts.enrich_trivial import extract_user_text
+        assert extract_user_text('{"type": "text"}') == ""

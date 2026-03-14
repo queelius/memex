@@ -1,14 +1,14 @@
-"""Scripts framework — discovery and runner utilities.
+"""Scripts framework -- discovery and runner utilities.
 
 Convention: each script is a Python module with:
-    register_args(parser)  — add script-specific CLI arguments
-    run(db, args, apply)   — execute the script, return stats dict
+    register_args(parser)  -- add script-specific CLI arguments
+    run(db, args, apply)   -- execute the script, return stats dict
 """
 from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 
 def _builtin_dir() -> Path:
@@ -27,17 +27,10 @@ def _load_module(name: str, path: Path):
     return mod
 
 
-def _extract_description(mod) -> str:
-    """Extract first line of module docstring as description."""
-    doc = getattr(mod, "__doc__", None) or ""
-    first_line = doc.strip().split("\n")[0].strip()
-    return first_line
-
-
 def discover_scripts() -> Dict[str, Dict[str, Any]]:
     """Discover available scripts from built-in and user directories.
 
-    Returns dict mapping script name to {"path": Path, "description": str}.
+    Returns dict mapping script name to {"path": Path, "description": str, "module": mod}.
     User scripts shadow built-in scripts of the same name.
     """
     scripts: Dict[str, Dict[str, Any]] = {}
@@ -55,9 +48,11 @@ def discover_scripts() -> Dict[str, Dict[str, Any]]:
                 continue
             if not (hasattr(mod, "register_args") and hasattr(mod, "run")):
                 continue
+            doc = getattr(mod, "__doc__", None) or ""
             scripts[name] = {
                 "path": py_file,
-                "description": _extract_description(mod),
+                "description": doc.strip().split("\n")[0].strip(),
+                "module": mod,
             }
 
     return scripts
@@ -71,4 +66,4 @@ def load_script(name: str):
     scripts = discover_scripts()
     if name not in scripts:
         raise ValueError(f"Script '{name}' not found. Use 'memex run --list' to see available scripts.")
-    return _load_module(name, scripts[name]["path"])
+    return scripts[name]["module"]

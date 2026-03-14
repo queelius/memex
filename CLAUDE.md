@@ -39,11 +39,13 @@ memex/
     patterns/            # Built-in regex pattern files
       api_keys.txt
       pii.txt
-  importers/           # Convention-based: detect() + import_file()
+  importers/           # Convention-based: detect() + import_path()
+    _claude_code_common.py  # Shared helpers for Claude Code importers
     openai.py
     anthropic.py
     gemini.py
-    claude_code.py     # Claude Code JSONL sessions (conversation_only mode)
+    claude_code.py          # Claude Code JSONL sessions (conversation_only mode)
+    claude_code_full.py     # Claude Code JSONL sessions (full fidelity: tool_use, thinking, tool_result)
   exporters/           # Convention-based: export()
     markdown.py
     json_export.py
@@ -55,7 +57,7 @@ memex/
 - Raw sqlite3 (no ORM) -- WAL mode, FTS5, PRAGMA query_only for read-only
 - Content blocks as plain dicts with "type" key -- not classes
 - Conversation trees: Dict[str, Message] with parent_id links, _children index
-- Convention-based plugins: modules with detect()/import_file() or export()
+- Convention-based plugins: modules with detect()/import_path() or export()
 - Convention-based scripts: modules with `register_args()` + `run()` in `memex/scripts/` and `~/.memex/scripts/`
 - FastMCP 2.x with lifespan pattern for DB lifecycle
 - Cursor-based keyset pagination (base64-encoded updated_at + id)
@@ -83,9 +85,11 @@ memex/
 - FTS5 virtual table (messages_fts) with porter unicode61 tokenizer
 - FTS5 columns: `conversation_id` (UNINDEXED), `message_id` (UNINDEXED), `text` — note `message_id` not `id` (differs from messages table PK)
 - Tags in separate table with (conversation_id, tag) PK
+- `parent_conversation_id` — self-referential FK to `conversations.id`, `ON DELETE SET NULL` (children survive parent deletion as orphans)
+- Partial index `idx_conversations_parent` on non-NULL parent_conversation_id
 - Enrichments table: PK (conversation_id, type, value), types: summary|topic|importance|excerpt|note
 - Provenance table: PK (conversation_id, source_type), tracks import origin
-- Schema versioning: `schema_version` table, `MIGRATIONS` dict, auto-applied on open
+- Schema versioning: `schema_version` table, `MIGRATIONS` dict, auto-applied on open (current: v3)
 - PRAGMA query_only=ON when readonly=True (enforced at SQLite engine level)
 - Database supports context manager: `with Database(path) as db:`
 - `update_message_content()` — updates content + re-indexes FTS5
@@ -95,7 +99,7 @@ memex/
 
 ## Testing
 
-- Tests in `tests/memex/` -- ~461 tests, 87%+ coverage
+- Tests in `tests/memex/` -- ~588 tests, 89%+ coverage
 - `conftest.py` provides `tmp_db_path` fixture
 - Server tests exercise DB methods directly (MCP protocol testing deferred)
 - `create_server(db=db)` sets PRAGMA query_only=ON; use `sql_write=True` for tests that call write tools directly
@@ -113,7 +117,10 @@ memex/
 - Importers set `conv.metadata["_provenance"]` -- CLI pops it before save, writes to provenance table after (CASCADE-safe)
 - Enrichment types validated in `update_conversations`: summary, topic, importance, excerpt, note
 - Enrichment sources validated in `update_conversations`: user, claude, heuristic
-- Claude Code importer uses "conversation_only" mode (strips tool use, thinking, progress). Future `claude_code_full` importer can coexist for full-fidelity import
+- Two Claude Code importers share `_claude_code_common.py`: `claude_code` (conversation_only, strips tool use/thinking) and `claude_code_full` (full fidelity). Both use `source="claude_code"`, differentiated by `importer_mode` metadata and provenance `source_type`
+- `claude_code_full` imports subagent files from `subagents/` directories with `parent_conversation_id` links; subagent IDs are `{sessionId}:{agentId}` (deterministic); `conversation_only` skips subagents entirely
+- Subagent records have `isSidechain=true` — `_import_single(ignore_sidechain=True)` is used for subagent files
+- `import_directory()` accepts `skip_subagents` param; subagents are imported per-parent-session, not via directory walk
 - `--no-copy-assets` on import skips media asset resolution and copying
 - `copy_assets` is idempotent: skips blocks already having `assets/` relative URLs
 - HTML exporter outputs a directory (not a file): `index.html` + `conversations.db` + `assets/`

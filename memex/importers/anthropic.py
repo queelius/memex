@@ -2,8 +2,10 @@
 import json
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from memex.importers import detect_model, parse_timestamp
 from memex.models import (
     Conversation,
     Message,
@@ -16,6 +18,8 @@ from memex.models import (
 
 def detect(path: str) -> bool:
     """Check if file is an Anthropic conversation export."""
+    if Path(path).is_dir():
+        return False
     try:
         with open(path) as f:
             data = json.load(f)
@@ -32,11 +36,11 @@ def detect(path: str) -> bool:
         if "uuid" in sample and "name" in sample:
             return True
         return False
-    except (json.JSONDecodeError, IOError, KeyError, IndexError):
+    except (json.JSONDecodeError, IOError, KeyError, IndexError, ValueError):
         return False
 
 
-def import_file(path: str) -> List[Conversation]:
+def import_path(path: str) -> List[Conversation]:
     """Import conversations from an Anthropic export file."""
     with open(path) as f:
         data = json.load(f)
@@ -50,41 +54,13 @@ def import_file(path: str) -> List[Conversation]:
     return conversations
 
 
-def _parse_timestamp(value: Any) -> Optional[datetime]:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(value)
-    if isinstance(value, str):
-        try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            pass
-        try:
-            return datetime.fromtimestamp(float(value))
-        except (ValueError, OSError):
-            pass
-    return None
-
-
-def _detect_model(data: dict) -> str:
-    """Detect model from conversation data."""
-    if "model" in data:
-        return data["model"]
-    messages = data.get("chat_messages", data.get("messages", []))
-    for msg in messages:
-        if msg.get("model"):
-            return msg["model"]
-    return "claude"
-
-
 def _import_conversation(data: dict, source_path: str = None) -> Optional[Conversation]:
     conv_id = data.get("uuid") or data.get("id", str(uuid.uuid4()))
     title = data.get("name") or data.get("title", "Untitled Conversation")
-    model = _detect_model(data)
+    model = detect_model(data, ["chat_messages", "messages"], "claude")
 
-    created = _parse_timestamp(data.get("created_at")) or datetime.now()
-    updated = _parse_timestamp(data.get("updated_at")) or created
+    created = parse_timestamp(data.get("created_at")) or datetime.now()
+    updated = parse_timestamp(data.get("updated_at")) or created
 
     conv = Conversation(
         id=conv_id,
@@ -113,7 +89,7 @@ def _import_conversation(data: dict, source_path: str = None) -> Optional[Conver
             role=role,
             content=content,
             parent_id=parent_id,
-            created_at=_parse_timestamp(msg_data.get("created_at")),
+            created_at=parse_timestamp(msg_data.get("created_at")),
         )
         conv.add_message(msg)
         parent_id = msg_id

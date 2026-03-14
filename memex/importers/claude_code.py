@@ -8,73 +8,45 @@ assistant text responses. Tool use, thinking blocks, progress events, and file
 snapshots are stripped. Metadata records the mode as "conversation_only" so a
 future full-fidelity importer (claude_code_full) can coexist.
 """
-import json
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import List
 
 from memex.models import Conversation, Message, text_block
-
-# Event types that Claude Code uses (for detection)
-_KNOWN_EVENT_TYPES = {
-    "user", "assistant", "system", "progress",
-    "file-history-snapshot", "queue-operation",
-}
-
-
-def detect(path: str) -> bool:
-    """Check if file is a Claude Code JSONL session transcript."""
-    try:
-        if not path.endswith(".jsonl"):
-            return False
-        with open(path) as f:
-            first_line = f.readline()
-        record = json.loads(first_line)
-        return (
-            "sessionId" in record or "type" in record
-        ) and record.get("type") in _KNOWN_EVENT_TYPES
-    except (json.JSONDecodeError, IOError, KeyError, IndexError):
-        return False
+from memex.importers._claude_code_common import (
+    detect,  # re-exported as public API
+    parse_iso as _parse_iso,
+    slug_to_title as _slug_to_title,
+    parse_records,
+    extract_session_metadata,
+    import_directory,
+)
 
 
-def _parse_iso(ts: str) -> datetime:
-    """Parse ISO 8601 timestamp, handling trailing Z."""
-    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+def import_path(path: str) -> List[Conversation]:
+    """Import a Claude Code JSONL session file or directory of sessions.
+
+    If path is a directory, finds all .jsonl files recursively and imports each.
+    """
+    p = Path(path)
+    if p.is_dir():
+        return import_directory(path, _import_single)
+    return _import_single(path)
 
 
-def import_file(path: str) -> List[Conversation]:
-    """Import a Claude Code JSONL session as a single conversation.
+def _import_single(path: str) -> List[Conversation]:
+    """Import a single Claude Code JSONL session as a conversation.
 
     Extracts only the conversation skeleton:
     - User messages: type="user", userType="external", not sidechain, plain text
     - Assistant messages: type="assistant", not sidechain, text blocks only
     """
-    with open(path) as f:
-        records = [json.loads(line) for line in f if line.strip()]
-
+    records = parse_records(path)
     if not records:
         return []
 
-    # Extract session metadata from first record with sessionId
-    session_id = None
-    slug = None
-    first_ts = None
-    last_ts = None
-    model = None
-
-    for rec in records:
-        if session_id is None and rec.get("sessionId"):
-            session_id = rec["sessionId"]
-        if slug is None and rec.get("slug"):
-            slug = rec["slug"]
-        if rec.get("timestamp"):
-            ts = rec["timestamp"]
-            if first_ts is None:
-                first_ts = ts
-            last_ts = ts
-        # Extract model from first assistant message
-        if model is None and rec.get("type") == "assistant":
-            model = rec.get("message", {}).get("model")
-
+    meta = extract_session_metadata(records)
+    session_id = meta["session_id"]
     if session_id is None:
         return []
 
@@ -136,16 +108,16 @@ def import_file(path: str) -> List[Conversation]:
         return []
 
     # Build title from slug
-    title = _slug_to_title(slug) if slug else "Untitled Session"
+    title = _slug_to_title(meta["slug"]) if meta["slug"] else "Untitled Session"
 
     now = datetime.now(timezone.utc)
     conv = Conversation(
         id=session_id,
         title=title,
         source="claude_code",
-        model=model,
-        created_at=_parse_iso(first_ts) if first_ts else now,
-        updated_at=_parse_iso(last_ts) if last_ts else now,
+        model=meta["model"],
+        created_at=_parse_iso(meta["first_ts"]) if meta["first_ts"] else now,
+        updated_at=_parse_iso(meta["last_ts"]) if meta["last_ts"] else now,
         tags=["claude-code"],
     )
 
@@ -160,8 +132,3 @@ def import_file(path: str) -> List[Conversation]:
     conv.metadata["importer_mode"] = "conversation_only"
 
     return [conv]
-
-
-def _slug_to_title(slug: str) -> str:
-    """Convert a slug like 'immutable-splashing-thompson' to title case."""
-    return slug.replace("-", " ").title()

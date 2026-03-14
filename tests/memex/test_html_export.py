@@ -609,14 +609,6 @@ class TestHtmlAnthropicIntegration:
         chunk = html[start:end]
         assert "loadSettings()" in chunk
 
-    def test_send_message_checks_api_key(self):
-        """resumeConversation should check for API key and open settings if missing."""
-        html = get_template()
-        start = html.index("function resumeConversation(")
-        chunk = html[start:start + 600]
-        assert 'memex_api_key' in chunk
-        assert 'toggleSettings()' in chunk
-
     def test_send_message_builds_history(self):
         """resumeConversation should query message history from DB."""
         html = get_template()

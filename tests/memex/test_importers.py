@@ -2,13 +2,15 @@
 import json
 
 from memex.importers.openai import detect as openai_detect
-from memex.importers.openai import import_file as openai_import
+from memex.importers.openai import import_path as openai_import
 from memex.importers.anthropic import detect as anthropic_detect
-from memex.importers.anthropic import import_file as anthropic_import
+from memex.importers.anthropic import import_path as anthropic_import
 from memex.importers.gemini import detect as gemini_detect
-from memex.importers.gemini import import_file as gemini_import
+from memex.importers.gemini import import_path as gemini_import
 from memex.importers.claude_code import detect as claude_code_detect
-from memex.importers.claude_code import import_file as claude_code_import
+from memex.importers.claude_code import import_path as claude_code_import
+from memex.importers.claude_code_full import detect as claude_code_full_detect
+from memex.importers.claude_code_full import import_path as claude_code_full_import
 
 
 # ---------- OpenAI ----------
@@ -38,6 +40,11 @@ class TestOpenAIDetect:
     def test_empty_list(self, tmp_path):
         f = tmp_path / "empty.json"
         f.write_text("[]")
+        assert openai_detect(str(f)) is False
+
+    def test_binary_file(self, tmp_path):
+        f = tmp_path / "image.jpg"
+        f.write_bytes(b'\xff\xd8\xff\xe0' + b'\x00' * 100)
         assert openai_detect(str(f)) is False
 
 
@@ -692,3 +699,630 @@ class TestClaudeCodeImport:
         assert "First part." in msg.get_text()
         assert "Second part." in msg.get_text()
         assert len(msg.content) == 1  # Joined into single text block
+
+    def test_import_skips_corrupted_lines(self, tmp_path):
+        """Corrupted/NUL-padded lines in JSONL are skipped gracefully."""
+        events = [
+            _cc_event("user", uuid="u1",
+                      message={"role": "user", "content": "Hello"}),
+            _cc_event("assistant", uuid="a1", parent_uuid="u1",
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [{"type": "text", "text": "Hi!"}]}),
+        ]
+        f = tmp_path / "session.jsonl"
+        # Write valid lines + corrupted NUL bytes (simulating truncated write)
+        content = "\n".join(json.dumps(e) for e in events) + "\n" + "\x00" * 100
+        f.write_text(content)
+        convs = claude_code_import(str(f))
+        assert len(convs) == 1
+        assert len(convs[0].messages) == 2
+
+
+# ---------- Directory detection + import ----------
+
+class TestClaudeCodeDirectoryDetect:
+    def test_directory_with_jsonl(self, tmp_path):
+        """Directory containing Claude Code .jsonl files is detected."""
+        sub = tmp_path / "projects" / "myproject"
+        sub.mkdir(parents=True)
+        f = sub / "session.jsonl"
+        _write_jsonl(f, [_cc_event("user")])
+        assert claude_code_detect(str(tmp_path / "projects")) is True
+
+    def test_directory_without_jsonl(self, tmp_path):
+        """Empty directory is not detected."""
+        d = tmp_path / "empty"
+        d.mkdir()
+        assert claude_code_detect(str(d)) is False
+
+    def test_directory_with_non_claude_jsonl(self, tmp_path):
+        """Directory with non-Claude Code .jsonl is not detected."""
+        d = tmp_path / "other"
+        d.mkdir()
+        f = d / "data.jsonl"
+        f.write_text(json.dumps({"foo": "bar", "type": "something_else"}))
+        assert claude_code_detect(str(d)) is False
+
+
+class TestClaudeCodeDirectoryImport:
+    def test_import_directory(self, tmp_path):
+        """Importing a directory finds and imports all .jsonl sessions."""
+        d = tmp_path / "sessions"
+        d.mkdir()
+        # Session A
+        events_a = [
+            _cc_event("user", uuid="u1", session_id="sess-a", slug="session-a",
+                      message={"role": "user", "content": "Hello A"}),
+            _cc_event("assistant", uuid="a1", session_id="sess-a", slug="session-a",
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [{"type": "text", "text": "Reply A"}]}),
+        ]
+        _write_jsonl(d / "a.jsonl", events_a)
+        # Session B in a subdirectory
+        sub = d / "sub"
+        sub.mkdir()
+        events_b = [
+            _cc_event("user", uuid="u1", session_id="sess-b", slug="session-b",
+                      message={"role": "user", "content": "Hello B"}),
+            _cc_event("assistant", uuid="a1", session_id="sess-b", slug="session-b",
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [{"type": "text", "text": "Reply B"}]}),
+        ]
+        _write_jsonl(sub / "b.jsonl", events_b)
+
+        convs = claude_code_import(str(d))
+        assert len(convs) == 2
+        ids = {c.id for c in convs}
+        assert ids == {"sess-a", "sess-b"}
+
+    def test_import_directory_skips_non_claude(self, tmp_path):
+        """Non-Claude .jsonl files in directory are skipped."""
+        d = tmp_path / "mixed"
+        d.mkdir()
+        # Valid Claude Code session
+        events = [
+            _cc_event("user", uuid="u1", session_id="sess-1", slug="valid",
+                      message={"role": "user", "content": "Hi"}),
+            _cc_event("assistant", uuid="a1", session_id="sess-1", slug="valid",
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [{"type": "text", "text": "Hello"}]}),
+        ]
+        _write_jsonl(d / "valid.jsonl", events)
+        # Non-Claude JSONL
+        (d / "other.jsonl").write_text(json.dumps({"foo": "bar"}))
+
+        convs = claude_code_import(str(d))
+        assert len(convs) == 1
+        assert convs[0].id == "sess-1"
+
+    def test_import_empty_directory(self, tmp_path):
+        """Importing an empty directory returns no conversations."""
+        d = tmp_path / "empty"
+        d.mkdir()
+        convs = claude_code_import(str(d))
+        assert convs == []
+
+
+class TestOpenAIDirectoryDetect:
+    def test_directory_with_conversations_json(self, tmp_path):
+        """Directory containing conversations.json is detected."""
+        d = tmp_path / "openai_export"
+        d.mkdir()
+        (d / "conversations.json").write_text(json.dumps([{
+            "id": "c1",
+            "mapping": {"m1": {"message": {"content": {"parts": ["hi"]}}}},
+        }]))
+        assert openai_detect(str(d)) is True
+
+    def test_directory_without_conversations_json(self, tmp_path):
+        """Directory without conversations.json is not detected."""
+        d = tmp_path / "random"
+        d.mkdir()
+        assert openai_detect(str(d)) is False
+
+    def test_directory_with_wrong_conversations_json(self, tmp_path):
+        """Directory with non-OpenAI conversations.json is not detected."""
+        d = tmp_path / "wrong"
+        d.mkdir()
+        (d / "conversations.json").write_text(json.dumps({"not": "openai"}))
+        assert openai_detect(str(d)) is False
+
+
+class TestOpenAIDirectoryImport:
+    def test_import_directory(self, tmp_path):
+        """Importing a directory reads conversations.json inside it."""
+        d = tmp_path / "openai_export"
+        d.mkdir()
+        data = [{
+            "id": "conv1", "title": "Test Chat",
+            "create_time": 1700000000, "update_time": 1700000001,
+            "mapping": {
+                "m1": {
+                    "id": "m1", "parent": None, "children": [],
+                    "message": {
+                        "id": "m1", "author": {"role": "user"},
+                        "content": {"parts": ["hello"]},
+                        "create_time": 1700000000,
+                    },
+                },
+            },
+        }]
+        (d / "conversations.json").write_text(json.dumps(data))
+        convs = openai_import(str(d))
+        assert len(convs) == 1
+        assert convs[0].title == "Test Chat"
+
+
+class TestAnthropicDirectoryDetect:
+    def test_rejects_directory(self, tmp_path):
+        """Anthropic importer rejects directories."""
+        d = tmp_path / "some_dir"
+        d.mkdir()
+        assert anthropic_detect(str(d)) is False
+
+
+class TestGeminiDirectoryDetect:
+    def test_rejects_directory(self, tmp_path):
+        """Gemini importer rejects directories."""
+        d = tmp_path / "some_dir"
+        d.mkdir()
+        assert gemini_detect(str(d)) is False
+
+
+# ---------- Claude Code Full ----------
+
+class TestClaudeCodeFullDetect:
+    def test_detect_delegates_to_shared(self, tmp_path):
+        """Full importer uses the same detection as conversation_only."""
+        f = tmp_path / "session.jsonl"
+        _write_jsonl(f, [_cc_event("user")])
+        assert claude_code_full_detect(str(f)) is True
+
+    def test_detect_rejects_non_claude(self, tmp_path):
+        f = tmp_path / "other.jsonl"
+        f.write_text(json.dumps({"foo": "bar", "type": "something_else"}))
+        assert claude_code_full_detect(str(f)) is False
+
+    def test_detect_directory(self, tmp_path):
+        sub = tmp_path / "projects" / "myproject"
+        sub.mkdir(parents=True)
+        _write_jsonl(sub / "session.jsonl", [_cc_event("user")])
+        assert claude_code_full_detect(str(tmp_path / "projects")) is True
+
+
+class TestClaudeCodeFullImport:
+    def test_import_preserves_tool_use(self, tmp_path):
+        """Tool use blocks are preserved in full import."""
+        events = [
+            _cc_event("user", uuid="u1",
+                      message={"role": "user", "content": "Read my file"}),
+            _cc_event("assistant", uuid="a1", parent_uuid="u1",
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [
+                                   {"type": "text", "text": "Let me read that."},
+                                   {"type": "tool_use", "id": "tu1",
+                                    "name": "Read", "input": {"path": "a.py"}},
+                               ]}),
+        ]
+        f = tmp_path / "session.jsonl"
+        _write_jsonl(f, events)
+        convs = claude_code_full_import(str(f))
+        assert len(convs) == 1
+        msg = list(convs[0].messages.values())[1]
+        assert len(msg.content) == 2
+        assert msg.content[0]["type"] == "text"
+        assert msg.content[1]["type"] == "tool_use"
+        assert msg.content[1]["name"] == "Read"
+        assert msg.content[1]["input"] == {"path": "a.py"}
+
+    def test_import_preserves_thinking(self, tmp_path):
+        """Thinking blocks are preserved and normalized to text field."""
+        events = [
+            _cc_event("user", uuid="u1",
+                      message={"role": "user", "content": "Think about this"}),
+            _cc_event("assistant", uuid="a1", parent_uuid="u1",
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [
+                                   {"type": "thinking", "thinking": "Let me consider..."},
+                                   {"type": "text", "text": "Here is my answer."},
+                               ]}),
+        ]
+        f = tmp_path / "session.jsonl"
+        _write_jsonl(f, events)
+        convs = claude_code_full_import(str(f))
+        msg = list(convs[0].messages.values())[1]
+        assert len(msg.content) == 2
+        assert msg.content[0]["type"] == "thinking"
+        assert msg.content[0]["text"] == "Let me consider..."
+        assert msg.content[1]["type"] == "text"
+
+    def test_import_preserves_tool_results(self, tmp_path):
+        """User tool_result messages are preserved."""
+        events = [
+            _cc_event("user", uuid="u1",
+                      message={"role": "user", "content": "Check something"}),
+            _cc_event("assistant", uuid="a1", parent_uuid="u1",
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [
+                                   {"type": "tool_use", "id": "tu1",
+                                    "name": "Read", "input": {"path": "a.py"}},
+                               ]}),
+            _cc_event("user", uuid="u2", parent_uuid="a1",
+                      user_type="internal",
+                      message={"role": "user", "content": [
+                          {"type": "tool_result", "tool_use_id": "tu1",
+                           "content": "file contents here"}
+                      ]}),
+            _cc_event("assistant", uuid="a2", parent_uuid="u2",
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [{"type": "text", "text": "Done!"}]}),
+        ]
+        f = tmp_path / "session.jsonl"
+        _write_jsonl(f, events)
+        convs = claude_code_full_import(str(f))
+        assert len(convs[0].messages) == 4
+        # Check the tool_result message
+        msgs = list(convs[0].messages.values())
+        assert msgs[2].role == "user"
+        assert msgs[2].content[0]["type"] == "tool_result"
+        assert msgs[2].content[0]["tool_use_id"] == "tu1"
+        assert msgs[2].content[0]["content"] == "file contents here"
+
+    def test_import_preserves_tool_result_error(self, tmp_path):
+        """Tool result errors are preserved."""
+        events = [
+            _cc_event("user", uuid="u1",
+                      message={"role": "user", "content": "Do something"}),
+            _cc_event("assistant", uuid="a1", parent_uuid="u1",
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [
+                                   {"type": "tool_use", "id": "tu1",
+                                    "name": "Bash", "input": {"cmd": "fail"}},
+                               ]}),
+            _cc_event("user", uuid="u2", parent_uuid="a1",
+                      user_type="internal",
+                      message={"role": "user", "content": [
+                          {"type": "tool_result", "tool_use_id": "tu1",
+                           "content": "command not found", "is_error": True}
+                      ]}),
+        ]
+        f = tmp_path / "session.jsonl"
+        _write_jsonl(f, events)
+        convs = claude_code_full_import(str(f))
+        msgs = list(convs[0].messages.values())
+        assert msgs[2].content[0]["is_error"] is True
+
+    def test_import_text_only_unchanged(self, tmp_path):
+        """Text-only messages work the same as conversation_only importer."""
+        events = [
+            _cc_event("user", uuid="u1",
+                      message={"role": "user", "content": "Hello"}),
+            _cc_event("assistant", uuid="a1", parent_uuid="u1",
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [{"type": "text", "text": "Hi there!"}]}),
+        ]
+        f = tmp_path / "session.jsonl"
+        _write_jsonl(f, events)
+        convs = claude_code_full_import(str(f))
+        assert len(convs) == 1
+        msgs = list(convs[0].messages.values())
+        assert msgs[0].get_text() == "Hello"
+        assert msgs[1].get_text() == "Hi there!"
+
+    def test_import_skips_sidechain(self, tmp_path):
+        """Sidechain messages are still skipped in full import."""
+        events = [
+            _cc_event("user", uuid="u1",
+                      message={"role": "user", "content": "Hello"}),
+            _cc_event("assistant", uuid="a1", parent_uuid="u1",
+                      is_sidechain=True,
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [{"type": "text", "text": "Sidechain"}]}),
+            _cc_event("assistant", uuid="a2", parent_uuid="u1",
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [{"type": "text", "text": "Main"}]}),
+        ]
+        f = tmp_path / "session.jsonl"
+        _write_jsonl(f, events)
+        convs = claude_code_full_import(str(f))
+        msgs = list(convs[0].messages.values())
+        assert len(msgs) == 2
+        assert msgs[1].get_text() == "Main"
+
+    def test_import_skips_progress_and_system(self, tmp_path):
+        """Progress and system events are skipped."""
+        events = [
+            _cc_event("progress", uuid="p1", data={"type": "hook_progress"}),
+            _cc_event("system", uuid="s1", message={"role": "system", "content": "init"}),
+            _cc_event("file-history-snapshot", uuid="f1",
+                      snapshot={"trackedFileBackups": {}}),
+            _cc_event("user", uuid="u1",
+                      message={"role": "user", "content": "Hello"}),
+            _cc_event("assistant", uuid="a1", parent_uuid="u1",
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [{"type": "text", "text": "Hi!"}]}),
+        ]
+        f = tmp_path / "session.jsonl"
+        _write_jsonl(f, events)
+        convs = claude_code_full_import(str(f))
+        assert len(convs[0].messages) == 2
+
+    def test_import_metadata(self, tmp_path):
+        """Full import sets importer_mode='full' and provenance source_type='claude_code_full'."""
+        events = [
+            _cc_event("user", uuid="u1",
+                      message={"role": "user", "content": "Hi"}),
+            _cc_event("assistant", uuid="a1", parent_uuid="u1",
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [{"type": "text", "text": "Hello!"}]}),
+        ]
+        f = tmp_path / "session.jsonl"
+        _write_jsonl(f, events)
+        convs = claude_code_full_import(str(f))
+        conv = convs[0]
+        assert conv.metadata["importer_mode"] == "full"
+        assert conv.source == "claude_code"
+        assert "claude-code" in conv.tags
+        prov = conv.metadata["_provenance"]
+        assert prov["source_type"] == "claude_code_full"
+        assert prov["source_id"] == "sess-123"
+        assert prov["source_file"] == str(f)
+
+    def test_import_empty_session(self, tmp_path):
+        """Session with no importable messages returns empty list."""
+        events = [
+            _cc_event("progress", uuid="p1", data={"type": "hook_progress"}),
+        ]
+        f = tmp_path / "session.jsonl"
+        _write_jsonl(f, events)
+        convs = claude_code_full_import(str(f))
+        assert convs == []
+
+    def test_import_directory(self, tmp_path):
+        """Directory import works via shared directory walker."""
+        d = tmp_path / "sessions"
+        d.mkdir()
+        events_a = [
+            _cc_event("user", uuid="u1", session_id="sess-a", slug="session-a",
+                      message={"role": "user", "content": "Hello A"}),
+            _cc_event("assistant", uuid="a1", session_id="sess-a", slug="session-a",
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [{"type": "text", "text": "Reply A"}]}),
+        ]
+        _write_jsonl(d / "a.jsonl", events_a)
+        events_b = [
+            _cc_event("user", uuid="u1", session_id="sess-b", slug="session-b",
+                      message={"role": "user", "content": "Hello B"}),
+            _cc_event("assistant", uuid="a1", session_id="sess-b", slug="session-b",
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [
+                                   {"type": "tool_use", "id": "tu1",
+                                    "name": "Bash", "input": {"cmd": "ls"}},
+                               ]}),
+        ]
+        _write_jsonl(d / "b.jsonl", events_b)
+        convs = claude_code_full_import(str(d))
+        assert len(convs) == 2
+        ids = {c.id for c in convs}
+        assert ids == {"sess-a", "sess-b"}
+
+    def test_import_assistant_only_tool_use(self, tmp_path):
+        """Assistant turn with only tool_use (no text) is preserved in full import."""
+        events = [
+            _cc_event("user", uuid="u1",
+                      message={"role": "user", "content": "Read a.py"}),
+            _cc_event("assistant", uuid="a1", parent_uuid="u1",
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [
+                                   {"type": "tool_use", "id": "tu1",
+                                    "name": "Read", "input": {"path": "a.py"}},
+                               ]}),
+        ]
+        f = tmp_path / "session.jsonl"
+        _write_jsonl(f, events)
+        convs = claude_code_full_import(str(f))
+        # Both messages preserved (conversation_only would skip the tool_use-only assistant)
+        assert len(convs[0].messages) == 2
+        msg = list(convs[0].messages.values())[1]
+        assert msg.content[0]["type"] == "tool_use"
+
+
+# ---------- Claude Code Full: Subagent Import ----------
+
+class TestClaudeCodeFullSubagentImport:
+    """Tests for subagent import in the full-fidelity importer."""
+
+    def _make_parent_session(self, d, session_id="sess-parent", slug="parent-session"):
+        """Create a parent session JSONL file."""
+        events = [
+            _cc_event("user", uuid="u1", session_id=session_id, slug=slug,
+                      message={"role": "user", "content": "Do something"}),
+            _cc_event("assistant", uuid="a1", session_id=session_id, slug=slug,
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [{"type": "text", "text": "On it!"}]}),
+        ]
+        f = d / f"{session_id}.jsonl"
+        _write_jsonl(f, events)
+        return f
+
+    def _make_subagent(self, parent_dir, agent_id, session_id="sess-parent"):
+        """Create a subagent JSONL file in <session_id>/subagents/ dir."""
+        subdir = parent_dir / session_id / "subagents"
+        subdir.mkdir(parents=True, exist_ok=True)
+        events = [
+            _cc_event("user", uuid="su1", session_id=session_id, slug=agent_id,
+                      is_sidechain=True,
+                      message={"role": "user", "content": "Subagent task"}),
+            _cc_event("assistant", uuid="sa1", session_id=session_id, slug=agent_id,
+                      is_sidechain=True,
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [
+                                   {"type": "tool_use", "id": "tu1",
+                                    "name": "Read", "input": {"path": "a.py"}},
+                               ]}),
+            _cc_event("user", uuid="su2", session_id=session_id, slug=agent_id,
+                      user_type="internal", is_sidechain=True,
+                      message={"role": "user", "content": [
+                          {"type": "tool_result", "tool_use_id": "tu1",
+                           "content": "file contents"}
+                      ]}),
+            _cc_event("assistant", uuid="sa2", session_id=session_id, slug=agent_id,
+                      is_sidechain=True,
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [{"type": "text", "text": "Done with subagent work"}]}),
+        ]
+        f = subdir / f"{agent_id}.jsonl"
+        _write_jsonl(f, events)
+        return f
+
+    def test_single_file_imports_subagents(self, tmp_path):
+        """Importing a single parent file also imports its subagents."""
+        d = tmp_path / "sessions"
+        d.mkdir()
+        parent_file = self._make_parent_session(d)
+        self._make_subagent(d, "compact")
+
+        convs = claude_code_full_import(str(parent_file))
+        assert len(convs) == 2
+        # Parent first, child second
+        assert convs[0].id == "sess-parent"
+        assert convs[0].parent_conversation_id is None
+        assert convs[1].id == "sess-parent:compact"
+        assert convs[1].parent_conversation_id == "sess-parent"
+
+    def test_subagent_id_is_deterministic(self, tmp_path):
+        """Subagent ID is {sessionId}:{agentId}."""
+        d = tmp_path / "sessions"
+        d.mkdir()
+        self._make_parent_session(d)
+        self._make_subagent(d, "my_agent")
+
+        convs = claude_code_full_import(str(d / "sess-parent.jsonl"))
+        child = [c for c in convs if c.parent_conversation_id][0]
+        assert child.id == "sess-parent:my_agent"
+
+    def test_subagent_metadata(self, tmp_path):
+        """Subagent gets agent_id in metadata."""
+        d = tmp_path / "sessions"
+        d.mkdir()
+        self._make_parent_session(d)
+        self._make_subagent(d, "prompt_suggestion")
+
+        convs = claude_code_full_import(str(d / "sess-parent.jsonl"))
+        child = [c for c in convs if c.parent_conversation_id][0]
+        assert child.metadata["agent_id"] == "prompt_suggestion"
+
+    def test_subagent_tags(self, tmp_path):
+        """Subagents get appropriate tags based on agent type."""
+        d = tmp_path / "sessions"
+        d.mkdir()
+        self._make_parent_session(d)
+        self._make_subagent(d, "compact")
+        self._make_subagent(d, "prompt_suggestion")
+        self._make_subagent(d, "custom_agent")
+
+        convs = claude_code_full_import(str(d / "sess-parent.jsonl"))
+        children = {c.metadata.get("agent_id"): c for c in convs if c.parent_conversation_id}
+
+        # compact agent gets compact tag
+        assert "claude-code-agent" in children["compact"].tags
+        assert "claude-code-compact" in children["compact"].tags
+
+        # prompt_suggestion agent gets prompt tag
+        assert "claude-code-agent" in children["prompt_suggestion"].tags
+        assert "claude-code-prompt-suggestion" in children["prompt_suggestion"].tags
+
+        # custom agent only gets base agent tag
+        assert "claude-code-agent" in children["custom_agent"].tags
+        assert "claude-code-compact" not in children["custom_agent"].tags
+
+    def test_subagent_sidechain_records_imported(self, tmp_path):
+        """Subagent's isSidechain=true records ARE imported (not skipped)."""
+        d = tmp_path / "sessions"
+        d.mkdir()
+        self._make_parent_session(d)
+        self._make_subagent(d, "compact")
+
+        convs = claude_code_full_import(str(d / "sess-parent.jsonl"))
+        child = [c for c in convs if c.parent_conversation_id][0]
+        # The subagent has 4 records (user, assistant+tool_use, user+tool_result, assistant)
+        assert child.message_count == 4
+
+    def test_directory_import_includes_subagents(self, tmp_path):
+        """Directory import returns parents before children."""
+        d = tmp_path / "sessions"
+        d.mkdir()
+        self._make_parent_session(d, "sess-a", "session-a")
+        self._make_subagent(d, "compact", "sess-a")
+
+        # Second session without subagents
+        sub = d / "sub"
+        sub.mkdir()
+        self._make_parent_session(sub, "sess-b", "session-b")
+
+        convs = claude_code_full_import(str(d))
+        ids = [c.id for c in convs]
+        # Both parents present, plus one child
+        assert "sess-a" in ids
+        assert "sess-a:compact" in ids
+        assert "sess-b" in ids
+        # Parent appears before its child
+        assert ids.index("sess-a") < ids.index("sess-a:compact")
+
+    def test_no_subagent_dir_is_fine(self, tmp_path):
+        """Session without subagents/ directory works normally."""
+        d = tmp_path / "sessions"
+        d.mkdir()
+        self._make_parent_session(d)
+
+        convs = claude_code_full_import(str(d / "sess-parent.jsonl"))
+        assert len(convs) == 1
+        assert convs[0].id == "sess-parent"
+
+    def test_empty_subagent_file_skipped(self, tmp_path):
+        """Subagent JSONL with no importable messages is skipped."""
+        d = tmp_path / "sessions"
+        d.mkdir()
+        self._make_parent_session(d)
+        subdir = d / "sess-parent" / "subagents"
+        subdir.mkdir(parents=True)
+        # Empty subagent (only progress events, all sidechain)
+        events = [
+            _cc_event("progress", uuid="p1", is_sidechain=True,
+                      data={"type": "hook_progress"}),
+        ]
+        _write_jsonl(subdir / "empty_agent.jsonl", events)
+
+        convs = claude_code_full_import(str(d / "sess-parent.jsonl"))
+        assert len(convs) == 1  # Only parent
+
+    def test_conversation_only_skips_subagents(self, tmp_path):
+        """The conversation_only importer still skips subagent directories."""
+        d = tmp_path / "sessions"
+        d.mkdir()
+        # Parent
+        events = [
+            _cc_event("user", uuid="u1", session_id="sess-a", slug="session-a",
+                      message={"role": "user", "content": "Hello"}),
+            _cc_event("assistant", uuid="a1", session_id="sess-a", slug="session-a",
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [{"type": "text", "text": "Hi!"}]}),
+        ]
+        _write_jsonl(d / "sess-a.jsonl", events)
+        # Subagent
+        subdir = d / "subagents"
+        subdir.mkdir()
+        sub_events = [
+            _cc_event("user", uuid="su1", session_id="sess-a", slug="compact",
+                      is_sidechain=True,
+                      message={"role": "user", "content": "Agent work"}),
+            _cc_event("assistant", uuid="sa1", session_id="sess-a", slug="compact",
+                      is_sidechain=True,
+                      message={"role": "assistant", "model": "claude-opus-4-6",
+                               "content": [{"type": "text", "text": "Done"}]}),
+        ]
+        _write_jsonl(subdir / "compact.jsonl", sub_events)
+
+        convs = claude_code_import(str(d))
+        assert len(convs) == 1
+        assert convs[0].id == "sess-a"

@@ -148,6 +148,381 @@ class TestCLIImportProvenance:
         db.close()
 
 
+class TestCLIImportRecursive:
+    """Tests for memex import --recursive directory import."""
+
+    def _make_openai_file(self, path, conv_id="c1", title="Test"):
+        """Write a minimal OpenAI export JSON file."""
+        path.write_text(json.dumps([{
+            "id": conv_id, "title": title,
+            "create_time": 1700000000, "update_time": 1700000001,
+            "mapping": {
+                "m1": {
+                    "id": "m1", "parent": None, "children": [],
+                    "message": {
+                        "id": "m1", "author": {"role": "user"},
+                        "content": {"parts": ["hello"]},
+                        "create_time": 1700000000,
+                    },
+                },
+            },
+        }]))
+
+    def _make_claude_code_file(self, path, session_id="sess-1"):
+        """Write a minimal Claude Code JSONL file."""
+        events = [
+            {
+                "type": "user", "uuid": "u1", "parentUuid": None,
+                "sessionId": session_id, "slug": "test-session",
+                "timestamp": "2026-02-18T10:00:00Z",
+                "userType": "external", "isSidechain": False,
+                "message": {"role": "user", "content": "hello"},
+            },
+            {
+                "type": "assistant", "uuid": "a1", "parentUuid": "u1",
+                "sessionId": session_id, "slug": "test-session",
+                "timestamp": "2026-02-18T10:00:01Z",
+                "userType": "external", "isSidechain": False,
+                "message": {"role": "assistant", "model": "claude-opus-4-6",
+                            "content": [{"type": "text", "text": "hi"}]},
+            },
+        ]
+        path.write_text("\n".join(json.dumps(e) for e in events))
+
+    def test_recursive_single_file(self, tmp_path):
+        """Directory with one importable file imports successfully via recursive walk."""
+        db_dir = tmp_path / "db"
+        src_dir = tmp_path / "sources"
+        src_dir.mkdir()
+        # Use a named file (not conversations.json) so OpenAI dir detection doesn't claim it
+        self._make_openai_file(src_dir / "export.json")
+
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "import", str(src_dir),
+             "--recursive", "--db", str(db_dir)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "1 conversation(s) from 1 file(s)" in result.stdout
+
+    def test_recursive_mixed_files(self, tmp_path):
+        """Directory with importable and non-importable files imports only matching."""
+        db_dir = tmp_path / "db"
+        src_dir = tmp_path / "sources"
+        src_dir.mkdir()
+        # Use a named file (not conversations.json) so OpenAI dir detection doesn't claim it
+        self._make_openai_file(src_dir / "export.json", conv_id="c1")
+        (src_dir / "README.md").write_text("# Not importable")
+        (src_dir / "config.yaml").write_text("key: value")
+
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "import", str(src_dir),
+             "--recursive", "--db", str(db_dir)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "1 conversation(s) from 1 file(s)" in result.stdout
+        assert "2 skipped" in result.stdout
+
+    def test_recursive_required_for_unrecognized_directory(self, tmp_path):
+        """Passing an unrecognized directory without --recursive errors."""
+        src_dir = tmp_path / "sources"
+        src_dir.mkdir()
+        # Files that no importer claims as a directory structure
+        (src_dir / "random.txt").write_text("hello")
+
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "import", str(src_dir),
+             "--db", str(tmp_path / "db")],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 1
+        assert "is a directory" in result.stderr
+        assert "--recursive" in result.stderr
+
+    def test_recursive_nested_subdirectories(self, tmp_path):
+        """Files in nested subdirectories are all found."""
+        db_dir = tmp_path / "db"
+        src_dir = tmp_path / "sources"
+        sub1 = src_dir / "project-a"
+        sub2 = src_dir / "project-b" / "deep"
+        sub1.mkdir(parents=True)
+        sub2.mkdir(parents=True)
+        self._make_openai_file(sub1 / "conv1.json", conv_id="c1")
+        self._make_openai_file(sub2 / "conv2.json", conv_id="c2")
+        # Non-importable at root level
+        (src_dir / "notes.txt").write_text("just notes")
+
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "import", str(src_dir),
+             "--recursive", "--db", str(db_dir)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "2 conversation(s) from 2 file(s)" in result.stdout
+        assert "1 skipped" in result.stdout
+
+        # Verify both conversations are in the database
+        from memex.db import Database
+        with Database(str(db_dir), readonly=True) as db:
+            c1 = db.load_conversation("c1")
+            c2 = db.load_conversation("c2")
+            assert c1 is not None
+            assert c2 is not None
+
+    def test_recursive_with_format_flag(self, tmp_path):
+        """--format works with --recursive to force a specific importer."""
+        db_dir = tmp_path / "db"
+        src_dir = tmp_path / "sources"
+        src_dir.mkdir()
+        # Write OpenAI data with a non-standard extension
+        self._make_openai_file(src_dir / "data.txt", conv_id="forced")
+
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "import", str(src_dir),
+             "--recursive", "--format", "openai", "--db", str(db_dir)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "1 conversation(s) from 1 file(s)" in result.stdout
+
+
+class TestCLIImportDirectory:
+    """Tests for directory import without --recursive (importer claims directory)."""
+
+    def test_openai_directory_import(self, tmp_path):
+        """OpenAI export directory with conversations.json imports without --recursive."""
+        db_dir = tmp_path / "db"
+        src_dir = tmp_path / "openai_export"
+        src_dir.mkdir()
+        (src_dir / "conversations.json").write_text(json.dumps([{
+            "id": "c1", "title": "OpenAI Chat",
+            "create_time": 1700000000, "update_time": 1700000001,
+            "mapping": {
+                "m1": {
+                    "id": "m1", "parent": None, "children": [],
+                    "message": {
+                        "id": "m1", "author": {"role": "user"},
+                        "content": {"parts": ["hello"]},
+                        "create_time": 1700000000,
+                    },
+                },
+            },
+        }]))
+
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "import", str(src_dir),
+             "--db", str(db_dir)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "Imported 1 conversation(s)" in result.stdout
+
+    def test_claude_code_directory_import(self, tmp_path):
+        """Claude Code project directory imports without --recursive."""
+        db_dir = tmp_path / "db"
+        src_dir = tmp_path / "claude_sessions"
+        src_dir.mkdir()
+        events = [
+            {
+                "type": "user", "uuid": "u1", "parentUuid": None,
+                "sessionId": "sess-dir", "slug": "dir-test",
+                "timestamp": "2026-02-18T10:00:00Z",
+                "userType": "external", "isSidechain": False,
+                "message": {"role": "user", "content": "hello from dir"},
+            },
+            {
+                "type": "assistant", "uuid": "a1", "parentUuid": "u1",
+                "sessionId": "sess-dir", "slug": "dir-test",
+                "timestamp": "2026-02-18T10:00:01Z",
+                "userType": "external", "isSidechain": False,
+                "message": {"role": "assistant", "model": "claude-opus-4-6",
+                            "content": [{"type": "text", "text": "hi"}]},
+            },
+        ]
+        (src_dir / "session.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in events)
+        )
+
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "import", str(src_dir),
+             "--db", str(db_dir)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "Imported 1 conversation(s)" in result.stdout
+
+
+class TestCLIImportSkipUnchanged:
+    """Tests for skip-if-unchanged optimization and --force flag."""
+
+    def _make_openai_file(self, path, conv_id="c1", title="Test",
+                          update_time=1700000001):
+        """Write a minimal OpenAI export JSON file."""
+        path.write_text(json.dumps([{
+            "id": conv_id, "title": title,
+            "create_time": 1700000000, "update_time": update_time,
+            "mapping": {
+                "m1": {
+                    "id": "m1", "parent": None, "children": [],
+                    "message": {
+                        "id": "m1", "author": {"role": "user"},
+                        "content": {"parts": ["hello"]},
+                        "create_time": 1700000000,
+                    },
+                },
+            },
+        }]))
+
+    def test_reimport_unchanged_skips(self, tmp_path):
+        """Re-importing identical data reports conversations as unchanged."""
+        db_dir = tmp_path / "db"
+        export_file = tmp_path / "export.json"
+        self._make_openai_file(export_file)
+
+        # First import
+        subprocess.run(
+            [sys.executable, "-m", "memex", "import", str(export_file),
+             "--db", str(db_dir)],
+            capture_output=True, text=True, check=True,
+        )
+        # Second import — should skip
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "import", str(export_file),
+             "--db", str(db_dir)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "Imported 0 conversation(s)" in result.stdout
+        assert "1 unchanged" in result.stdout
+
+    def test_force_reimports_unchanged(self, tmp_path):
+        """--force re-imports even if unchanged."""
+        db_dir = tmp_path / "db"
+        export_file = tmp_path / "export.json"
+        self._make_openai_file(export_file)
+
+        # First import
+        subprocess.run(
+            [sys.executable, "-m", "memex", "import", str(export_file),
+             "--db", str(db_dir)],
+            capture_output=True, text=True, check=True,
+        )
+        # Second import with --force
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "import", str(export_file),
+             "--force", "--db", str(db_dir)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "Imported 1 conversation(s)" in result.stdout
+        # With --force, no "N unchanged" count should appear
+        assert " unchanged)" not in result.stdout
+
+    def test_modified_conversation_reimported(self, tmp_path):
+        """Conversation with changed update_time gets re-imported."""
+        db_dir = tmp_path / "db"
+        export_file = tmp_path / "export.json"
+
+        # First import
+        self._make_openai_file(export_file, update_time=1700000001)
+        subprocess.run(
+            [sys.executable, "-m", "memex", "import", str(export_file),
+             "--db", str(db_dir)],
+            capture_output=True, text=True, check=True,
+        )
+        # Update the file with a new update_time
+        self._make_openai_file(export_file, update_time=1700099999)
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "import", str(export_file),
+             "--db", str(db_dir)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "Imported 1 conversation(s)" in result.stdout
+        assert " unchanged)" not in result.stdout
+
+    def test_recursive_with_unchanged(self, tmp_path):
+        """Recursive import shows unchanged count in summary."""
+        db_dir = tmp_path / "db"
+        src_dir = tmp_path / "sources"
+        src_dir.mkdir()
+        self._make_openai_file(src_dir / "conv1.json", conv_id="c1")
+        self._make_openai_file(src_dir / "conv2.json", conv_id="c2")
+
+        # First import
+        subprocess.run(
+            [sys.executable, "-m", "memex", "import", str(src_dir),
+             "--recursive", "--db", str(db_dir)],
+            capture_output=True, text=True, check=True,
+        )
+        # Re-import — both should be unchanged
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "import", str(src_dir),
+             "--recursive", "--db", str(db_dir)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "Imported 0 conversation(s)" in result.stdout
+        assert "2 unchanged" in result.stdout
+
+
+class TestCLIImportSkipUnchangedUnit:
+    """Unit tests for Database.conversation_unchanged()."""
+
+    def test_conversation_unchanged_true(self, tmp_db_path):
+        from memex.db import Database
+        from memex.models import Conversation
+        from datetime import datetime
+
+        with Database(tmp_db_path) as db:
+            conv = Conversation(
+                id="c1", title="Test",
+                created_at=datetime(2023, 1, 1),
+                updated_at=datetime(2023, 1, 2),
+                message_count=5,
+            )
+            db.save_conversation(conv)
+            assert db.conversation_unchanged("c1", datetime(2023, 1, 2), 5) is True
+
+    def test_conversation_unchanged_false_different_time(self, tmp_db_path):
+        from memex.db import Database
+        from memex.models import Conversation
+        from datetime import datetime
+
+        with Database(tmp_db_path) as db:
+            conv = Conversation(
+                id="c1", title="Test",
+                created_at=datetime(2023, 1, 1),
+                updated_at=datetime(2023, 1, 2),
+                message_count=5,
+            )
+            db.save_conversation(conv)
+            assert db.conversation_unchanged("c1", datetime(2023, 6, 1), 5) is False
+
+    def test_conversation_unchanged_false_different_count(self, tmp_db_path):
+        from memex.db import Database
+        from memex.models import Conversation
+        from datetime import datetime
+
+        with Database(tmp_db_path) as db:
+            conv = Conversation(
+                id="c1", title="Test",
+                created_at=datetime(2023, 1, 1),
+                updated_at=datetime(2023, 1, 2),
+                message_count=5,
+            )
+            db.save_conversation(conv)
+            assert db.conversation_unchanged("c1", datetime(2023, 1, 2), 10) is False
+
+    def test_conversation_unchanged_nonexistent(self, tmp_db_path):
+        from memex.db import Database
+        from datetime import datetime
+
+        with Database(tmp_db_path) as db:
+            assert db.conversation_unchanged("nope", datetime(2023, 1, 1), 0) is False
+
+
 class TestCLIExport:
     def test_export_markdown(self, tmp_path):
         # First import, then export
@@ -217,6 +592,144 @@ class TestCLIExport:
         assert data[0]["id"] == "c1"
 
 
+class TestCLIExportArkiv:
+    """Tests for the arkiv exporter (JSONL + README.md + schema.yaml)."""
+
+    def _import_conversation(self, tmp_path, *, conv_id="c1", title="My Chat",
+                              source="chatgpt", model="gpt-4", text="hello world"):
+        """Import a single conversation and return db_dir."""
+        db_dir = tmp_path / "db"
+        export_file = tmp_path / "export.json"
+        export_file.write_text(json.dumps([{
+            "id": conv_id, "title": title,
+            "create_time": 1700000000, "update_time": 1700000001,
+            "mapping": {
+                "m1": {
+                    "id": "m1", "parent": None, "children": ["m2"],
+                    "message": {
+                        "id": "m1", "author": {"role": "user"},
+                        "content": {"parts": [text]},
+                        "create_time": 1700000000,
+                    },
+                },
+                "m2": {
+                    "id": "m2", "parent": "m1", "children": [],
+                    "message": {
+                        "id": "m2", "author": {"role": "assistant"},
+                        "content": {"parts": ["hi there"]},
+                        "create_time": 1700000001,
+                        "metadata": {"model_slug": model},
+                    },
+                },
+            },
+        }]))
+        subprocess.run(
+            [sys.executable, "-m", "memex", "import", str(export_file), "--db", str(db_dir)],
+            capture_output=True, text=True, check=True,
+        )
+        return db_dir
+
+    def test_export_creates_directory_with_files(self, tmp_path):
+        db_dir = self._import_conversation(tmp_path)
+        out_dir = tmp_path / "arkiv_out"
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "export", str(out_dir),
+             "--format", "arkiv", "--db", str(db_dir)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "Exported 1 conversation" in result.stdout
+        assert (out_dir / "conversations.jsonl").exists()
+        assert (out_dir / "README.md").exists()
+        assert (out_dir / "schema.yaml").exists()
+
+    def test_jsonl_records_have_correct_fields(self, tmp_path):
+        db_dir = self._import_conversation(tmp_path)
+        out_dir = tmp_path / "arkiv_out"
+        subprocess.run(
+            [sys.executable, "-m", "memex", "export", str(out_dir),
+             "--format", "arkiv", "--db", str(db_dir)],
+            capture_output=True, text=True, check=True,
+        )
+        records = []
+        with open(out_dir / "conversations.jsonl") as f:
+            for line in f:
+                records.append(json.loads(line))
+
+        assert len(records) == 2  # user + assistant messages
+
+        # Check first record (user message)
+        rec = records[0]
+        assert rec["mimetype"] == "text/plain"
+        assert rec["content"] == "hello world"
+        assert "timestamp" in rec
+        meta = rec["metadata"]
+        assert meta["conversation_id"] == "c1"
+        assert meta["conversation_title"] == "My Chat"
+        assert meta["role"] == "user"
+        assert meta["source"] == "openai"
+        assert meta["message_id"] == "m1"
+
+        # Check second record (assistant message)
+        rec2 = records[1]
+        assert rec2["content"] == "hi there"
+        assert rec2["metadata"]["role"] == "assistant"
+        assert rec2["metadata"]["model"] == "gpt-4"
+
+    def test_readme_has_yaml_frontmatter(self, tmp_path):
+        db_dir = self._import_conversation(tmp_path)
+        out_dir = tmp_path / "arkiv_out"
+        subprocess.run(
+            [sys.executable, "-m", "memex", "export", str(out_dir),
+             "--format", "arkiv", "--db", str(db_dir)],
+            capture_output=True, text=True, check=True,
+        )
+        content = (out_dir / "README.md").read_text()
+        assert content.startswith("---\n")
+        assert "name: memex conversations archive" in content
+        assert "1 conversations exported from memex" in content
+        assert "generator: memex" in content
+        assert "conversations.jsonl" in content
+
+    def test_schema_yaml_has_metadata_keys(self, tmp_path):
+        db_dir = self._import_conversation(tmp_path)
+        out_dir = tmp_path / "arkiv_out"
+        subprocess.run(
+            [sys.executable, "-m", "memex", "export", str(out_dir),
+             "--format", "arkiv", "--db", str(db_dir)],
+            capture_output=True, text=True, check=True,
+        )
+        content = (out_dir / "schema.yaml").read_text()
+        assert "conversations:" in content
+        assert "record_count: 2" in content
+        assert "metadata_keys:" in content
+        assert "role:" in content
+        assert "type: string" in content
+        assert "values:" in content
+
+    def test_empty_export_produces_valid_output(self, tmp_path):
+        """Exporting with no conversations should still produce valid files."""
+        db_dir = tmp_path / "db"
+        # Create an empty database by importing nothing — just init via export
+        os.makedirs(db_dir, exist_ok=True)
+        # Initialize DB with an import that we'll ignore — use direct DB
+        from memex.db import Database
+        with Database(str(db_dir)) as db:
+            pass  # just creates schema
+
+        out_dir = tmp_path / "arkiv_out"
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "export", str(out_dir),
+             "--format", "arkiv", "--db", str(db_dir)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert (out_dir / "conversations.jsonl").exists()
+        # JSONL should be empty
+        content = (out_dir / "conversations.jsonl").read_text()
+        assert content == ""
+
+
 class TestCLIShow:
     def _import_one(self, tmp_path):
         """Helper: import one conversation, return db_dir."""
@@ -280,6 +793,80 @@ class TestCLIShow:
         )
         assert result.returncode == 1
         assert "not found" in result.stderr
+
+
+class TestCLIShowSearch:
+    """Tests for memex show --search and empty-state messaging."""
+
+    def _import_one(self, tmp_path):
+        """Helper: import one conversation with searchable content, return db_dir."""
+        db_dir = tmp_path / "db"
+        export_file = tmp_path / "export.json"
+        export_file.write_text(json.dumps([{
+            "id": "c1", "title": "Quantum Computing Chat",
+            "create_time": 1700000000, "update_time": 1700000001,
+            "mapping": {
+                "m1": {
+                    "id": "m1", "parent": None, "children": [],
+                    "message": {
+                        "id": "m1", "author": {"role": "user"},
+                        "content": {"parts": ["Tell me about quantum entanglement"]},
+                        "create_time": 1700000000,
+                    },
+                },
+            },
+        }]))
+        subprocess.run(
+            [sys.executable, "-m", "memex", "import", str(export_file), "--db", str(db_dir)],
+            capture_output=True, text=True,
+        )
+        return db_dir
+
+    def test_empty_db_message(self, tmp_path):
+        """Empty database shows 'No conversations found.' message."""
+        db_dir = tmp_path / "empty_db"
+        # Create an empty database first (show requires an existing DB)
+        from memex.db import Database
+        with Database(str(db_dir)) as _db:
+            pass
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "show", "--db", str(db_dir)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "No conversations found." in result.stdout
+
+    def test_search_with_match(self, tmp_path):
+        """--search with matching term shows the conversation."""
+        db_dir = self._import_one(tmp_path)
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "show", "--search", "quantum", "--db", str(db_dir)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "c1" in result.stdout
+        assert "Quantum Computing Chat" in result.stdout
+
+    def test_search_no_match(self, tmp_path):
+        """--search with no matching term shows appropriate message."""
+        db_dir = self._import_one(tmp_path)
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "show", "--search", "xyznonexistent", "--db", str(db_dir)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "No conversations matching 'xyznonexistent'." in result.stdout
+
+    def test_search_ignored_when_id_given(self, tmp_path):
+        """--search is ignored when a conversation ID is provided."""
+        db_dir = self._import_one(tmp_path)
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "show", "c1", "--search", "quantum", "--db", str(db_dir)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        # Shows the specific conversation, not a search listing
+        assert "# Quantum Computing Chat" in result.stdout
 
 
 class TestCLIImportAssets:
@@ -500,13 +1087,121 @@ class TestDiscoverFormats:
         plugin.write_text(
             '"""Custom test importer."""\n'
             'def detect(f): return False\n'
-            'def import_file(f): return []\n'
+            'def import_path(f): return []\n'
         )
         builtin_dir = tmp_path / "empty_builtins"
         builtin_dir.mkdir()
-        formats = _discover_formats(builtin_dir, user_dir, ("detect", "import_file"))
+        formats = _discover_formats(builtin_dir, user_dir, ("detect", "import_path"))
         assert "custom" in formats
         assert "Custom test importer." in formats["custom"]["description"]
+
+
+class TestCLIMissingDb:
+    """Test that mistyped --db paths produce clear errors, not silent no-ops."""
+
+    def test_show_missing_db_errors(self, tmp_path):
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "show",
+             "--db", str(tmp_path / "nonexistent")],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 1
+        assert "database not found" in result.stderr.lower()
+
+    def test_export_missing_db_errors(self, tmp_path):
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "export", str(tmp_path / "out.md"),
+             "--format", "markdown", "--db", str(tmp_path / "nonexistent")],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 1
+        assert "database not found" in result.stderr.lower()
+
+    def test_run_missing_db_errors(self, tmp_path):
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "run", "enrich_trivial",
+             "--db", str(tmp_path / "nonexistent")],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 1
+        assert "database not found" in result.stderr.lower()
+
+
+class TestCLIDb:
+    """Tests for 'memex db' stats command."""
+
+    def _import_conversation(self, tmp_path):
+        """Import a single conversation and return db_dir."""
+        db_dir = tmp_path / "db"
+        export_file = tmp_path / "export.json"
+        export_file.write_text(json.dumps([{
+            "id": "c1", "title": "Stats Test",
+            "create_time": 1700000000, "update_time": 1700000001,
+            "mapping": {
+                "m1": {
+                    "id": "m1", "parent": None, "children": ["m2"],
+                    "message": {
+                        "id": "m1", "author": {"role": "user"},
+                        "content": {"parts": ["hello world"]},
+                        "create_time": 1700000000,
+                    },
+                },
+                "m2": {
+                    "id": "m2", "parent": "m1", "children": [],
+                    "message": {
+                        "id": "m2", "author": {"role": "assistant"},
+                        "content": {"parts": ["hi there"]},
+                        "create_time": 1700000001,
+                    },
+                },
+            },
+        }]))
+        subprocess.run(
+            [sys.executable, "-m", "memex", "import", str(export_file), "--db", str(db_dir)],
+            capture_output=True, text=True, check=True,
+        )
+        return db_dir
+
+    def test_db_shows_stats(self, tmp_path):
+        db_dir = self._import_conversation(tmp_path)
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "db", "--db", str(db_dir)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "Conversations:" in result.stdout
+        assert "Messages:" in result.stdout
+        assert "1" in result.stdout  # 1 conversation
+        assert "2" in result.stdout  # 2 messages
+
+    def test_db_shows_path_and_size(self, tmp_path):
+        db_dir = self._import_conversation(tmp_path)
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "db", "--db", str(db_dir)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "conversations.db" in result.stdout
+        # Size should show a unit (B, KB, MB, GB)
+        assert any(unit in result.stdout for unit in ("KB", "MB", "GB", " B"))
+
+    def test_db_shows_source(self, tmp_path):
+        db_dir = self._import_conversation(tmp_path)
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "db", "--db", str(db_dir)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert "openai" in result.stdout  # the importer sets source=openai
+
+    def test_db_missing_shows_error(self, tmp_path):
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "db",
+             "--db", str(tmp_path / "nonexistent")],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 1
+        assert "database not found" in result.stderr.lower()
 
 
 class TestCLIHelp:

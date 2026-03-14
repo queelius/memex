@@ -108,7 +108,7 @@ class TestRoundtrip:
 class TestImportExportRoundtrip:
     def test_openai_import_then_json_export(self, tmp_path):
         """Import an OpenAI file, save to DB, export as JSON, verify data."""
-        from memex.importers.openai import import_file
+        from memex.importers.openai import import_path as import_file
         from memex.exporters.json_export import export as json_export
 
         # Create fake OpenAI export
@@ -238,7 +238,7 @@ class TestClaudeCodeImportRoundtrip:
 
     def test_import_search_verify(self, tmp_path):
         import json as _json
-        from memex.importers.claude_code import import_file
+        from memex.importers.claude_code import import_path as import_file
 
         # Build a minimal Claude Code JSONL
         events = [
@@ -433,5 +433,209 @@ class TestEnrichmentWorkflow:
         # 4. Verify statistics
         stats = db.get_statistics()
         assert stats["provenance_tracked"] == 1
+
+        db.close()
+
+
+class TestParentConversation:
+    """parent_conversation_id: persistence, FK behavior, and migration."""
+
+    def test_save_and_load_parent_id(self, tmp_db_path):
+        """parent_conversation_id saves and loads correctly."""
+        db = Database(tmp_db_path)
+        now = datetime(2024, 6, 1)
+
+        # Parent conversation
+        parent = Conversation(
+            id="parent-1", created_at=now, updated_at=now,
+            title="Parent Session", source="claude_code",
+        )
+        parent.add_message(Message(id="m1", role="user", content=[text_block("hi")]))
+        db.save_conversation(parent)
+
+        # Child conversation with parent link
+        child = Conversation(
+            id="child-1", created_at=now, updated_at=now,
+            title="Child Agent", source="claude_code",
+            parent_conversation_id="parent-1",
+        )
+        child.add_message(Message(id="m1", role="user", content=[text_block("agent work")]))
+        db.save_conversation(child)
+
+        # Load and verify
+        loaded = db.load_conversation("child-1")
+        assert loaded.parent_conversation_id == "parent-1"
+
+        # Parent has no parent
+        loaded_parent = db.load_conversation("parent-1")
+        assert loaded_parent.parent_conversation_id is None
+
+        db.close()
+
+    def test_on_delete_set_null(self, tmp_db_path):
+        """Deleting parent sets child's parent_conversation_id to NULL."""
+        db = Database(tmp_db_path)
+        now = datetime(2024, 6, 1)
+
+        parent = Conversation(
+            id="parent-del", created_at=now, updated_at=now,
+            title="Parent", source="test",
+        )
+        parent.add_message(Message(id="m1", role="user", content=[text_block("hi")]))
+        db.save_conversation(parent)
+
+        child = Conversation(
+            id="child-del", created_at=now, updated_at=now,
+            title="Child", source="test",
+            parent_conversation_id="parent-del",
+        )
+        child.add_message(Message(id="m1", role="user", content=[text_block("work")]))
+        db.save_conversation(child)
+
+        # Delete parent
+        db.delete_conversation("parent-del")
+
+        # Child survives, parent_conversation_id becomes NULL
+        loaded = db.load_conversation("child-del")
+        assert loaded is not None
+        assert loaded.parent_conversation_id is None
+
+        db.close()
+
+    def test_parent_in_conv_metadata(self, tmp_db_path):
+        """parent_conversation_id appears in MCP _conv_metadata."""
+        from memex.mcp import _conv_metadata
+        db = Database(tmp_db_path)
+        now = datetime(2024, 6, 1)
+
+        parent = Conversation(
+            id="p1", created_at=now, updated_at=now,
+            title="Parent", source="test",
+        )
+        parent.add_message(Message(id="m1", role="user", content=[text_block("hi")]))
+        db.save_conversation(parent)
+
+        child = Conversation(
+            id="c1", created_at=now, updated_at=now,
+            title="Child", source="test",
+            parent_conversation_id="p1",
+        )
+        child.add_message(Message(id="m1", role="user", content=[text_block("work")]))
+        db.save_conversation(child)
+
+        loaded = db.load_conversation("c1")
+        meta = _conv_metadata(loaded, db)
+        assert meta["parent_conversation_id"] == "p1"
+
+        loaded_parent = db.load_conversation("p1")
+        meta_parent = _conv_metadata(loaded_parent, db)
+        assert meta_parent["parent_conversation_id"] is None
+
+        db.close()
+
+    def test_query_children_via_sql(self, tmp_db_path):
+        """Can query child conversations via SQL."""
+        db = Database(tmp_db_path)
+        now = datetime(2024, 6, 1)
+
+        parent = Conversation(
+            id="qp1", created_at=now, updated_at=now,
+            title="Parent", source="test",
+        )
+        parent.add_message(Message(id="m1", role="user", content=[text_block("hi")]))
+        db.save_conversation(parent)
+
+        for i in range(3):
+            child = Conversation(
+                id=f"qc{i}", created_at=now, updated_at=now,
+                title=f"Child {i}", source="test",
+                parent_conversation_id="qp1",
+            )
+            child.add_message(Message(id="m1", role="user", content=[text_block("work")]))
+            db.save_conversation(child)
+
+        rows = db.execute_sql(
+            "SELECT id FROM conversations WHERE parent_conversation_id=? ORDER BY id",
+            ("qp1",),
+        )
+        assert len(rows) == 3
+        assert [r["id"] for r in rows] == ["qc0", "qc1", "qc2"]
+
+        db.close()
+
+    def test_migration_v2_to_v3(self, tmp_path):
+        """Migration from v2 to v3 adds column and index."""
+        import sqlite3
+        db_dir = tmp_path / "migrate"
+        db_dir.mkdir()
+        db_path = str(db_dir / "conversations.db")
+
+        # Create a v2 database manually
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys=ON")
+        # Minimal v2 schema (no parent_conversation_id)
+        conn.executescript("""
+            CREATE TABLE conversations (
+                id TEXT PRIMARY KEY, title TEXT, source TEXT, model TEXT, summary TEXT,
+                message_count INTEGER NOT NULL DEFAULT 0,
+                created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL,
+                starred_at DATETIME, pinned_at DATETIME, archived_at DATETIME,
+                sensitive BOOLEAN NOT NULL DEFAULT 0,
+                metadata JSON NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE messages (
+                conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                id TEXT NOT NULL, role TEXT NOT NULL, parent_id TEXT, model TEXT,
+                created_at DATETIME, sensitive BOOLEAN NOT NULL DEFAULT 0,
+                content JSON NOT NULL, metadata JSON NOT NULL DEFAULT '{}',
+                PRIMARY KEY (conversation_id, id)
+            );
+            CREATE TABLE tags (
+                conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                tag TEXT NOT NULL, PRIMARY KEY (conversation_id, tag)
+            );
+            CREATE VIRTUAL TABLE messages_fts USING fts5(
+                conversation_id UNINDEXED, message_id UNINDEXED, text,
+                tokenize = 'porter unicode61'
+            );
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            CREATE TABLE enrichments (
+                conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                type TEXT NOT NULL, value TEXT NOT NULL, source TEXT NOT NULL,
+                confidence REAL, created_at DATETIME NOT NULL,
+                PRIMARY KEY (conversation_id, type, value)
+            );
+            CREATE TABLE provenance (
+                conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                source_type TEXT NOT NULL, source_file TEXT, source_id TEXT,
+                source_hash TEXT, imported_at DATETIME NOT NULL, importer_version TEXT,
+                PRIMARY KEY (conversation_id, source_type)
+            );
+        """)
+        conn.execute("INSERT INTO schema_version (version) VALUES (2)")
+        conn.execute(
+            "INSERT INTO conversations (id, title, created_at, updated_at) "
+            "VALUES ('test', 'Test', '2024-01-01', '2024-01-01')"
+        )
+        conn.commit()
+        conn.close()
+
+        # Open with Database — should auto-migrate to v3
+        db = Database(str(db_dir))
+        # Verify version is 3
+        row = db.execute_sql("SELECT version FROM schema_version")
+        assert row[0]["version"] == 3
+
+        # Verify column exists
+        conv = db.load_conversation("test")
+        assert conv is not None
+        assert conv.parent_conversation_id is None
+
+        # Verify index exists
+        indexes = db.execute_sql(
+            "SELECT name FROM sqlite_master WHERE type='index' "
+            "AND name='idx_conversations_parent'"
+        )
+        assert len(indexes) == 1
 
         db.close()

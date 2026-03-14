@@ -6,10 +6,9 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 
-# ── Data Structures ─────────────────────────────────────────────
+# -- Data Structures ---------------------------------------------------------
 
 
 @dataclass
@@ -30,7 +29,7 @@ class ScanResult:
     content: list[dict] = field(default_factory=list)
 
 
-# ── Detection Engine ────────────────────────────────────────────
+# -- Detection Engine --------------------------------------------------------
 
 
 def compile_matchers(words=None, patterns=None, pattern_file=None):
@@ -46,16 +45,13 @@ def compile_matchers(words=None, patterns=None, pattern_file=None):
             regex = re.compile(r"\b" + re.escape(word) + r"\b", re.IGNORECASE)
             matchers.append((regex, word))
 
-    if patterns:
-        for pattern in patterns:
-            regex = re.compile(pattern)
-            matchers.append((regex, pattern))
-
+    # Combine explicit patterns and pattern-file patterns
+    raw_patterns = list(patterns or [])
     if pattern_file:
-        file_patterns = load_pattern_file(pattern_file)
-        for pattern in file_patterns:
-            regex = re.compile(pattern)
-            matchers.append((regex, pattern))
+        raw_patterns.extend(load_pattern_file(pattern_file))
+
+    for pattern in raw_patterns:
+        matchers.append((re.compile(pattern), pattern))
 
     if not matchers:
         raise ValueError("No words, patterns, or pattern file provided.")
@@ -125,8 +121,8 @@ def check_match_mode(matches, mode, matchers):
     'all': every matcher produced at least one hit.
     """
     if mode == "any":
-        return len(matches) > 0
-    elif mode == "all":
+        return bool(matches)
+    if mode == "all":
         matched_terms = {m.term for m in matches}
         required_terms = {term for _, term in matchers}
         return required_terms.issubset(matched_terms)
@@ -148,18 +144,18 @@ def register_args(parser):
 
 def run(db, args, apply=False):
     """Scan and optionally redact content."""
-    # Parse word/pattern args
     words = [w.strip() for w in args.words.split(",")] if args.words else None
     patterns = [p.strip() for p in args.patterns.split(",")] if args.patterns else None
     matchers = compile_matchers(words=words, patterns=patterns,
                                 pattern_file=args.pattern_file)
 
     # Scan all messages
-    all_convs = _load_all_conversation_ids(db)
-    pending = []  # list of (ScanResult, action_level)
+    conv_rows = db.execute_sql("SELECT id FROM conversations")
+    pending = []  # list of ScanResults
     conv_hits = {}  # conversation_id -> list of ScanResults (for conversation-level)
 
-    for conv_id in all_convs:
+    for row in conv_rows:
+        conv_id = row["id"]
         messages = db.execute_sql(
             "SELECT id, content FROM messages WHERE conversation_id=? ORDER BY created_at",
             (conv_id,),
@@ -167,37 +163,34 @@ def run(db, args, apply=False):
         for msg_row in messages:
             content = json.loads(msg_row["content"]) if isinstance(msg_row["content"], str) else msg_row["content"]
             result = scan_message(content, matchers, conv_id, msg_row["id"])
-            if result.matches:
-                if args.level == "conversation":
-                    conv_hits.setdefault(conv_id, []).append(result)
-                else:
-                    if check_match_mode(result.matches, args.match_mode, matchers):
-                        pending.append(result)
+            if not result.matches:
+                continue
+            if args.level == "conversation":
+                conv_hits.setdefault(conv_id, []).append(result)
+            elif check_match_mode(result.matches, args.match_mode, matchers):
+                pending.append(result)
 
     # For conversation-level: check match mode across all messages in conv
     if args.level == "conversation":
         for conv_id, results in conv_hits.items():
             all_matches = [m for r in results for m in r.matches]
             if check_match_mode(all_matches, args.match_mode, matchers):
-                # Use first result as representative
-                combined = ScanResult(
+                pending.append(ScanResult(
                     conversation_id=conv_id,
                     message_id="(all)",
                     matches=all_matches,
                     content=[],
-                )
-                pending.append(combined)
+                ))
 
-    # Build stats
     stats = _compute_stats(pending, args.level)
 
     if not apply:
         _print_dry_run(pending, args.level, stats)
         return stats
 
-    # Apply mode
     if args.yes:
-        _apply_batch(db, pending, args.level)
+        for result in pending:
+            _apply_single(db, result, args.level)
     else:
         interactive_stats = interactive_review(pending, db, args.level)
         stats.update(interactive_stats)
@@ -205,14 +198,9 @@ def run(db, args, apply=False):
     return stats
 
 
-def _load_all_conversation_ids(db):
-    rows = db.execute_sql("SELECT id FROM conversations")
-    return [r["id"] for r in rows]
-
-
 def _compute_stats(pending, level):
-    stats = {"word_redactions": 0, "message_redactions": 0, "conversation_deletions": 0,
-             "total_matches": len(pending)}
+    stats = {"total_matches": len(pending), "word_redactions": 0,
+             "message_redactions": 0, "conversation_deletions": 0}
     if level == "word":
         stats["word_redactions"] = sum(len(r.matches) for r in pending)
     elif level == "message":
@@ -251,7 +239,7 @@ def _print_dry_run(pending, level, stats):
     print(f"\nRe-run with --apply to commit changes.")
 
 
-# ── Mutation Engine ─────────────────────────────────────────────
+# -- Mutation Engine ---------------------------------------------------------
 
 
 def redact_word_level(content, matches):
@@ -260,7 +248,7 @@ def redact_word_level(content, matches):
     Processes matches right-to-left within each block to preserve offsets.
     """
     result = copy.deepcopy(content)
-    # Group matches by block_index, sort by start descending
+    # Group matches by block_index
     by_block = {}
     for m in matches:
         by_block.setdefault(m.block_index, []).append(m)
@@ -272,9 +260,17 @@ def redact_word_level(content, matches):
         if block.get("type") != "text":
             continue
         text = block["text"]
-        # Sort right-to-left to preserve offsets
-        for m in sorted(block_matches, key=lambda x: x.start, reverse=True):
-            text = text[:m.start] + "[REDACTED]" + text[m.end:]
+        # Merge overlapping/identical spans before replacement
+        sorted_matches = sorted(block_matches, key=lambda x: (x.start, x.end))
+        merged_spans = []
+        for m in sorted_matches:
+            if merged_spans and m.start <= merged_spans[-1][1]:
+                merged_spans[-1] = (merged_spans[-1][0], max(merged_spans[-1][1], m.end))
+            else:
+                merged_spans.append((m.start, m.end))
+        # Replace right-to-left to preserve offsets
+        for start, end in reversed(merged_spans):
+            text = text[:start] + "[REDACTED]" + text[end:]
         block["text"] = text
 
     return result
@@ -285,34 +281,28 @@ def redact_message_level():
     return [{"type": "text", "text": "[REDACTED]"}]
 
 
-def _save_original(db, conv_id, msg_id, original_content):
-    """Save original content as enrichment before redacting."""
-    db.save_enrichment(
-        conv_id, "original_content", msg_id, "redact",
-    )
-
-
 def _apply_single(db, result, level):
     """Apply a single redaction action to the database."""
     if level == "word":
         new_content = redact_word_level(result.content, result.matches)
-        _save_original(db, result.conversation_id, result.message_id, result.content)
-        db.update_message_content(result.conversation_id, result.message_id, new_content)
+        db.save_enrichment(
+            result.conversation_id, "original_content",
+            json.dumps({"message_id": result.message_id, "content": result.content}),
+            "redact")
+        db.update_message_content(result.conversation_id, result.message_id,
+                                  new_content)
     elif level == "message":
-        _save_original(db, result.conversation_id, result.message_id, result.content)
+        db.save_enrichment(
+            result.conversation_id, "original_content",
+            json.dumps({"message_id": result.message_id, "content": result.content}),
+            "redact")
         db.update_message_content(result.conversation_id, result.message_id,
                                   redact_message_level())
     elif level == "conversation":
         db.delete_conversation(result.conversation_id)
 
 
-def _apply_batch(db, pending, level):
-    """Apply all pending redactions without prompting."""
-    for result in pending:
-        _apply_single(db, result, level)
-
-
-# ── Interactive Review ──────────────────────────────────────────
+# -- Interactive Review ------------------------------------------------------
 
 
 def interactive_review(pending, db, level, input_fn=None):
@@ -329,31 +319,41 @@ def interactive_review(pending, db, level, input_fn=None):
             stats["redacted"] += 1
             continue
 
-        # Display context
         conv_short = result.conversation_id[:12]
         if level == "word":
-            for m in result.matches:
-                if m.term in auto_terms:
-                    continue
+            approved_matches = [m for m in result.matches if m.term in auto_terms]
+            unapproved = [m for m in result.matches if m.term not in auto_terms]
+            reviewed_matches = list(approved_matches)
+            quit_requested = False
+            for m in unapproved:
                 text = result.content[m.block_index]["text"] if m.block_index < len(result.content) else ""
                 preview = text[max(0, m.start - 20):m.end + 20]
                 print(f"\n[{i+1}/{len(pending)}] conv {conv_short}... msg {result.message_id}:")
                 print(f"  ...{preview}...")
                 choice = input_fn("  [r]edact  [s]kip  [a]ll  [q]uit\n> ").strip().lower()
-                if choice == "r":
-                    _apply_single(db, result, level)
-                    stats["redacted"] += 1
-                    break
-                elif choice == "a":
+                if choice == "a":
                     auto_terms.add(m.term)
-                    _apply_single(db, result, level)
-                    stats["redacted"] += 1
-                    break
-                elif choice == "s":
-                    stats["skipped"] += 1
-                    break
+                    reviewed_matches.append(m)
+                elif choice == "r":
+                    reviewed_matches.append(m)
                 elif choice == "q":
-                    return stats
+                    quit_requested = True
+                    break
+                # "s" skips this term (don't add to reviewed_matches)
+            if quit_requested:
+                if reviewed_matches:
+                    partial = ScanResult(result.conversation_id, result.message_id,
+                                         reviewed_matches, result.content)
+                    _apply_single(db, partial, level)
+                    stats["redacted"] += 1
+                return stats
+            if reviewed_matches:
+                partial = ScanResult(result.conversation_id, result.message_id,
+                                     reviewed_matches, result.content)
+                _apply_single(db, partial, level)
+                stats["redacted"] += 1
+            else:
+                stats["skipped"] += 1
         else:
             terms = ", ".join(sorted({m.term for m in result.matches}))
             print(f"\n[{i+1}/{len(pending)}] conv {conv_short}... msg {result.message_id}:")

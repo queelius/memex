@@ -8,6 +8,18 @@ import sys
 from pathlib import Path
 
 
+def _open_db(args, readonly=True):
+    """Open a database, exiting with an error if not found."""
+    from memex.db import Database
+
+    db_path = os.path.expanduser(args.db)
+    try:
+        return Database(db_path, readonly=readonly)
+    except FileNotFoundError:
+        print(f"Error: database not found: {args.db}", file=sys.stderr)
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="memex", description="Personal conversation knowledge base"
@@ -18,10 +30,14 @@ def main():
     sub = parser.add_subparsers(dest="command")
 
     # import
-    imp = sub.add_parser("import", help="Import conversations from a file")
-    imp.add_argument("file", nargs="?", help="File to import")
+    imp = sub.add_parser("import", help="Import conversations from a file or directory")
+    imp.add_argument("file", nargs="?", help="File or directory to import")
     imp.add_argument("--format", help="Force importer format (use --list-formats to see available)")
     imp.add_argument("--list-formats", action="store_true", help="List available import formats")
+    imp.add_argument("--recursive", "-r", action="store_true",
+                     help="Recursively import all detected files from a directory")
+    imp.add_argument("--force", action="store_true",
+                     help="Re-import all conversations even if unchanged")
     imp.add_argument("--no-copy-assets", action="store_true",
                      help="Skip copying media assets into the database directory")
     imp.add_argument(
@@ -44,8 +60,17 @@ def main():
     # show
     show = sub.add_parser("show", help="Display a conversation")
     show.add_argument("id", nargs="?", help="Conversation ID (omit to list all)")
+    show.add_argument("--search", help="Search conversations by text (FTS)")
     show.add_argument("--raw", action="store_true", help="(deprecated, now always prints markdown)")
     show.add_argument(
+        "--db",
+        help="Database directory",
+        default=os.environ.get("MEMEX_DATABASE_PATH", "~/.memex/default"),
+    )
+
+    # db
+    db_p = sub.add_parser("db", help="Show database statistics")
+    db_p.add_argument(
         "--db",
         help="Database directory",
         default=os.environ.get("MEMEX_DATABASE_PATH", "~/.memex/default"),
@@ -73,6 +98,8 @@ def main():
         _cmd_show(args)
     elif args.command == "export":
         _cmd_export(args)
+    elif args.command == "db":
+        _cmd_db(args)
     elif args.command == "mcp":
         _cmd_mcp(args)
     elif args.command == "run":
@@ -96,6 +123,10 @@ def _list_formats(formats, label):
 
 
 def _cmd_import(args):
+    import logging
+    logging.basicConfig(
+        level=logging.INFO, format="%(message)s", stream=sys.stderr,
+    )
     if args.list_formats:
         _list_formats(_discover_importers(), "import")
         return
@@ -111,32 +142,119 @@ def _cmd_import(args):
         sys.exit(1)
 
     from memex.db import Database
+
+    db_path = os.path.expanduser(args.db)
+    file_path = Path(args.file).resolve()
+
+    if file_path.is_dir():
+        # Try importers directly on the directory first
+        convs = _auto_import(str(file_path), args.format, exit_on_fail=False)
+        if convs is not None:
+            # An importer claimed the directory
+            with Database(db_path) as db:
+                n_imp, n_unch = _save_convs(convs, file_path, args, db)
+                parts = [f"Imported {n_imp} conversation(s)"]
+                if n_unch:
+                    parts.append(f"({n_unch} unchanged)")
+                parts.append(f"into {db_path}")
+                print(" ".join(parts))
+        elif args.recursive:
+            # Fallback: walk directory, try each file
+            with Database(db_path) as db:
+                stats = {"imported": 0, "unchanged": 0, "files_imported": 0, "files_skipped": 0}
+                for child in sorted(file_path.rglob("*")):
+                    if not child.is_file():
+                        continue
+                    n_imp, n_unch = _import_one(child, args, db)
+                    if n_imp > 0 or n_unch > 0:
+                        stats["imported"] += n_imp
+                        stats["unchanged"] += n_unch
+                        stats["files_imported"] += 1
+                    else:
+                        stats["files_skipped"] += 1
+                parts = [f"Imported {stats['imported']} conversation(s) from "
+                         f"{stats['files_imported']} file(s) "
+                         f"({stats['files_skipped']} skipped)"]
+                if stats["unchanged"]:
+                    parts.append(f"({stats['unchanged']} unchanged)")
+                parts.append(f"into {db_path}")
+                print(" ".join(parts))
+        else:
+            print(f"Error: '{args.file}' is a directory. "
+                  f"Use --recursive to import all files, "
+                  f"or point at a recognized export directory.",
+                  file=sys.stderr)
+            sys.exit(1)
+    else:
+        with Database(db_path) as db:
+            n_imp, n_unch = _import_one(file_path, args, db, exit_on_miss=True)
+            parts = [f"Imported {n_imp} conversation(s)"]
+            if n_unch:
+                parts.append(f"({n_unch} unchanged)")
+            parts.append(f"into {db_path}")
+            print(" ".join(parts))
+
+
+def _save_convs(convs, source_path, args, db):
+    """Save imported conversations to the database.
+
+    Returns (imported_count, unchanged_count).
+    source_path is used as the base for asset resolution.
+    """
     from memex.assets import resolve_source_assets, copy_assets
 
     db_path = os.path.expanduser(args.db)
-    source_dir = Path(args.file).resolve().parent
+    source_dir = source_path if source_path.is_dir() else source_path.parent
     asset_dir = Path(db_path) / "assets"
-    with Database(db_path) as db:
-        convs = _auto_import(args.file, args.format)
-        for conv in convs:
-            # Extract provenance before save (pop to keep metadata clean)
-            prov = conv.metadata.pop("_provenance", None)
-            # Resolve and copy media assets
-            if not args.no_copy_assets:
-                source_type = prov.get("source_type", "") if prov else ""
-                resolve_source_assets(conv, source_dir, source_type)
-                copy_assets(conv, asset_dir)
-            db.save_conversation(conv)
-            # Write provenance after save (CASCADE-safe ordering)
-            if prov:
-                db.save_provenance(
-                    conv.id,
-                    source_type=prov.get("source_type", "unknown"),
-                    source_file=prov.get("source_file"),
-                    source_id=prov.get("source_id"),
-                    source_hash=prov.get("source_hash"),
-                )
-        print(f"Imported {len(convs)} conversation(s) into {db_path}")
+    imported = 0
+    unchanged = 0
+    for conv in convs:
+        # Skip-if-unchanged check (bypass with --force)
+        if not args.force and db.conversation_unchanged(
+            conv.id, conv.updated_at, conv.message_count
+        ):
+            unchanged += 1
+            continue
+
+        prov = conv.metadata.pop("_provenance", None)
+        if not args.no_copy_assets:
+            source_type = prov.get("source_type", "") if prov else ""
+            resolve_source_assets(conv, source_dir, source_type)
+            copy_assets(conv, asset_dir)
+        db.save_conversation(conv)
+        if prov:
+            db.save_provenance(
+                conv.id,
+                source_type=prov.get("source_type", "unknown"),
+                source_file=prov.get("source_file"),
+                source_id=prov.get("source_id"),
+                source_hash=prov.get("source_hash"),
+            )
+        imported += 1
+
+        # Progress to stderr (every 50 conversations)
+        if len(convs) > 10 and (imported + unchanged) % 50 == 0:
+            print(f"\rImporting: {imported + unchanged}/{len(convs)} "
+                  f"conversations ({imported} imported, {unchanged} unchanged)...",
+                  end="", file=sys.stderr, flush=True)
+
+    # Clear progress line
+    if len(convs) > 10 and (imported + unchanged) > 0:
+        print("\r" + " " * 79 + "\r", end="", file=sys.stderr, flush=True)
+
+    return (imported, unchanged)
+
+
+def _import_one(file_path, args, db, exit_on_miss=False):
+    """Import a single file into the database.
+
+    Returns (imported_count, unchanged_count).
+    If exit_on_miss=True, calls sys.exit(1) when no importer matches.
+    """
+    convs = _auto_import(str(file_path), args.format, exit_on_fail=exit_on_miss)
+    if convs is None:
+        return (0, 0)
+    return _save_convs(convs, file_path, args, db)
 
 
 def _discover_formats(directory, user_directory, required_attrs, strip_suffix=""):
@@ -186,7 +304,7 @@ def _discover_importers():
     return _discover_formats(
         Path(__file__).parent / "importers",
         Path.home() / ".memex" / "importers",
-        ("detect", "import_file"),
+        ("detect", "import_path"),
     )
 
 
@@ -199,8 +317,11 @@ def _discover_exporters():
     )
 
 
-def _auto_import(file_path, format_name=None):
-    """Auto-detect importer and import file."""
+def _auto_import(file_path, format_name=None, exit_on_fail=True):
+    """Auto-detect importer and import path (file or directory).
+
+    Returns list of conversations, or None if no importer matched and exit_on_fail=False.
+    """
     importers = _discover_importers()
     if format_name:
         if format_name not in importers:
@@ -208,30 +329,53 @@ def _auto_import(file_path, format_name=None):
                   f"Available: {', '.join(sorted(importers))}",
                   file=sys.stderr)
             sys.exit(1)
-        return importers[format_name]["module"].import_file(file_path)
+        try:
+            return importers[format_name]["module"].import_path(file_path)
+        except Exception as e:
+            if exit_on_fail:
+                print(f"Error: failed to import {file_path}: {e}", file=sys.stderr)
+                sys.exit(1)
+            print(f"Warning: failed to import {file_path}: {e}", file=sys.stderr)
+            return None
     for name, info in importers.items():
         if info["module"].detect(file_path):
-            return info["module"].import_file(file_path)
-    print(f"Error: no importer found for {file_path}", file=sys.stderr)
-    sys.exit(1)
+            try:
+                return info["module"].import_path(file_path)
+            except Exception as e:
+                if exit_on_fail:
+                    print(f"Error: failed to import {file_path}: {e}", file=sys.stderr)
+                    sys.exit(1)
+                print(f"Warning: failed to import {file_path}: {e}", file=sys.stderr)
+                return None
+    if exit_on_fail:
+        print(f"Error: no importer found for {file_path}", file=sys.stderr)
+        sys.exit(1)
+    return None
 
 
 def _cmd_show(args):
-    from memex.db import Database
-
     db_path = os.path.expanduser(args.db)
-    with Database(db_path, readonly=True) as db:
+    with _open_db(args) as db:
         if args.id is None:
             # List mode
             cursor = None
+            found = False
             while True:
-                result = db.query_conversations(limit=50, cursor=cursor)
+                result = db.query_conversations(
+                    query=args.search, limit=50, cursor=cursor,
+                )
                 for item in result["items"]:
+                    found = True
                     tags = f"  [{item['tags_csv']}]" if item.get("tags_csv") else ""
                     print(f"{item['id']}  {item['message_count']:3d} msgs  {item['title'] or '(untitled)'}{tags}")
                 if not result["has_more"]:
                     break
                 cursor = result["next_cursor"]
+            if not found:
+                if args.search:
+                    print(f"No conversations matching '{args.search}'.")
+                else:
+                    print("No conversations found.")
             return
 
         conv = db.load_conversation(args.id)
@@ -290,10 +434,10 @@ def _cmd_export(args):
         print("Error: the following arguments are required: output", file=sys.stderr)
         sys.exit(1)
 
-    from memex.db import Database
     exporter_mod = exporters[args.format]["module"]
 
-    with Database(os.path.expanduser(args.db)) as db:
+    db_path = os.path.expanduser(args.db)
+    with _open_db(args) as db:
         # Load conversations in chunks to avoid memory exhaustion
         convs = []
         cursor = None
@@ -336,11 +480,55 @@ def _cmd_run(args, remaining):
     mod.register_args(script_parser)
     script_args = script_parser.parse_args(remaining)
 
-    db_path = os.path.expanduser(args.db)
-    with Database(db_path, readonly=not args.apply) as db:
+    with _open_db(args, readonly=not args.apply) as db:
         result = mod.run(db, script_args, apply=args.apply)
         if args.verbose and result:
             print(f"\nResult: {result}")
+
+
+def _cmd_db(args):
+    db_path = os.path.expanduser(args.db)
+    with _open_db(args) as db:
+        stats = db.execute_sql(
+            "SELECT COUNT(*) as n_convs, SUM(message_count) as n_msgs,"
+            " MIN(created_at) as earliest, MAX(updated_at) as latest"
+            " FROM conversations"
+        )[0]
+        sources = db.execute_sql(
+            "SELECT source, COUNT(*) as n FROM conversations"
+            " WHERE source IS NOT NULL GROUP BY source ORDER BY n DESC"
+        )
+        top_tags = db.execute_sql(
+            "SELECT tag, COUNT(*) as n FROM tags GROUP BY tag ORDER BY n DESC LIMIT 10"
+        )
+        db_file = db.db_path
+
+    size_str = _format_size(os.path.getsize(db_file)) if os.path.exists(db_file) else "unknown"
+    n_convs = stats["n_convs"] or 0
+    n_msgs = stats["n_msgs"] or 0
+
+    print(f"Database: {db_path}")
+    print(f"  File:          {db_file}  ({size_str})")
+    print(f"  Conversations: {n_convs:,}")
+    print(f"  Messages:      {n_msgs:,}")
+    if stats["earliest"] and stats["latest"]:
+        print(f"  Dates:         {stats['earliest'][:10]} → {stats['latest'][:10]}")
+    if sources:
+        print("  Sources:")
+        for row in sources:
+            print(f"    {row['source']:<20s}  {row['n']:,}")
+    if top_tags:
+        print("  Top tags:")
+        for row in top_tags:
+            print(f"    {row['tag']:<20s}  {row['n']:,}")
+
+
+def _format_size(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
 
 
 def _cmd_mcp(args):

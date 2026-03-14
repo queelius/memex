@@ -1,6 +1,7 @@
 """Import OpenAI conversation exports (conversations.json)."""
 import json
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from memex.models import (
@@ -13,20 +14,37 @@ from memex.models import (
 )
 
 
-def detect(path: str) -> bool:
-    """Check if file is an OpenAI conversations.json export."""
+def _detect_file(path: str) -> bool:
+    """Check if a single file is an OpenAI conversations.json export."""
     try:
         with open(path) as f:
             data = json.load(f)
         if isinstance(data, list) and data and "mapping" in data[0]:
             return True
         return False
-    except (json.JSONDecodeError, IOError, KeyError, IndexError):
+    except (json.JSONDecodeError, IOError, KeyError, IndexError, ValueError):
         return False
 
 
-def import_file(path: str) -> List[Conversation]:
-    """Import conversations from an OpenAI export file."""
+def detect(path: str) -> bool:
+    """Check if path is an OpenAI export file or directory containing one."""
+    p = Path(path)
+    if p.is_dir():
+        candidate = p / "conversations.json"
+        return candidate.exists() and _detect_file(str(candidate))
+    return _detect_file(path)
+
+
+def import_path(path: str) -> List[Conversation]:
+    """Import conversations from an OpenAI export file or directory."""
+    p = Path(path)
+    if p.is_dir():
+        return _import_file(str(p / "conversations.json"))
+    return _import_file(path)
+
+
+def _import_file(path: str) -> List[Conversation]:
+    """Import conversations from a single OpenAI export file."""
     with open(path) as f:
         data = json.load(f)
     if not isinstance(data, list):

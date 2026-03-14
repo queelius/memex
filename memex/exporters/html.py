@@ -4,6 +4,7 @@ import shutil
 from pathlib import Path
 from typing import List
 
+from memex.db import Database
 from memex.exporters.html_template import get_template
 from memex.models import Conversation
 
@@ -32,15 +33,24 @@ def export(conversations: List[Conversation], path: str, **kwargs) -> None:
     out_dir = Path(path)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write index.html
-    (out_dir / "index.html").write_text(get_template())
-
-    # Copy DB if available
     db_path = kwargs.get("db_path")
-    if db_path and db_path != ":memory:" and os.path.exists(db_path):
-        shutil.copy2(db_path, out_dir / "conversations.db")
+    has_db = db_path and db_path != ":memory:" and os.path.exists(db_path)
 
-        # Copy assets if they exist
+    # Extract schema DDL from the database if available
+    schema_ddl = ""
+    if has_db:
+        try:
+            with Database(str(Path(db_path).parent), readonly=True) as db:
+                schema_ddl = db.get_schema()
+        except Exception:
+            pass
+
+    # Write index.html
+    (out_dir / "index.html").write_text(get_template(schema_ddl=schema_ddl))
+
+    # Copy DB and assets if available
+    if has_db:
+        shutil.copy2(db_path, out_dir / "conversations.db")
         assets_dir = Path(db_path).parent / "assets"
         if assets_dir.is_dir():
             dest_assets = out_dir / "assets"

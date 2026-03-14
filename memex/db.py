@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from memex.models import Conversation, Message
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS conversations (
@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     message_count INTEGER NOT NULL DEFAULT 0,
     created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL,
     starred_at DATETIME, pinned_at DATETIME, archived_at DATETIME,
+    parent_conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
     sensitive BOOLEAN NOT NULL DEFAULT 0,
     metadata JSON NOT NULL DEFAULT '{}'
 );
@@ -69,6 +70,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(conversation_id, pare
 CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);
 CREATE INDEX IF NOT EXISTS idx_enrichments_type ON enrichments(type);
 CREATE INDEX IF NOT EXISTS idx_enrichments_source ON enrichments(source);
+CREATE INDEX IF NOT EXISTS idx_conversations_parent ON conversations(parent_conversation_id) WHERE parent_conversation_id IS NOT NULL;
 """
 
 
@@ -107,8 +109,23 @@ def _migrate_to_v2(conn):
     conn.commit()
 
 
+def _migrate_to_v3(conn):
+    """Add parent_conversation_id column to conversations."""
+    conn.execute(
+        "ALTER TABLE conversations ADD COLUMN parent_conversation_id "
+        "TEXT REFERENCES conversations(id) ON DELETE SET NULL"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_conversations_parent "
+        "ON conversations(parent_conversation_id) "
+        "WHERE parent_conversation_id IS NOT NULL"
+    )
+    conn.commit()
+
+
 MIGRATIONS: Dict[int, callable] = {
     1: _migrate_to_v2,
+    2: _migrate_to_v3,
 }
 
 
@@ -172,6 +189,8 @@ class Database:
             self.db_path = ":memory:"
         else:
             db_dir = Path(path)
+            if readonly and not db_dir.exists():
+                raise FileNotFoundError(f"Database not found: {path}")
             db_dir.mkdir(parents=True, exist_ok=True)
             self.db_path = str(db_dir / "conversations.db")
         self.readonly = readonly
@@ -203,8 +222,10 @@ class Database:
             )
             self.conn.commit()
         elif not has_version_table:
-            # Pre-existing DB without versioning: bootstrap at v1
-            self.conn.executescript(SCHEMA_SQL)
+            # Pre-existing DB without versioning: create only new tables
+            # (skip SCHEMA_SQL to avoid conflicts with existing tables),
+            # then bootstrap at v1 and run all migrations.
+            self._create_missing_tables()
             self.conn.execute(
                 "INSERT INTO schema_version (version) VALUES (1)"
             )
@@ -213,6 +234,27 @@ class Database:
         else:
             # DB with version table: apply any pending migrations
             self._apply_migrations()
+
+    def _create_missing_tables(self):
+        """Create tables that don't yet exist, without touching existing tables.
+
+        Used for pre-existing databases without versioning — runs SCHEMA_SQL
+        but suppresses errors from indexes referencing columns not yet added
+        by migrations (e.g., parent_conversation_id index on an old conversations table).
+        """
+        for stmt in SCHEMA_SQL.split(";"):
+            stmt = stmt.strip()
+            if not stmt:
+                continue
+            try:
+                self.conn.execute(stmt)
+            except sqlite3.OperationalError as e:
+                msg = str(e)
+                if "no such column" in msg or "already exists" in msg:
+                    pass  # Expected for indexes on columns not yet migrated
+                else:
+                    raise
+        self.conn.commit()
 
     def _apply_migrations(self):
         row = self.conn.execute(
@@ -273,6 +315,7 @@ class Database:
 -- tags.conversation_id       → conversations.id  (CASCADE delete)
 -- enrichments.conversation_id → conversations.id (CASCADE delete)
 -- provenance.conversation_id → conversations.id  (CASCADE delete)
+-- conversations.parent_conversation_id → conversations.id (SET NULL on delete)
 -- messages.parent_id         → messages.id (same conversation, tree structure)
 
 -- ══ FTS5 Full-Text Search ══════════════════════════════════════
@@ -294,6 +337,16 @@ class Database:
 -- Filter: WHERE starred_at IS NOT NULL (starred conversations)"""
         return ddl + docs
 
+    def conversation_unchanged(self, conv_id: str, updated_at, message_count: int) -> bool:
+        """Fast check: does this conversation already exist with matching fields?"""
+        row = self.conn.execute(
+            "SELECT updated_at, message_count FROM conversations WHERE id=?",
+            (conv_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        return row["updated_at"] == _fmt_dt(updated_at) and row["message_count"] == message_count
+
     def save_conversation(self, conv: Conversation) -> None:
         c = self.conn.cursor()
         try:
@@ -301,12 +354,14 @@ class Database:
                 "INSERT OR REPLACE INTO conversations "
                 "(id,title,source,model,summary,message_count,"
                 "created_at,updated_at,starred_at,pinned_at,archived_at,"
-                "sensitive,metadata) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "parent_conversation_id,sensitive,metadata) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     conv.id, conv.title, conv.source, conv.model, conv.summary,
                     conv.message_count, _fmt_dt(conv.created_at),
                     _fmt_dt(conv.updated_at), _fmt_dt(conv.starred_at),
                     _fmt_dt(conv.pinned_at), _fmt_dt(conv.archived_at),
+                    conv.parent_conversation_id,
                     int(conv.sensitive), json.dumps(conv.metadata),
                 ),
             )
@@ -363,6 +418,7 @@ class Database:
             starred_at=_parse_dt(r["starred_at"]),
             pinned_at=_parse_dt(r["pinned_at"]),
             archived_at=_parse_dt(r["archived_at"]),
+            parent_conversation_id=r["parent_conversation_id"],
             sensitive=bool(r["sensitive"]),
             metadata=json.loads(r["metadata"]) if r["metadata"] else {},
         )

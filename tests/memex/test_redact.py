@@ -411,3 +411,438 @@ class TestBuiltinPatterns:
         from memex.scripts.redact import load_pattern_file
         patterns = load_pattern_file("api_keys.txt")
         assert len(patterns) >= 3  # at least OpenAI, GitHub, AWS
+
+
+# ── Additional Detection Edge Cases ────────────────────────────
+
+
+class TestLoadPatternFileResolution:
+    def test_user_patterns_dir_fallback(self, tmp_path):
+        """When builtin dir lacks file, user patterns dir is tried."""
+        from memex.scripts.redact import load_pattern_file
+        user_patterns = tmp_path / ".memex" / "scripts" / "patterns"
+        user_patterns.mkdir(parents=True)
+        (user_patterns / "custom.txt").write_text("user_pattern_1\nuser_pattern_2\n")
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            patterns = load_pattern_file("custom.txt")
+        assert patterns == ["user_pattern_1", "user_pattern_2"]
+
+    def test_nonexistent_pattern_file_raises(self):
+        """Loading a pattern file that doesn't exist anywhere raises."""
+        from memex.scripts.redact import load_pattern_file
+        with pytest.raises(FileNotFoundError):
+            load_pattern_file("totally_nonexistent_file_xyz.txt")
+
+
+class TestCheckMatchModeEdgeCases:
+    def test_unknown_mode_returns_false(self):
+        """An unrecognized mode returns False."""
+        from memex.scripts.redact import check_match_mode, Match
+        matches = [Match("c1", "m1", "word", 0, 4, 0)]
+        assert check_match_mode(matches, "unknown_mode", []) is False
+
+    def test_any_with_no_matches_returns_false(self):
+        """'any' mode with empty matches returns False."""
+        from memex.scripts.redact import check_match_mode
+        assert check_match_mode([], "any", []) is False
+
+
+# ── Additional Mutation Edge Cases ─────────────────────────────
+
+
+class TestRedactWordLevelEdgeCases:
+    def test_out_of_bounds_block_index_skipped(self):
+        """Match referencing a block_index beyond content length is skipped."""
+        from memex.scripts.redact import Match, redact_word_level
+        content = [{"type": "text", "text": "hello"}]
+        # block_index=5 is out of bounds
+        matches = [Match("c1", "m1", "hello", 0, 5, 5)]
+        result = redact_word_level(content, matches)
+        assert result[0]["text"] == "hello"  # unchanged
+
+    def test_match_on_non_text_block_skipped(self):
+        """Match referencing a non-text block is skipped."""
+        from memex.scripts.redact import Match, redact_word_level
+        content = [{"type": "tool_use", "text": "some tool data"}]
+        matches = [Match("c1", "m1", "some", 0, 4, 0)]
+        result = redact_word_level(content, matches)
+        # Non-text block unchanged
+        assert result[0]["text"] == "some tool data"
+
+    def test_adjacent_matches_both_redacted(self):
+        """Adjacent matches in same block are both redacted correctly."""
+        from memex.scripts.redact import Match, redact_word_level
+        content = [{"type": "text", "text": "bad bad"}]
+        matches = [
+            Match("c1", "m1", "bad", 0, 3, 0),
+            Match("c1", "m1", "bad", 4, 7, 0),
+        ]
+        result = redact_word_level(content, matches)
+        assert result[0]["text"] == "[REDACTED] [REDACTED]"
+
+    def test_overlapping_matches_merged(self):
+        """Overlapping matches from different matchers don't corrupt output."""
+        from memex.scripts.redact import Match, redact_word_level
+        # Same span matched by both a word and a pattern
+        content = [{"type": "text", "text": "what the fuck"}]
+        matches = [
+            Match("c1", "m1", "fuck", 9, 13, 0),
+            Match("c1", "m1", "f..k", 9, 13, 0),
+        ]
+        result = redact_word_level(content, matches)
+        assert result[0]["text"] == "what the [REDACTED]"
+
+    def test_partially_overlapping_matches_merged(self):
+        """Partially overlapping matches produce a single [REDACTED]."""
+        from memex.scripts.redact import Match, redact_word_level
+        content = [{"type": "text", "text": "abcdefghij"}]
+        # Match 1: positions 2-6, Match 2: positions 4-8 (overlap at 4-6)
+        matches = [
+            Match("c1", "m1", "pat1", 2, 6, 0),
+            Match("c1", "m1", "pat2", 4, 8, 0),
+        ]
+        result = redact_word_level(content, matches)
+        assert result[0]["text"] == "ab[REDACTED]ij"
+
+
+# ── Additional Dry Run Output Tests ────────────────────────────
+
+
+class TestDryRunOutput:
+    def test_message_level_dry_run(self, tmp_db_path, capsys):
+        """Dry run at message level prints MSG indicator."""
+        from memex.scripts.redact import run
+        db = Database(tmp_db_path)
+        conv = _make_conv_with_text("what the fuck")
+        db.save_conversation(conv)
+        args = _make_args(words="fuck", level="message")
+        stats = run(db, args, apply=False)
+        assert stats["message_redactions"] == 1
+        output = capsys.readouterr().out
+        assert "MSG" in output
+        db.close()
+
+    def test_conversation_level_dry_run(self, tmp_db_path, capsys):
+        """Dry run at conversation level prints CONV indicator."""
+        from memex.scripts.redact import run
+        db = Database(tmp_db_path)
+        conv = _make_conv_with_text("what the fuck")
+        db.save_conversation(conv)
+        args = _make_args(words="fuck", level="conversation")
+        stats = run(db, args, apply=False)
+        assert stats["conversation_deletions"] == 1
+        output = capsys.readouterr().out
+        assert "CONV" in output
+        db.close()
+
+    def test_dry_run_no_matches_prints_no_matches(self, tmp_db_path, capsys):
+        """Dry run with no matches prints 'No matches found.'."""
+        from memex.scripts.redact import run
+        db = Database(tmp_db_path)
+        conv = _make_conv_with_text("perfectly clean")
+        db.save_conversation(conv)
+        args = _make_args(words="nonexistent", level="word")
+        run(db, args, apply=False)
+        output = capsys.readouterr().out
+        assert "No matches found" in output
+        db.close()
+
+
+# ── Conversation-Level Match Mode ──────────────────────────────
+
+
+class TestConversationLevelMatchMode:
+    def test_conversation_all_mode_across_messages(self, tmp_db_path):
+        """Conversation-level with all mode checks across all messages in conv."""
+        from memex.scripts.redact import run
+        db = Database(tmp_db_path)
+        now = datetime.now()
+        conv = Conversation(id="c1", created_at=now, updated_at=now, title="Test",
+                            source="test", message_count=2)
+        conv.add_message(Message(id="m1", role="user",
+                                 content=[text_block("the word fuck appears here")]))
+        conv.add_message(Message(id="m2", role="assistant",
+                                 content=[text_block("the word shit appears here")],
+                                 parent_id="m1"))
+        db.save_conversation(conv)
+        # Both terms present across messages - should match in conversation-level all mode
+        args = _make_args(words="fuck,shit", level="conversation", yes=True, all_mode=True)
+        stats = run(db, args, apply=True)
+        assert stats["conversation_deletions"] == 1
+        assert db.load_conversation("c1") is None
+        db.close()
+
+    def test_conversation_all_mode_incomplete_no_delete(self, tmp_db_path):
+        """Conversation-level all mode: if not all terms found, no deletion."""
+        from memex.scripts.redact import run
+        db = Database(tmp_db_path)
+        conv = _make_conv_with_text("only fuck here")
+        db.save_conversation(conv)
+        args = _make_args(words="fuck,shit", level="conversation", yes=True, all_mode=True)
+        stats = run(db, args, apply=True)
+        assert stats["conversation_deletions"] == 0
+        assert db.load_conversation("c1") is not None
+        db.close()
+
+
+# ── Interactive Review Edge Cases ──────────────────────────────
+
+
+class TestInteractiveReviewEdgeCases:
+    def test_message_level_skip(self, tmp_db_path):
+        """Interactive message-level 's' skips without modification."""
+        from memex.scripts.redact import interactive_review, compile_matchers, scan_message
+        db = Database(tmp_db_path)
+        conv = _make_conv_with_text("what the fuck")
+        db.save_conversation(conv)
+        matchers = compile_matchers(words=["fuck"])
+        content = [{"type": "text", "text": "what the fuck"}]
+        result = scan_message(content, matchers, "c1", "m1")
+        responses = iter(["s"])
+        stats = interactive_review([result], db, "message",
+                                   input_fn=lambda _: next(responses))
+        assert stats["skipped"] == 1
+        reloaded = db.load_conversation("c1")
+        assert "fuck" in reloaded.messages["m1"].get_text()
+        db.close()
+
+    def test_message_level_quit(self, tmp_db_path):
+        """Interactive message-level 'q' stops early."""
+        from memex.scripts.redact import interactive_review, compile_matchers, scan_message
+        db = Database(tmp_db_path)
+        conv1 = _make_conv_with_text("what the fuck", id="c1")
+        conv2 = _make_conv_with_text("what the shit", id="c2")
+        db.save_conversation(conv1)
+        db.save_conversation(conv2)
+        matchers = compile_matchers(words=["fuck", "shit"])
+        result1 = scan_message([text_block("what the fuck")], matchers, "c1", "m1")
+        result2 = scan_message([text_block("what the shit")], matchers, "c2", "m1")
+        responses = iter(["q"])
+        stats = interactive_review([result1, result2], db, "message",
+                                   input_fn=lambda _: next(responses))
+        assert stats["redacted"] == 0
+        # Neither should be modified
+        assert db.load_conversation("c1") is not None
+        assert db.load_conversation("c2") is not None
+        db.close()
+
+    def test_all_choice_honors_auto_on_skip(self, tmp_db_path):
+        """When term A is auto-approved and term B is skipped, A is still redacted."""
+        from memex.scripts.redact import interactive_review, compile_matchers, scan_message
+        db = Database(tmp_db_path)
+        # Message 1: has "fuck" — user says 'a' (auto all "fuck")
+        conv1 = _make_conv_with_text("what the fuck", id="c1")
+        # Message 2: has both "fuck" and "shit" — "fuck" is auto, user skips "shit"
+        now = datetime.now()
+        conv2 = Conversation(id="c2", created_at=now, updated_at=now, title="Test",
+                             source="test", message_count=1)
+        conv2.add_message(Message(id="m1", role="user",
+                                  content=[text_block("fuck this shit")]))
+        db.save_conversation(conv1)
+        db.save_conversation(conv2)
+        matchers = compile_matchers(words=["fuck", "shit"])
+        result1 = scan_message([text_block("what the fuck")], matchers, "c1", "m1")
+        result2 = scan_message([text_block("fuck this shit")], matchers, "c2", "m1")
+        # First result: 'a' to auto-approve "fuck". Second result: 's' to skip "shit"
+        responses = iter(["a", "s"])
+        stats = interactive_review([result1, result2], db, "word",
+                                   input_fn=lambda _: next(responses))
+        # c1 fully redacted
+        r1 = db.load_conversation("c1")
+        assert "[REDACTED]" in r1.messages["m1"].get_text()
+        # c2: "fuck" should be redacted (auto), "shit" should remain
+        r2 = db.load_conversation("c2")
+        text = r2.messages["m1"].get_text()
+        assert "fuck" not in text
+        assert "[REDACTED]" in text
+        assert "shit" in text
+        db.close()
+
+    def test_conversation_level_interactive_redact(self, tmp_db_path):
+        """Interactive conversation-level 'r' deletes the conversation."""
+        from memex.scripts.redact import interactive_review, compile_matchers, scan_message, ScanResult, Match
+        db = Database(tmp_db_path)
+        conv = _make_conv_with_text("what the fuck")
+        db.save_conversation(conv)
+        # Build a conversation-level ScanResult (message_id="(all)", content=[])
+        combined = ScanResult(
+            conversation_id="c1",
+            message_id="(all)",
+            matches=[Match("c1", "m1", "fuck", 9, 13, 0)],
+            content=[],
+        )
+        responses = iter(["r"])
+        stats = interactive_review([combined], db, "conversation",
+                                   input_fn=lambda _: next(responses))
+        assert stats["redacted"] == 1
+        assert db.load_conversation("c1") is None
+        db.close()
+
+
+# ── Pattern-Based End-to-End ───────────────────────────────────
+
+
+class TestPatternBasedRedaction:
+    def test_regex_pattern_end_to_end(self, tmp_db_path):
+        """run() with --patterns performs regex-based redaction."""
+        from memex.scripts.redact import run
+        db = Database(tmp_db_path)
+        conv = _make_conv_with_text("my key is sk-proj-abc123def456ghi789jkl012mno please")
+        db.save_conversation(conv)
+        # Use a comma-free regex (commas in quantifiers like {20,} get split
+        # by run()'s CSV parser for --patterns)
+        args = _make_args(patterns=r"sk-\w+", level="word", yes=True)
+        stats = run(db, args, apply=True)
+        assert stats["word_redactions"] >= 1
+        reloaded = db.load_conversation("c1")
+        assert "[REDACTED]" in reloaded.messages["m1"].get_text()
+        assert "sk-proj" not in reloaded.messages["m1"].get_text()
+        db.close()
+
+    def test_pattern_file_end_to_end(self, tmp_db_path, tmp_path):
+        """run() with --pattern-file loads and applies patterns."""
+        from memex.scripts.redact import run
+        pf = tmp_path / "patterns.txt"
+        pf.write_text(r"secret_\w+")
+        db = Database(tmp_db_path)
+        conv = _make_conv_with_text("the password is secret_abc123 ok")
+        db.save_conversation(conv)
+        args = _make_args(pattern_file=str(pf), level="word", yes=True)
+        stats = run(db, args, apply=True)
+        assert stats["word_redactions"] >= 1
+        reloaded = db.load_conversation("c1")
+        assert "secret_abc123" not in reloaded.messages["m1"].get_text()
+        db.close()
+
+
+# ── Redact + DB Integration ────────────────────────────────────
+
+
+class TestRedactDBIntegration:
+    def test_word_redact_updates_fts_index(self, tmp_db_path):
+        """After word-level redaction, the original term is no longer FTS-searchable."""
+        from memex.scripts.redact import run
+        db = Database(tmp_db_path)
+        conv = _make_conv_with_text("the secret password is hunter2")
+        db.save_conversation(conv)
+        args = _make_args(words="hunter2", level="word", yes=True)
+        run(db, args, apply=True)
+        # "hunter2" should not be findable via FTS
+        results = db.search_messages("hunter2")
+        assert len(results) == 0
+        # But surrounding text should still be findable
+        results = db.search_messages("password")
+        assert len(results) >= 1
+        db.close()
+
+    def test_message_redact_removes_all_text_from_fts(self, tmp_db_path):
+        """After message-level redaction, original text is not FTS-searchable."""
+        from memex.scripts.redact import run
+        db = Database(tmp_db_path)
+        conv = _make_conv_with_text("the unique_search_term_xyz is here")
+        db.save_conversation(conv)
+        args = _make_args(words="unique_search_term_xyz", level="message", yes=True)
+        run(db, args, apply=True)
+        results = db.search_messages("unique_search_term_xyz")
+        assert len(results) == 0
+        db.close()
+
+    def test_conversation_delete_cleans_fts_and_enrichments(self, tmp_db_path):
+        """Conversation-level redaction cleans up FTS, enrichments, and provenance."""
+        from memex.scripts.redact import run
+        db = Database(tmp_db_path)
+        conv = _make_conv_with_text("fuck this particular conversation")
+        db.save_conversation(conv)
+        db.save_enrichment("c1", "topic", "profanity", "heuristic")
+        db.save_provenance("c1", source_type="test", source_file="test.json")
+        args = _make_args(words="fuck", level="conversation", yes=True)
+        run(db, args, apply=True)
+        # Everything gone
+        assert db.load_conversation("c1") is None
+        assert db.get_enrichments("c1") == []
+        assert db.get_provenance("c1") == []
+        results = db.search_messages("particular")
+        assert len(results) == 0
+        db.close()
+
+    def test_redact_multiblock_message_preserves_clean_blocks(self, tmp_db_path):
+        """Word redaction in a multi-block message only affects matching blocks."""
+        from memex.scripts.redact import run
+        db = Database(tmp_db_path)
+        now = datetime.now()
+        conv = Conversation(id="c1", created_at=now, updated_at=now, title="Test",
+                            source="test", message_count=1)
+        conv.add_message(Message(id="m1", role="user", content=[
+            {"type": "text", "text": "clean text here"},
+            {"type": "text", "text": "some fuck in this block"},
+        ]))
+        db.save_conversation(conv)
+        args = _make_args(words="fuck", level="word", yes=True)
+        run(db, args, apply=True)
+        reloaded = db.load_conversation("c1")
+        content = reloaded.messages["m1"].content
+        assert content[0]["text"] == "clean text here"
+        assert "[REDACTED]" in content[1]["text"]
+        assert "fuck" not in content[1]["text"]
+        db.close()
+
+    def test_redact_only_matching_messages_in_conversation(self, tmp_db_path):
+        """Word-level redaction only modifies messages that contain matches."""
+        from memex.scripts.redact import run
+        db = Database(tmp_db_path)
+        now = datetime.now()
+        conv = Conversation(id="c1", created_at=now, updated_at=now, title="Test",
+                            source="test", message_count=2)
+        conv.add_message(Message(id="m1", role="user",
+                                 content=[text_block("clean message here")]))
+        conv.add_message(Message(id="m2", role="assistant",
+                                 content=[text_block("this has fuck in it")],
+                                 parent_id="m1"))
+        db.save_conversation(conv)
+        args = _make_args(words="fuck", level="word", yes=True)
+        run(db, args, apply=True)
+        reloaded = db.load_conversation("c1")
+        assert reloaded.messages["m1"].get_text() == "clean message here"
+        assert "[REDACTED]" in reloaded.messages["m2"].get_text()
+        db.close()
+
+    def test_redact_multiple_conversations_selectively(self, tmp_db_path):
+        """Redaction across multiple conversations only affects matching ones."""
+        from memex.scripts.redact import run
+        db = Database(tmp_db_path)
+        conv1 = _make_conv_with_text("has the bad word fuck", id="c1")
+        conv2 = _make_conv_with_text("perfectly clean text", id="c2")
+        conv3 = _make_conv_with_text("also has fuck here", id="c3")
+        db.save_conversation(conv1)
+        db.save_conversation(conv2)
+        db.save_conversation(conv3)
+        args = _make_args(words="fuck", level="word", yes=True)
+        stats = run(db, args, apply=True)
+        assert stats["word_redactions"] == 2
+        # c1 and c3 redacted
+        r1 = db.load_conversation("c1")
+        assert "[REDACTED]" in r1.messages["m1"].get_text()
+        r3 = db.load_conversation("c3")
+        assert "[REDACTED]" in r3.messages["m1"].get_text()
+        # c2 untouched
+        r2 = db.load_conversation("c2")
+        assert r2.messages["m1"].get_text() == "perfectly clean text"
+        db.close()
+
+    def test_word_redact_stores_original_content_enrichment(self, tmp_db_path):
+        """Word-level redaction saves an original_content enrichment with recoverable content."""
+        from memex.scripts.redact import run
+        db = Database(tmp_db_path)
+        conv = _make_conv_with_text("contains secret here")
+        db.save_conversation(conv)
+        args = _make_args(words="secret", level="word", yes=True)
+        run(db, args, apply=True)
+        enrichments = db.get_enrichments("c1")
+        originals = [e for e in enrichments if e["type"] == "original_content"]
+        assert len(originals) == 1
+        assert originals[0]["source"] == "redact"
+        # The enrichment value contains the original content as JSON
+        stored = json.loads(originals[0]["value"])
+        assert stored["message_id"] == "m1"
+        assert stored["content"] == [{"type": "text", "text": "contains secret here"}]
+        db.close()
