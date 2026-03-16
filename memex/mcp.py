@@ -62,6 +62,22 @@ def _get_db_from_ctx(mcp, ctx, db_name=None):
     return mcp._test_db
 
 
+def _extract_text(content) -> str:
+    """Extract text from a message content field (JSON string or list of blocks)."""
+    if isinstance(content, str):
+        import json as _json
+        try:
+            content = _json.loads(content)
+        except (ValueError, TypeError):
+            return content
+    if isinstance(content, list):
+        return "\n".join(
+            b.get("text", "") for b in content
+            if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
+        )
+    return str(content) if content else ""
+
+
 def _conv_metadata(conv, db) -> dict:
     """Build conversation metadata dict with boolean flags, tags, enrichments, provenance."""
     tags = [
@@ -207,6 +223,167 @@ Starred/pinned (use IS NOT NULL for boolean timestamp columns):
         meta = _conv_metadata(conv, database)
         meta["paths"] = database.list_paths(id)
         return meta
+
+    @mcp.tool(annotations={"readOnlyHint": True})
+    def get_conversations(
+        tag: Annotated[str | None, Field(description="Filter by tag")] = None,
+        source: Annotated[str | None, Field(description="Filter by source (openai, anthropic, etc.)")] = None,
+        model: Annotated[str | None, Field(description="Filter by model")] = None,
+        search: Annotated[str | None, Field(description="FTS5 full-text search across messages")] = None,
+        ids: Annotated[list[str] | None, Field(description="Specific conversation IDs")] = None,
+        starred: Annotated[bool | None, Field(description="Filter by starred status")] = None,
+        pinned: Annotated[bool | None, Field(description="Filter by pinned status")] = None,
+        include_messages: Annotated[bool, Field(description="Include full message content (default false — returns metadata + preview)")] = False,
+        limit: Annotated[int, Field(description="Max conversations to return (default 20)")] = 20,
+        db: Annotated[str | None, Field(description="Target database")] = None,
+        ctx: Context = None,
+    ) -> list[dict]:
+        """Retrieve multiple conversations with metadata, tags, enrichments, and optionally messages in a single call.
+
+Use this instead of execute_sql + get_conversation × N for bulk retrieval.
+Without include_messages, returns metadata + first/last message preview (fast orientation).
+With include_messages=True, returns full message content for all conversations.
+
+Filters are combined with AND. At least one filter or ids must be provided.
+
+Examples:
+  get_conversations(tag="python", limit=5)                  → 5 python-tagged conversations
+  get_conversations(search="bayesian inference", limit=10)  → FTS search with previews
+  get_conversations(source="anthropic", include_messages=True, limit=3) → full content
+  get_conversations(starred=True)                           → all starred conversations
+  get_conversations(ids=["abc", "def"])                     → specific conversations by ID
+"""
+        if not any([tag, source, model, search, ids, starred is not None, pinned is not None]):
+            raise ToolError("Provide at least one filter: tag, source, model, search, ids, starred, or pinned")
+
+        database = _get_db_from_ctx(mcp, ctx, db)
+
+        conds = []
+        params = []
+
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            conds.append(f"c.id IN ({placeholders})")
+            params.extend(ids)
+        if source:
+            conds.append("c.source = ?")
+            params.append(source)
+        if model:
+            conds.append("c.model = ?")
+            params.append(model)
+        if starred is True:
+            conds.append("c.starred_at IS NOT NULL")
+        elif starred is False:
+            conds.append("c.starred_at IS NULL")
+        if pinned is True:
+            conds.append("c.pinned_at IS NOT NULL")
+        elif pinned is False:
+            conds.append("c.pinned_at IS NULL")
+        if tag:
+            conds.append(
+                "EXISTS(SELECT 1 FROM tags t WHERE t.conversation_id = c.id AND t.tag = ?)"
+            )
+            params.append(tag)
+
+        # FTS search: find matching conversation IDs first
+        fts_ids = None
+        if search:
+            from memex.db import _sanitize_fts_query
+            fts_q = _sanitize_fts_query(search)
+            if fts_q:
+                try:
+                    fts_rows = database.execute_sql(
+                        "SELECT DISTINCT conversation_id FROM messages_fts "
+                        "WHERE messages_fts MATCH ? LIMIT 1000",
+                        (fts_q,),
+                    )
+                    fts_ids = [r["conversation_id"] for r in fts_rows]
+                except Exception:
+                    fts_ids = []
+                if not fts_ids:
+                    return []
+                placeholders = ",".join("?" for _ in fts_ids)
+                conds.append(f"c.id IN ({placeholders})")
+                params.extend(fts_ids)
+
+        where = " AND ".join(conds) if conds else "1=1"
+        params.append(limit)
+
+        try:
+            rows = database.execute_sql(
+                f"SELECT c.id, c.title, c.source, c.model, c.summary, "
+                f"c.message_count, c.created_at, c.updated_at, "
+                f"c.starred_at, c.pinned_at, c.archived_at, "
+                f"c.parent_conversation_id, c.sensitive, c.metadata "
+                f"FROM conversations c WHERE {where} "
+                f"ORDER BY c.updated_at DESC LIMIT ?",
+                tuple(params),
+            )
+        except Exception as e:
+            raise ToolError(str(e))
+
+        result = []
+        for row in rows:
+            conv_id = row["id"]
+
+            # Tags
+            tags = [
+                r["tag"] for r in database.execute_sql(
+                    "SELECT tag FROM tags WHERE conversation_id = ?", (conv_id,)
+                )
+            ]
+
+            # Enrichments
+            enrichments = database.get_enrichments(conv_id)
+
+            entry = {
+                "id": conv_id,
+                "title": row["title"],
+                "source": row["source"],
+                "model": row["model"],
+                "summary": row["summary"],
+                "message_count": row["message_count"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "starred": row["starred_at"] is not None,
+                "pinned": row["pinned_at"] is not None,
+                "archived": row["archived_at"] is not None,
+                "sensitive": bool(row["sensitive"]),
+                "tags": tags,
+                "enrichments": enrichments,
+            }
+
+            if include_messages:
+                # Full message content
+                messages = database.execute_sql(
+                    "SELECT id, role, content, parent_id, model, created_at "
+                    "FROM messages WHERE conversation_id = ? ORDER BY created_at",
+                    (conv_id,),
+                )
+                entry["messages"] = messages
+            else:
+                # Preview: first and last message text
+                messages = database.execute_sql(
+                    "SELECT id, role, content, created_at "
+                    "FROM messages WHERE conversation_id = ? ORDER BY created_at",
+                    (conv_id,),
+                )
+                if messages:
+                    first = messages[0]
+                    last = messages[-1] if len(messages) > 1 else None
+                    entry["first_message"] = {
+                        "role": first["role"],
+                        "preview": _extract_text(first["content"])[:500],
+                    }
+                    if last:
+                        entry["last_message"] = {
+                            "role": last["role"],
+                            "preview": _extract_text(last["content"])[:500],
+                        }
+
+            result.append(entry)
+
+        return result
 
     VALID_ENRICHMENT_TYPES = {"summary", "topic", "importance", "excerpt", "note"}
     VALID_ENRICHMENT_SOURCES = {"user", "claude", "heuristic"}

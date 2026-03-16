@@ -74,11 +74,11 @@ class TestCreateServer:
         server = create_server(db=db)
         assert server._test_db is db
 
-    def test_server_has_four_tools(self, db):
+    def test_server_has_five_tools(self, db):
         server = create_server(db=db)
         tool_names = [t.name for t in server._tool_manager._tools.values()]
         assert sorted(tool_names) == sorted([
-            "execute_sql", "get_conversation",
+            "execute_sql", "get_conversation", "get_conversations",
             "update_conversations", "append_message",
         ])
 
@@ -369,6 +369,91 @@ class TestUpdateConversationsEnrichments:
         for conv in result["updated"]:
             topics = [e["value"] for e in conv["enrichments"] if e["type"] == "topic"]
             assert "shared_topic" in topics
+
+
+class TestGetConversations:
+    """Test bulk conversation retrieval."""
+
+    def test_by_tag(self, multi_db):
+        server = create_server(db=multi_db)
+        fn = _get_tool_fn(server, "get_conversations")
+        result = fn(tag="python")
+        assert len(result) >= 1
+        for r in result:
+            assert "python" in r["tags"]
+
+    def test_by_source(self, multi_db):
+        server = create_server(db=multi_db)
+        fn = _get_tool_fn(server, "get_conversations")
+        result = fn(source="openai")
+        assert len(result) >= 1
+        for r in result:
+            assert r["source"] == "openai"
+
+    def test_by_ids(self, multi_db):
+        server = create_server(db=multi_db)
+        fn = _get_tool_fn(server, "get_conversations")
+        result = fn(ids=["c1", "c3"])
+        assert len(result) == 2
+        ids = {r["id"] for r in result}
+        assert ids == {"c1", "c3"}
+
+    def test_preview_mode(self, multi_db):
+        """Default: includes first/last message preview, not full messages."""
+        server = create_server(db=multi_db)
+        fn = _get_tool_fn(server, "get_conversations")
+        result = fn(tag="python")
+        assert len(result) >= 1
+        r = result[0]
+        assert "first_message" in r
+        assert "preview" in r["first_message"]
+        assert "messages" not in r
+
+    def test_include_messages(self, multi_db):
+        """include_messages=True returns full message content."""
+        server = create_server(db=multi_db)
+        fn = _get_tool_fn(server, "get_conversations")
+        result = fn(tag="python", include_messages=True)
+        assert len(result) >= 1
+        r = result[0]
+        assert "messages" in r
+        assert len(r["messages"]) >= 2
+
+    def test_includes_enrichments(self, multi_db):
+        multi_db.save_enrichment("c2", "topic", "coding", "claude")
+        server = create_server(db=multi_db)
+        fn = _get_tool_fn(server, "get_conversations")
+        result = fn(ids=["c2"])
+        assert len(result) == 1
+        assert len(result[0]["enrichments"]) == 1
+        assert result[0]["enrichments"][0]["value"] == "coding"
+
+    def test_limit(self, multi_db):
+        server = create_server(db=multi_db)
+        fn = _get_tool_fn(server, "get_conversations")
+        result = fn(source="openai", limit=1)
+        assert len(result) == 1
+
+    def test_requires_filter(self, multi_db):
+        from fastmcp.exceptions import ToolError
+        server = create_server(db=multi_db)
+        fn = _get_tool_fn(server, "get_conversations")
+        with pytest.raises(ToolError, match="filter"):
+            fn()
+
+    def test_fts_search(self, multi_db):
+        server = create_server(db=multi_db)
+        fn = _get_tool_fn(server, "get_conversations")
+        result = fn(search="topic 2")
+        assert len(result) >= 1
+
+    def test_starred_filter(self, multi_db):
+        multi_db.update_conversation("c1", starred=True)
+        server = create_server(db=multi_db)
+        fn = _get_tool_fn(server, "get_conversations")
+        result = fn(starred=True)
+        assert len(result) == 1
+        assert result[0]["id"] == "c1"
 
 
 class TestAppendMessage:
