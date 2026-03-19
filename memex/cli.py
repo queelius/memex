@@ -8,15 +8,44 @@ import sys
 from pathlib import Path
 
 
+def _load_cli_config():
+    """Load config for CLI commands. Cached after first call."""
+    if not hasattr(_load_cli_config, "_cache"):
+        from memex.config import load_config
+        config_path = os.environ.get("MEMEX_CONFIG", os.path.expanduser("~/.memex/config.yaml"))
+        _load_cli_config._cache = load_config(config_path)
+    return _load_cli_config._cache
+
+
+def _resolve_db_path(name_or_path: str) -> str:
+    """Resolve a --db value: config database name or literal path."""
+    config = _load_cli_config()
+    databases = config.get("databases", {})
+    if name_or_path in databases:
+        return os.path.expanduser(databases[name_or_path]["path"])
+    return os.path.expanduser(name_or_path)
+
+
+def _default_db() -> str:
+    """Default --db value: primary from config, env var, or ~/.memex/default."""
+    config = _load_cli_config()
+    primary = config.get("primary")
+    databases = config.get("databases", {})
+    if primary and primary in databases:
+        return primary
+    return os.environ.get("MEMEX_DATABASE_PATH", "~/.memex/default")
+
+
 def _open_db(args, readonly=True):
     """Open a database, exiting with an error if not found."""
     from memex.db import Database
 
-    db_path = os.path.expanduser(args.db)
+    db_name = args.db or _default_db()
+    db_path = _resolve_db_path(db_name)
     try:
         return Database(db_path, readonly=readonly)
     except FileNotFoundError:
-        print(f"Error: database not found: {args.db}", file=sys.stderr)
+        print(f"Error: database not found: {db_name}", file=sys.stderr)
         sys.exit(1)
 
 
@@ -43,7 +72,7 @@ def main():
     imp.add_argument(
         "--db",
         help="Database directory",
-        default=os.environ.get("MEMEX_DATABASE_PATH", "~/.memex/default"),
+        default=None,
     )
 
     # export
@@ -54,7 +83,7 @@ def main():
     exp.add_argument(
         "--db",
         help="Database directory",
-        default=os.environ.get("MEMEX_DATABASE_PATH", "~/.memex/default"),
+        default=None,
     )
 
     # show
@@ -65,16 +94,12 @@ def main():
     show.add_argument(
         "--db",
         help="Database directory",
-        default=os.environ.get("MEMEX_DATABASE_PATH", "~/.memex/default"),
+        default=None,
     )
 
-    # db
-    db_p = sub.add_parser("db", help="Show database statistics")
-    db_p.add_argument(
-        "--db",
-        help="Database directory",
-        default=os.environ.get("MEMEX_DATABASE_PATH", "~/.memex/default"),
-    )
+    # db (sqlflag-powered query interface)
+    db_p = sub.add_parser("db", help="Query databases.", add_help=False)
+    db_p.add_argument("_db_args", nargs=argparse.REMAINDER)
 
     # mcp
     sub.add_parser("mcp", help="Start MCP server")
@@ -88,7 +113,7 @@ def main():
     run_p.add_argument(
         "--db",
         help="Database directory",
-        default=os.environ.get("MEMEX_DATABASE_PATH", "~/.memex/default"),
+        default=None,
     )
 
     args, remaining = parser.parse_known_args()
@@ -99,7 +124,7 @@ def main():
     elif args.command == "export":
         _cmd_export(args)
     elif args.command == "db":
-        _cmd_db(args)
+        _cmd_db(args._db_args or [])
     elif args.command == "mcp":
         _cmd_mcp(args)
     elif args.command == "run":
@@ -143,7 +168,7 @@ def _cmd_import(args):
 
     from memex.db import Database
 
-    db_path = os.path.expanduser(args.db)
+    db_path = _resolve_db_path(args.db or _default_db())
     file_path = Path(args.file).resolve()
 
     if file_path.is_dir():
@@ -203,7 +228,7 @@ def _save_convs(convs, source_path, args, db):
     """
     from memex.assets import resolve_source_assets, copy_assets
 
-    db_path = os.path.expanduser(args.db)
+    db_path = _resolve_db_path(args.db or _default_db())
     source_dir = source_path if source_path.is_dir() else source_path.parent
     asset_dir = Path(db_path) / "assets"
     imported = 0
@@ -354,7 +379,6 @@ def _auto_import(file_path, format_name=None, exit_on_fail=True):
 
 
 def _cmd_show(args):
-    db_path = os.path.expanduser(args.db)
     with _open_db(args) as db:
         if args.id is None:
             # List mode
@@ -436,7 +460,6 @@ def _cmd_export(args):
 
     exporter_mod = exporters[args.format]["module"]
 
-    db_path = os.path.expanduser(args.db)
     with _open_db(args) as db:
         # Load conversations in chunks to avoid memory exhaustion
         convs = []
@@ -486,49 +509,42 @@ def _cmd_run(args, remaining):
             print(f"\nResult: {result}")
 
 
-def _cmd_db(args):
-    db_path = os.path.expanduser(args.db)
-    with _open_db(args) as db:
-        stats = db.execute_sql(
-            "SELECT COUNT(*) as n_convs, SUM(message_count) as n_msgs,"
-            " MIN(created_at) as earliest, MAX(updated_at) as latest"
-            " FROM conversations"
-        )[0]
-        sources = db.execute_sql(
-            "SELECT source, COUNT(*) as n FROM conversations"
-            " WHERE source IS NOT NULL GROUP BY source ORDER BY n DESC"
-        )
-        top_tags = db.execute_sql(
-            "SELECT tag, COUNT(*) as n FROM tags GROUP BY tag ORDER BY n DESC LIMIT 10"
-        )
-        db_file = db.db_path
+def _cmd_db(argv: list[str]):
+    """Query databases via sqlflag. Reads ~/.memex/config.yaml for multi-db."""
+    import click
+    from sqlflag.cli import SqlFlag
 
-    size_str = _format_size(os.path.getsize(db_file)) if os.path.exists(db_file) else "unknown"
-    n_convs = stats["n_convs"] or 0
-    n_msgs = stats["n_msgs"] or 0
+    config = _load_cli_config()
+    databases = config.get("databases", {})
+    primary = config.get("primary")
 
-    print(f"Database: {db_path}")
-    print(f"  File:          {db_file}  ({size_str})")
-    print(f"  Conversations: {n_convs:,}")
-    print(f"  Messages:      {n_msgs:,}")
-    if stats["earliest"] and stats["latest"]:
-        print(f"  Dates:         {stats['earliest'][:10]} → {stats['latest'][:10]}")
-    if sources:
-        print("  Sources:")
-        for row in sources:
-            print(f"    {row['source']:<20s}  {row['n']:,}")
-    if top_tags:
-        print("  Top tags:")
-        for row in top_tags:
-            print(f"    {row['tag']:<20s}  {row['n']:,}")
+    if not databases:
+        print("No databases configured. Create ~/.memex/config.yaml or set MEMEX_DATABASE_PATH.",
+              file=sys.stderr)
+        sys.exit(1)
 
+    group = click.Group(name="db", help="Query memex databases.")
 
-def _format_size(n: int) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024:
-            return f"{n:.1f} {unit}"
-        n /= 1024
-    return f"{n:.1f} TB"
+    for name, db_config in databases.items():
+        db_dir = os.path.expanduser(db_config["path"])
+        db_file = os.path.join(db_dir, "conversations.db")
+        if not os.path.exists(db_file):
+            continue
+        sf = SqlFlag(db_file, tables=db_config.get("tables"))
+        root = sf.click_app
+
+        if name == primary:
+            # Primary: mount commands directly for shortcut access
+            for cmd_name, cmd in root.commands.items():
+                group.add_command(cmd, name=cmd_name)
+
+        # Always mount as named subgroup for explicit access
+        sub = click.Group(name=name, help=f"Query {name} database.")
+        for cmd_name, cmd in root.commands.items():
+            sub.add_command(cmd, name=cmd_name)
+        group.add_command(sub)
+
+    group.main(argv)
 
 
 def _cmd_mcp(args):

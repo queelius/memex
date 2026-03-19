@@ -1128,10 +1128,10 @@ class TestCLIMissingDb:
 
 
 class TestCLIDb:
-    """Tests for 'memex db' stats command."""
+    """Tests for 'memex db' sqlflag-powered query interface."""
 
-    def _import_conversation(self, tmp_path):
-        """Import a single conversation and return db_dir."""
+    def _setup_db(self, tmp_path):
+        """Import a conversation and write a config pointing at it."""
         db_dir = tmp_path / "db"
         export_file = tmp_path / "export.json"
         export_file.write_text(json.dumps([{
@@ -1160,48 +1160,54 @@ class TestCLIDb:
             [sys.executable, "-m", "memex", "import", str(export_file), "--db", str(db_dir)],
             capture_output=True, text=True, check=True,
         )
-        return db_dir
-
-    def test_db_shows_stats(self, tmp_path):
-        db_dir = self._import_conversation(tmp_path)
-        result = subprocess.run(
-            [sys.executable, "-m", "memex", "db", "--db", str(db_dir)],
-            capture_output=True, text=True,
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            f"primary: test\ndatabases:\n  test:\n    path: {db_dir}\n"
         )
-        assert result.returncode == 0
-        assert "Conversations:" in result.stdout
-        assert "Messages:" in result.stdout
-        assert "1" in result.stdout  # 1 conversation
-        assert "2" in result.stdout  # 2 messages
+        return config_file
 
-    def test_db_shows_path_and_size(self, tmp_path):
-        db_dir = self._import_conversation(tmp_path)
-        result = subprocess.run(
-            [sys.executable, "-m", "memex", "db", "--db", str(db_dir)],
-            capture_output=True, text=True,
-        )
-        assert result.returncode == 0
-        assert "conversations.db" in result.stdout
-        # Size should show a unit (B, KB, MB, GB)
-        assert any(unit in result.stdout for unit in ("KB", "MB", "GB", " B"))
-
-    def test_db_shows_source(self, tmp_path):
-        db_dir = self._import_conversation(tmp_path)
-        result = subprocess.run(
-            [sys.executable, "-m", "memex", "db", "--db", str(db_dir)],
-            capture_output=True, text=True,
-        )
-        assert result.returncode == 0
-        assert "openai" in result.stdout  # the importer sets source=openai
-
-    def test_db_missing_shows_error(self, tmp_path):
+    def test_db_sql_query(self, tmp_path):
+        config = self._setup_db(tmp_path)
         result = subprocess.run(
             [sys.executable, "-m", "memex", "db",
-             "--db", str(tmp_path / "nonexistent")],
+             "sql", "SELECT count(*) as n FROM conversations", "--format", "json"],
             capture_output=True, text=True,
+            env={**os.environ, "MEMEX_CONFIG": str(config)},
         )
-        assert result.returncode == 1
-        assert "database not found" in result.stderr.lower()
+        assert result.returncode == 0
+        assert '"n": 1' in result.stdout
+
+    def test_db_table_query(self, tmp_path):
+        config = self._setup_db(tmp_path)
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "db",
+             "table", "conversations", "--format", "json"],
+            capture_output=True, text=True,
+            env={**os.environ, "MEMEX_CONFIG": str(config)},
+        )
+        assert result.returncode == 0
+        assert "Stats Test" in result.stdout
+
+    def test_db_schema(self, tmp_path):
+        config = self._setup_db(tmp_path)
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "db", "schema"],
+            capture_output=True, text=True,
+            env={**os.environ, "MEMEX_CONFIG": str(config)},
+        )
+        assert result.returncode == 0
+        assert "conversations" in result.stdout
+
+    def test_db_named_database(self, tmp_path):
+        config = self._setup_db(tmp_path)
+        result = subprocess.run(
+            [sys.executable, "-m", "memex", "db",
+             "test", "sql", "SELECT count(*) as n FROM conversations", "--format", "json"],
+            capture_output=True, text=True,
+            env={**os.environ, "MEMEX_CONFIG": str(config)},
+        )
+        assert result.returncode == 0
+        assert '"n": 1' in result.stdout
 
 
 class TestCLIHelp:
