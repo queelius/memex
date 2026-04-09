@@ -82,6 +82,28 @@ The HTML exporter builds a self-contained single-page app that loads the SQLite 
 - **Full browser UI**: conversation list, search, filter by source/tag, timeline sparkline
 - **Librarian chat**: ask questions about your archive. An LLM queries the database via Anthropic tool use, using the `metafunctor-edge` proxy by default (no API key required). You can also configure a direct Anthropic endpoint.
 - **Per-conversation resume chat**: continue an existing conversation
+- **Marginalia**: annotate messages and conversations with free-form notes, inline in the browser
+
+## Notes (Marginalia)
+
+Annotate messages and conversations with free-form text notes. Notes are stored in a dedicated `notes` table with FTS5 search, and appear across all surfaces (CLI, MCP, HTML SPA, exporters).
+
+```bash
+memex run note add --conv <id> "this was a turning point" --apply
+memex run note add --conv <id> --msg <id> "key insight here" --apply
+memex run note list --conv <id>
+memex run note search "turning point"
+memex run note delete <note_id> --apply
+```
+
+Notes are included in exports by default. Use `--no-notes` to strip them:
+
+```bash
+memex export ./public --format html              # includes notes
+memex export ./public --format html --no-notes   # strips notes
+```
+
+In the HTML SPA, click the pencil icon on any message or conversation header to add a note inline. Notes persist in the browser's sql.js copy and are included when you download the DB.
 
 ## Multi-Database Config
 
@@ -102,13 +124,14 @@ All CLI commands and MCP tools accept `--db <name>` (CLI) or `db=<name>` (MCP) t
 
 ## MCP Tools
 
-When running as an MCP server, memex exposes 5 tools:
+When running as an MCP server, memex exposes 6 tools:
 
 - `execute_sql`: Primary read interface. All queries via SQL (read-only by default).
 - `get_conversation`: Tree-aware retrieval + export (metadata, messages, markdown/JSON).
 - `get_conversations`: Bulk retrieval with filters (tag, source, model, search, ids) and optional full messages.
 - `update_conversations`: Modify properties, tags, and enrichments (bulk).
 - `append_message`: Add messages to conversation trees.
+- `add_note`: Annotate a message or conversation with a free-form text note.
 
 Resources: `memex://schema` (DDL + query patterns), `memex://databases` (multi-db discovery + stats).
 

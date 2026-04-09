@@ -29,7 +29,7 @@ memex/
   models.py            # ContentBlock, Message, Conversation (tree)
   db.py                # Database (raw sqlite3, WAL, FTS5, migrations)
   config.py            # YAML config, DatabaseRegistry
-  mcp.py               # FastMCP server (5 tools, 2 resources)
+  mcp.py               # FastMCP server (6 tools, 2 resources)
   assets.py            # Asset resolution, copying, media markdown rendering
   cli.py               # argparse CLI (import, export, show, mcp, run)
   scripts/
@@ -77,6 +77,7 @@ memex/
 | `get_conversations` | Bulk retrieval with filters (ids, tag, source, model, search, starred, pinned) and optional full messages. Collapses the N+1 of execute_sql + get_conversation × N. |
 | `update_conversations` | Modify conversation properties, tags, enrichments. Bulk 1..N. |
 | `append_message` | Add message to conversation tree with consistency guarantees. |
+| `add_note` | Annotate a message or conversation with a free-form text note (marginalia). |
 
 **Resources:** `memex://schema` (DDL + relationships + FTS5 docs), `memex://databases` (multi-db discovery)
 
