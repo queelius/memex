@@ -940,3 +940,90 @@ class TestCLIExportHtml:
             result = db2.query_conversations()
             assert len(result["items"]) == 1
             assert result["items"][0]["title"] == "HTML Export Test"
+
+
+class TestHtmlNotes:
+    """Tests for notes (marginalia) support in the HTML SPA template."""
+
+    def test_template_has_notes_css(self):
+        html = get_template()
+        assert ".note {" in html
+        assert ".note-composer" in html
+        assert ".add-note-btn" in html
+
+    def test_template_has_notes_js(self):
+        html = get_template()
+        assert "function loadNotesForConversation" in html
+        assert "function saveNote" in html
+        assert "function deleteNoteUI" in html
+
+    def test_template_librarian_mentions_notes(self):
+        html = get_template("CREATE TABLE notes (id TEXT);")
+        assert "NOTES:" in html
+        assert "notes table" in html
+        assert "notes_fts" in html
+
+    def test_template_has_notes_render_functions(self):
+        html = get_template()
+        assert "function renderNotesForMessage" in html
+        assert "function renderConversationNotes" in html
+        assert "function addNoteBtn" in html
+
+    def test_template_has_notes_edit_functions(self):
+        html = get_template()
+        assert "function editNote" in html
+        assert "function openNoteComposer" in html
+
+    def test_render_conversation_loads_notes(self):
+        """renderConversation should call loadNotesForConversation."""
+        html = get_template()
+        start = html.index("function renderConversation(")
+        end = html.index("function renderContent(")
+        chunk = html[start:end]
+        assert "loadNotesForConversation(conv.id)" in chunk
+
+    def test_render_conversation_renders_conversation_notes(self):
+        """renderConversation should render conversation-level notes."""
+        html = get_template()
+        start = html.index("function renderConversation(")
+        end = html.index("function renderContent(")
+        chunk = html[start:end]
+        assert "renderConversationNotes(" in chunk
+
+    def test_render_conversation_renders_message_notes(self):
+        """renderConversation should render message-level notes."""
+        html = get_template()
+        start = html.index("function renderConversation(")
+        end = html.index("function renderContent(")
+        chunk = html[start:end]
+        assert "renderNotesForMessage(" in chunk
+
+    def test_render_conversation_has_note_buttons(self):
+        """renderConversation should add note buttons for header and messages."""
+        html = get_template()
+        start = html.index("function renderConversation(")
+        end = html.index("function renderContent(")
+        chunk = html[start:end]
+        assert 'addNoteBtn("conversation"' in chunk
+        assert 'addNoteBtn("message"' in chunk
+
+    def test_load_notes_graceful_degradation(self):
+        """loadNotesForConversation should catch errors for missing table."""
+        html = get_template()
+        start = html.index("function loadNotesForConversation")
+        chunk = html[start:start + 500]
+        assert "try" in chunk
+        assert "catch" in chunk
+
+    def test_messages_have_data_msg_id(self):
+        """Message divs should get data-msg-id attributes for note targeting."""
+        html = get_template()
+        start = html.index("function renderConversation(")
+        end = html.index("function renderContent(")
+        chunk = html[start:end]
+        assert "data-msg-id" in chunk
+
+    def test_notes_cache_variable(self):
+        """Template should have the notesCache state variable."""
+        html = get_template()
+        assert "var notesCache = {}" in html
