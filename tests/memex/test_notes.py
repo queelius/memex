@@ -9,6 +9,12 @@ import pytest
 from memex.db import Database, SCHEMA_VERSION
 
 
+def _get_tool_fn(server, name):
+    """Extract a tool's underlying function from the FastMCP server."""
+    tool = server._tool_manager._tools[name]
+    return tool.fn
+
+
 class TestSchemaV4:
     def test_schema_version_is_4(self):
         assert SCHEMA_VERSION == 4
@@ -345,6 +351,86 @@ class TestDatabaseNotesCRUD:
             db.add_note(conversation_id="c1", text=f"repeated keyword token {i}")
         results = db.search_notes("keyword", limit=3)
         assert len(results) == 3
+
+
+class TestMCPAddNoteTool:
+    def _setup_db(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        db.conn.execute(
+            "INSERT INTO conversations (id, title, created_at, updated_at) "
+            "VALUES ('c1', 'Test', '2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+        )
+        db.conn.execute(
+            "INSERT INTO messages (conversation_id, id, role, content, created_at) "
+            "VALUES ('c1', 'm1', 'user', '[]', '2026-01-01 00:00:00')"
+        )
+        db.conn.commit()
+        return db
+
+    def test_add_conversation_note_via_tool(self, tmp_db_path):
+        from memex.mcp import create_server
+        db = self._setup_db(tmp_db_path)
+        server = create_server(db=db, sql_write=True)
+        add_note = _get_tool_fn(server, "add_note")
+        result = add_note(conversation_id="c1", text="a thought")
+        assert "note_id" in result
+        assert result["target_kind"] == "conversation"
+        notes = db.get_notes(conversation_id="c1")
+        assert len(notes) == 1
+        assert notes[0]["text"] == "a thought"
+        db.close()
+
+    def test_add_message_note_via_tool(self, tmp_db_path):
+        from memex.mcp import create_server
+        db = self._setup_db(tmp_db_path)
+        server = create_server(db=db, sql_write=True)
+        add_note = _get_tool_fn(server, "add_note")
+        result = add_note(conversation_id="c1", message_id="m1", text="key moment")
+        assert result["target_kind"] == "message"
+        notes = db.get_notes(conversation_id="c1", message_id="m1")
+        assert len(notes) == 1
+        db.close()
+
+    def test_add_note_rejects_readonly(self, tmp_db_path):
+        from memex.mcp import create_server
+        from fastmcp.exceptions import ToolError
+        db = self._setup_db(tmp_db_path)
+        db.close()
+        db = Database(tmp_db_path, readonly=True)
+        server = create_server(db=db, sql_write=False)
+        add_note = _get_tool_fn(server, "add_note")
+        with pytest.raises(ToolError, match="writes are disabled"):
+            add_note(conversation_id="c1", text="will fail")
+        db.close()
+
+    def test_enrichment_note_type_rejected(self, tmp_db_path):
+        from memex.mcp import create_server
+        from fastmcp.exceptions import ToolError
+        db = self._setup_db(tmp_db_path)
+        server = create_server(db=db, sql_write=True)
+        update = _get_tool_fn(server, "update_conversations")
+        with pytest.raises(ToolError, match="Invalid enrichment type"):
+            update(
+                ids=["c1"],
+                add_enrichments=[{"type": "note", "value": "x", "source": "user"}],
+            )
+        db.close()
+
+    def test_schema_resource_mentions_notes(self, tmp_db_path):
+        db = Database(tmp_db_path)
+        schema = db.get_schema()
+        assert "notes" in schema
+        assert "notes_fts" in schema
+        db.close()
+
+    def test_server_has_six_tools(self, tmp_db_path):
+        from memex.mcp import create_server
+        db = Database(tmp_db_path)
+        server = create_server(db=db, sql_write=True)
+        # Verify add_note is discoverable
+        add_note = _get_tool_fn(server, "add_note")
+        assert add_note is not None
+        db.close()
 
 
 class TestNotesOrphanSurvive:

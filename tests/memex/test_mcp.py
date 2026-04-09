@@ -74,12 +74,12 @@ class TestCreateServer:
         server = create_server(db=db)
         assert server._test_db is db
 
-    def test_server_has_five_tools(self, db):
+    def test_server_has_six_tools(self, db):
         server = create_server(db=db)
         tool_names = [t.name for t in server._tool_manager._tools.values()]
         assert sorted(tool_names) == sorted([
             "execute_sql", "get_conversation", "get_conversations",
-            "update_conversations", "append_message",
+            "update_conversations", "append_message", "add_note",
         ])
 
     def test_server_has_two_resources(self, db):

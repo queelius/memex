@@ -411,7 +411,7 @@ Examples:
 
         return result
 
-    VALID_ENRICHMENT_TYPES = {"summary", "topic", "importance", "excerpt", "note"}
+    VALID_ENRICHMENT_TYPES = {"summary", "topic", "importance", "excerpt"}
     VALID_ENRICHMENT_SOURCES = {"user", "claude", "heuristic"}
 
     @mcp.tool(annotations={"idempotentHint": True})
@@ -510,6 +510,42 @@ Examples:
             }
         except ValueError as e:
             raise ToolError(str(e))
+
+    @mcp.tool()
+    def add_note(
+        conversation_id: Annotated[str, Field(description="Conversation ID the note attaches to")],
+        text: Annotated[str, Field(description="Free-form text content of the note")],
+        message_id: Annotated[str | None, Field(description="Message ID for message-level note (omit for conversation-level)")] = None,
+        db: Annotated[str | None, Field(description="Target database")] = None,
+        ctx: Context = None,
+    ) -> dict:
+        """Add a free-form text note (marginalia) to a message or conversation.
+
+Use this when the user wants to annotate something in their archive with
+their own observations, thoughts, or corrections. If message_id is provided,
+creates a message-level note. Otherwise creates a conversation-level note.
+
+Notes are searchable via execute_sql against notes_fts (FTS5):
+  SELECT n.* FROM notes_fts f JOIN notes n ON n.id = f.note_id WHERE notes_fts MATCH 'query'
+"""
+        database = _get_db_from_ctx(mcp, ctx, db)
+        if database.readonly:
+            raise ToolError(
+                "SQL writes are disabled for this database. "
+                "Set MEMEX_SQL_WRITE=true to enable."
+            )
+        try:
+            note_id = database.add_note(
+                conversation_id=conversation_id,
+                message_id=message_id,
+                text=text,
+            )
+        except (ValueError, sqlite3.IntegrityError) as e:
+            raise ToolError(str(e))
+        return {
+            "note_id": note_id,
+            "target_kind": "message" if message_id else "conversation",
+        }
 
 
 def _register_resources(mcp: FastMCP):
