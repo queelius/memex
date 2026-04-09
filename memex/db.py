@@ -1011,6 +1011,150 @@ class Database:
             self.conn.rollback()
             raise
 
+    # ── Notes (marginalia) ──────────────────────────────────────
+
+    def add_note(
+        self,
+        *,
+        conversation_id: str,
+        text: str,
+        message_id: Optional[str] = None,
+        note_id: Optional[str] = None,
+    ) -> str:
+        """Add a free-form text note to a conversation or message.
+
+        If message_id is provided, creates a message-level note
+        (target_kind='message'). Otherwise creates a conversation-level note
+        (target_kind='conversation'). Returns the note id.
+        """
+        import uuid as _uuid
+        if note_id is None:
+            note_id = str(_uuid.uuid4())
+        target_kind = "message" if message_id else "conversation"
+        now = _fmt_dt(datetime.now())
+        try:
+            self.conn.execute(
+                "INSERT INTO notes "
+                "(id, target_kind, conversation_id, message_id, text, "
+                "created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (note_id, target_kind, conversation_id, message_id, text, now, now),
+            )
+            self.conn.execute(
+                "INSERT INTO notes_fts "
+                "(note_id, conversation_id, message_id, text) "
+                "VALUES (?, ?, ?, ?)",
+                (note_id, conversation_id, message_id, text),
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        return note_id
+
+    def update_note(self, note_id: str, text: str) -> bool:
+        """Update an existing note's text and bump updated_at. Returns True if a row was updated."""
+        now = _fmt_dt(datetime.now())
+        try:
+            cursor = self.conn.execute(
+                "UPDATE notes SET text = ?, updated_at = ? WHERE id = ?",
+                (text, now, note_id),
+            )
+            if cursor.rowcount == 0:
+                self.conn.commit()
+                return False
+            # Re-index FTS5: DELETE old row, INSERT new with fresh text
+            row = self.conn.execute(
+                "SELECT conversation_id, message_id FROM notes WHERE id = ?",
+                (note_id,),
+            ).fetchone()
+            self.conn.execute(
+                "DELETE FROM notes_fts WHERE note_id = ?", (note_id,)
+            )
+            if row is not None:
+                self.conn.execute(
+                    "INSERT INTO notes_fts "
+                    "(note_id, conversation_id, message_id, text) "
+                    "VALUES (?, ?, ?, ?)",
+                    (note_id, row["conversation_id"], row["message_id"], text),
+                )
+            self.conn.commit()
+            return True
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def delete_note(self, note_id: str) -> bool:
+        """Delete a note and its FTS5 entry. Returns True if a row was deleted."""
+        try:
+            self.conn.execute(
+                "DELETE FROM notes_fts WHERE note_id = ?", (note_id,)
+            )
+            cursor = self.conn.execute(
+                "DELETE FROM notes WHERE id = ?", (note_id,)
+            )
+            self.conn.commit()
+            return cursor.rowcount > 0
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def get_notes(
+        self,
+        *,
+        conversation_id: Optional[str] = None,
+        message_id: Optional[str] = None,
+        target_kind: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Query notes filtered by conversation, message, or target kind.
+
+        With no filters, returns all notes in the database. Results are
+        ordered by created_at ascending.
+        """
+        conds = []
+        params: List[Any] = []
+        if conversation_id is not None:
+            conds.append("conversation_id = ?")
+            params.append(conversation_id)
+        if message_id is not None:
+            conds.append("message_id = ?")
+            params.append(message_id)
+        if target_kind is not None:
+            conds.append("target_kind = ?")
+            params.append(target_kind)
+        where = " AND ".join(conds) if conds else "1=1"
+        rows = self.conn.execute(
+            f"SELECT id, target_kind, conversation_id, message_id, text, "
+            f"created_at, updated_at FROM notes WHERE {where} "
+            f"ORDER BY created_at ASC",
+            tuple(params),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def search_notes(
+        self, query: str, limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        """FTS5 search across note text. Returns note dicts in match order."""
+        sanitized = _sanitize_fts_query(query)
+        if not sanitized:
+            return []
+        fts_rows = self.conn.execute(
+            "SELECT note_id FROM notes_fts WHERE notes_fts MATCH ? LIMIT ?",
+            (sanitized, limit),
+        ).fetchall()
+        ids = [r["note_id"] for r in fts_rows]
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        rows = self.conn.execute(
+            f"SELECT id, target_kind, conversation_id, message_id, text, "
+            f"created_at, updated_at FROM notes WHERE id IN ({placeholders})",
+            tuple(ids),
+        ).fetchall()
+        # Preserve FTS match order
+        by_id = {r["id"]: dict(r) for r in rows}
+        return [by_id[i] for i in ids if i in by_id]
+
     # ── Provenance ──────────────────────────────────────────────
 
     def save_provenance(
