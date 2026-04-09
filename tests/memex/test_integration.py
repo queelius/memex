@@ -620,13 +620,14 @@ class TestParentConversation:
         conn.commit()
         conn.close()
 
-        # Open with Database — should auto-migrate to v3
+        # Open with Database, should auto-migrate to current SCHEMA_VERSION
         db = Database(str(db_dir))
-        # Verify version is 3
+        # Verify version is at the current SCHEMA_VERSION (chains v2 -> v3 -> ...)
+        from memex.db import SCHEMA_VERSION
         row = db.execute_sql("SELECT version FROM schema_version")
-        assert row[0]["version"] == 3
+        assert row[0]["version"] == SCHEMA_VERSION
 
-        # Verify column exists
+        # Verify parent_conversation_id column was added in v3 migration
         conv = db.load_conversation("test")
         assert conv is not None
         assert conv.parent_conversation_id is None

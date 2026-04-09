@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from memex.models import Conversation, Message
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS conversations (
@@ -59,6 +59,21 @@ CREATE TABLE IF NOT EXISTS provenance (
     importer_version TEXT,
     PRIMARY KEY (conversation_id, source_type)
 );
+CREATE TABLE IF NOT EXISTS notes (
+    id TEXT PRIMARY KEY,
+    target_kind TEXT NOT NULL CHECK (target_kind IN ('message', 'conversation')),
+    conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+    message_id TEXT,
+    text TEXT NOT NULL,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+    note_id UNINDEXED, conversation_id UNINDEXED, message_id UNINDEXED, text,
+    tokenize = 'porter unicode61'
+);
+CREATE INDEX IF NOT EXISTS idx_notes_target ON notes(conversation_id, message_id);
+CREATE INDEX IF NOT EXISTS idx_notes_kind ON notes(target_kind);
 CREATE INDEX IF NOT EXISTS idx_conversations_source ON conversations(source);
 CREATE INDEX IF NOT EXISTS idx_conversations_model ON conversations(model);
 CREATE INDEX IF NOT EXISTS idx_conversations_created ON conversations(created_at);
@@ -123,9 +138,55 @@ def _migrate_to_v3(conn):
     conn.commit()
 
 
+def _migrate_to_v4(conn):
+    """Add notes and notes_fts tables, migrate existing enrichment 'note' entries."""
+    import uuid as _uuid
+
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS notes (
+            id TEXT PRIMARY KEY,
+            target_kind TEXT NOT NULL CHECK (target_kind IN ('message', 'conversation')),
+            conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+            message_id TEXT,
+            text TEXT NOT NULL,
+            created_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+            note_id UNINDEXED, conversation_id UNINDEXED, message_id UNINDEXED, text,
+            tokenize = 'porter unicode61'
+        );
+        CREATE INDEX IF NOT EXISTS idx_notes_target ON notes(conversation_id, message_id);
+        CREATE INDEX IF NOT EXISTS idx_notes_kind ON notes(target_kind);
+    """)
+
+    # Migrate any existing conversation-level notes from enrichments into notes table
+    rows = conn.execute(
+        "SELECT conversation_id, value, created_at FROM enrichments WHERE type = 'note'"
+    ).fetchall()
+    for row in rows:
+        note_id = str(_uuid.uuid4())
+        conv_id = row["conversation_id"]
+        value = row["value"]
+        created_at = row["created_at"]
+        conn.execute(
+            "INSERT INTO notes (id, target_kind, conversation_id, message_id, text, "
+            "created_at, updated_at) VALUES (?, 'conversation', ?, NULL, ?, ?, ?)",
+            (note_id, conv_id, value, created_at, created_at),
+        )
+        conn.execute(
+            "INSERT INTO notes_fts (note_id, conversation_id, message_id, text) "
+            "VALUES (?, ?, NULL, ?)",
+            (note_id, conv_id, value),
+        )
+    conn.execute("DELETE FROM enrichments WHERE type = 'note'")
+    conn.commit()
+
+
 MIGRATIONS: Dict[int, callable] = {
     1: _migrate_to_v2,
     2: _migrate_to_v3,
+    3: _migrate_to_v4,
 }
 
 
