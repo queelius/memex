@@ -15,10 +15,19 @@ def export(conversations: List[Conversation], path: str, **kwargs) -> None:
     - conversations.jsonl  -- one record per message (arkiv universal format)
     - README.md            -- YAML frontmatter (ECHO self-description)
     - schema.yaml          -- metadata key statistics
+
+    Parameters
+    ----------
+    include_notes : bool
+        Include message-level notes in record metadata (default True).
+    db : Database | None
+        Database instance for querying notes.
     """
     os.makedirs(path, exist_ok=True)
 
-    records = _build_records(conversations)
+    include_notes = kwargs.get("include_notes", True)
+    db = kwargs.get("db")
+    records = _build_records(conversations, include_notes=include_notes, db=db)
 
     # Write JSONL
     jsonl_path = os.path.join(path, "conversations.jsonl")
@@ -37,10 +46,25 @@ def export(conversations: List[Conversation], path: str, **kwargs) -> None:
     )
 
 
-def _build_records(conversations: List[Conversation]) -> List[Dict[str, Any]]:
+def _build_records(
+    conversations: List[Conversation],
+    *,
+    include_notes: bool = True,
+    db: Any = None,
+) -> List[Dict[str, Any]]:
     """Convert conversations to arkiv records (one per message)."""
     records = []
     for conv in conversations:
+        # Pre-fetch message-level notes for this conversation
+        msg_notes: Dict[str, List[Dict[str, Any]]] = {}
+        if include_notes and db:
+            for note in db.get_notes(
+                conversation_id=conv.id, target_kind="message"
+            ):
+                mid = note.get("message_id")
+                if mid:
+                    msg_notes.setdefault(mid, []).append(note)
+
         conv_tags = conv.tags
         for msg in conv.messages.values():
             text = msg.get_text()
@@ -65,6 +89,13 @@ def _build_records(conversations: List[Conversation]) -> List[Dict[str, Any]]:
             metadata["message_id"] = msg.id
             if conv_tags:
                 metadata["tags"] = conv_tags
+
+            # Attach message-level notes
+            notes_for_msg = msg_notes.get(msg.id, [])
+            if notes_for_msg:
+                metadata["notes"] = [
+                    {"id": n["id"], "text": n["text"]} for n in notes_for_msg
+                ]
 
             records.append(
                 {

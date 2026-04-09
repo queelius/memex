@@ -445,3 +445,370 @@ class TestNotesOrphanSurvive:
         assert len(rows) == 1
         assert rows[0]["text"] == "survive me"
         assert rows[0]["conversation_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# CLI script tests for memex/scripts/note.py
+# ---------------------------------------------------------------------------
+
+class TestNoteScript:
+    """Tests for the note CLI script using _cmd_run (same pattern as TestCLIRun)."""
+
+    @staticmethod
+    def _db_dir(db):
+        """Get the directory path that _open_db / Database() expects."""
+        return os.path.dirname(db.db_path)
+
+    def _run(self, db, script_args, apply=False, capsys=None):
+        """Run the note script via _cmd_run with the given arguments."""
+        import argparse as _ap
+        from memex.cli import _cmd_run
+
+        args = _ap.Namespace(
+            name="note",
+            list=False,
+            apply=apply,
+            verbose=False,
+            db=self._db_dir(db),
+        )
+        _cmd_run(args, script_args)
+        if capsys is not None:
+            return capsys.readouterr().out
+        return ""
+
+    def test_note_script_discovered(self):
+        """note script is discoverable via the framework."""
+        from memex.scripts import load_script
+        mod = load_script("note")
+        assert hasattr(mod, "register_args")
+        assert hasattr(mod, "run")
+        assert mod.__doc__
+
+    def test_add_dry_run(self, db_with_conversation, capsys):
+        db = db_with_conversation
+        out = self._run(
+            db, ["add", "--conv", "c1", "my", "dry", "note"],
+            apply=False, capsys=capsys,
+        )
+        assert "DRY" in out
+        assert "my dry note" in out
+        # Nothing written
+        assert db.get_notes(conversation_id="c1") == []
+
+    def test_add_apply(self, db_with_conversation, capsys):
+        db = db_with_conversation
+        out = self._run(
+            db, ["add", "--conv", "c1", "a", "real", "note"],
+            apply=True, capsys=capsys,
+        )
+        assert "Added" in out
+        notes = db.get_notes(conversation_id="c1")
+        assert len(notes) == 1
+        assert notes[0]["text"] == "a real note"
+        assert notes[0]["target_kind"] == "conversation"
+
+    def test_add_message_level(self, db_with_conversation, capsys):
+        db = db_with_conversation
+        out = self._run(
+            db, ["add", "--conv", "c1", "--msg", "m1", "msg", "note"],
+            apply=True, capsys=capsys,
+        )
+        assert "message" in out
+        notes = db.get_notes(conversation_id="c1", message_id="m1")
+        assert len(notes) == 1
+        assert notes[0]["target_kind"] == "message"
+
+    def test_add_missing_conv(self, db_with_conversation, capsys):
+        db = db_with_conversation
+        out = self._run(
+            db, ["add", "orphan", "text"],
+            apply=True, capsys=capsys,
+        )
+        assert "Error" in out
+
+    def test_add_missing_text(self, db_with_conversation, capsys):
+        db = db_with_conversation
+        out = self._run(
+            db, ["add", "--conv", "c1"],
+            apply=True, capsys=capsys,
+        )
+        assert "Error" in out
+
+    def test_list(self, db_with_conversation, capsys):
+        db = db_with_conversation
+        db.add_note(conversation_id="c1", text="note one")
+        db.add_note(conversation_id="c1", text="note two")
+        out = self._run(
+            db, ["list", "--conv", "c1"],
+            apply=False, capsys=capsys,
+        )
+        assert "note one" in out
+        assert "note two" in out
+        assert "2 note(s)" in out
+
+    def test_list_empty(self, db_with_conversation, capsys):
+        db = db_with_conversation
+        out = self._run(
+            db, ["list", "--conv", "c1"],
+            apply=False, capsys=capsys,
+        )
+        assert "No notes found" in out
+
+    def test_list_missing_conv(self, db_with_conversation, capsys):
+        db = db_with_conversation
+        out = self._run(
+            db, ["list"],
+            apply=False, capsys=capsys,
+        )
+        assert "Error" in out
+
+    def test_list_filters_by_msg(self, db_with_conversation, capsys):
+        db = db_with_conversation
+        db.add_note(conversation_id="c1", text="conv-level")
+        db.add_note(conversation_id="c1", message_id="m1", text="msg-level")
+        out = self._run(
+            db, ["list", "--conv", "c1", "--msg", "m1"],
+            apply=False, capsys=capsys,
+        )
+        assert "msg-level" in out
+        assert "conv-level" not in out
+        assert "1 note(s)" in out
+
+    def test_search(self, db_with_conversation, capsys):
+        db = db_with_conversation
+        db.add_note(conversation_id="c1", text="quantum entanglement idea")
+        db.add_note(conversation_id="c1", text="grocery list")
+        out = self._run(
+            db, ["search", "quantum"],
+            apply=False, capsys=capsys,
+        )
+        assert "quantum" in out
+        assert "1 result(s)" in out
+
+    def test_search_no_results(self, db_with_conversation, capsys):
+        db = db_with_conversation
+        db.add_note(conversation_id="c1", text="something")
+        out = self._run(
+            db, ["search", "nonexistent"],
+            apply=False, capsys=capsys,
+        )
+        assert "No matching notes found" in out
+
+    def test_search_missing_query(self, db_with_conversation, capsys):
+        db = db_with_conversation
+        out = self._run(
+            db, ["search"],
+            apply=False, capsys=capsys,
+        )
+        assert "Error" in out
+
+    def test_search_multi_word_query(self, db_with_conversation, capsys):
+        db = db_with_conversation
+        db.add_note(conversation_id="c1", text="deep learning transformers note")
+        out = self._run(
+            db, ["search", "deep", "learning"],
+            apply=False, capsys=capsys,
+        )
+        assert "deep learning" in out
+
+    def test_delete_dry_run(self, db_with_conversation, capsys):
+        db = db_with_conversation
+        note_id = db.add_note(conversation_id="c1", text="ephemeral")
+        out = self._run(
+            db, ["delete", note_id],
+            apply=False, capsys=capsys,
+        )
+        assert "DRY" in out
+        # Not deleted
+        assert len(db.get_notes(conversation_id="c1")) == 1
+
+    def test_delete_apply(self, db_with_conversation, capsys):
+        db = db_with_conversation
+        note_id = db.add_note(conversation_id="c1", text="ephemeral")
+        out = self._run(
+            db, ["delete", note_id],
+            apply=True, capsys=capsys,
+        )
+        assert "Deleted" in out
+        assert db.get_notes(conversation_id="c1") == []
+
+    def test_delete_missing_id(self, db_with_conversation, capsys):
+        db = db_with_conversation
+        out = self._run(
+            db, ["delete"],
+            apply=True, capsys=capsys,
+        )
+        assert "Error" in out
+
+    def test_delete_nonexistent(self, db_with_conversation, capsys):
+        db = db_with_conversation
+        out = self._run(
+            db, ["delete", "bogus-id"],
+            apply=True, capsys=capsys,
+        )
+        assert "not found" in out
+
+
+# ---------------------------------------------------------------------------
+# Exporter notes tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def db_with_notes(tmp_path):
+    """A database with one conversation, one message, and notes on each."""
+    db = Database(str(tmp_path / "export-notes-db"))
+    db.conn.execute(
+        "INSERT INTO conversations (id, title, created_at, updated_at) "
+        "VALUES ('c1', 'Noted Conv', '2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+    )
+    db.conn.execute(
+        "INSERT INTO messages (conversation_id, id, role, content, created_at) "
+        "VALUES ('c1', 'm1', 'user', '[{\"type\":\"text\",\"text\":\"hello\"}]', "
+        "'2026-01-01 00:00:00')"
+    )
+    db.conn.commit()
+    db.add_note(conversation_id="c1", text="conv-level annotation")
+    db.add_note(conversation_id="c1", message_id="m1", text="msg-level annotation")
+    yield db
+    db.close()
+
+
+def _load_conv(db):
+    """Load the single test conversation from the db."""
+    return db.load_conversation("c1")
+
+
+class TestMarkdownExportNotes:
+    def test_markdown_includes_conv_note(self, db_with_notes, tmp_path):
+        from memex.exporters.markdown import export
+        conv = _load_conv(db_with_notes)
+        out = str(tmp_path / "out.md")
+        export([conv], out, db=db_with_notes, include_notes=True)
+        text = open(out).read()
+        assert "conv-level annotation" in text
+
+    def test_markdown_includes_msg_note(self, db_with_notes, tmp_path):
+        from memex.exporters.markdown import export
+        conv = _load_conv(db_with_notes)
+        out = str(tmp_path / "out.md")
+        export([conv], out, db=db_with_notes, include_notes=True)
+        text = open(out).read()
+        assert "msg-level annotation" in text
+
+    def test_markdown_notes_are_blockquotes(self, db_with_notes, tmp_path):
+        from memex.exporters.markdown import export
+        conv = _load_conv(db_with_notes)
+        out = str(tmp_path / "out.md")
+        export([conv], out, db=db_with_notes, include_notes=True)
+        text = open(out).read()
+        assert "> **Note:** conv-level annotation" in text
+        assert "> **Note:** msg-level annotation" in text
+
+    def test_markdown_no_notes_flag(self, db_with_notes, tmp_path):
+        from memex.exporters.markdown import export
+        conv = _load_conv(db_with_notes)
+        out = str(tmp_path / "out.md")
+        export([conv], out, db=db_with_notes, include_notes=False)
+        text = open(out).read()
+        assert "conv-level annotation" not in text
+        assert "msg-level annotation" not in text
+
+    def test_markdown_no_db_still_works(self, db_with_notes, tmp_path):
+        from memex.exporters.markdown import export
+        conv = _load_conv(db_with_notes)
+        out = str(tmp_path / "out.md")
+        export([conv], out)  # no db, no include_notes -- should not crash
+        text = open(out).read()
+        assert "Noted Conv" in text
+        assert "annotation" not in text
+
+
+class TestJSONExportNotes:
+    def test_json_includes_conv_notes(self, db_with_notes, tmp_path):
+        import json
+        from memex.exporters.json_export import export
+        conv = _load_conv(db_with_notes)
+        out = str(tmp_path / "out.json")
+        export([conv], out, db=db_with_notes, include_notes=True)
+        data = json.loads(open(out).read())
+        assert len(data) == 1
+        assert "notes" in data[0]
+        conv_notes = data[0]["notes"]
+        assert any(n["text"] == "conv-level annotation" for n in conv_notes)
+
+    def test_json_includes_msg_notes(self, db_with_notes, tmp_path):
+        import json
+        from memex.exporters.json_export import export
+        conv = _load_conv(db_with_notes)
+        out = str(tmp_path / "out.json")
+        export([conv], out, db=db_with_notes, include_notes=True)
+        data = json.loads(open(out).read())
+        msg = data[0]["messages"][0]
+        assert "notes" in msg
+        assert any(n["text"] == "msg-level annotation" for n in msg["notes"])
+
+    def test_json_no_notes_flag(self, db_with_notes, tmp_path):
+        import json
+        from memex.exporters.json_export import export
+        conv = _load_conv(db_with_notes)
+        out = str(tmp_path / "out.json")
+        export([conv], out, db=db_with_notes, include_notes=False)
+        data = json.loads(open(out).read())
+        assert "notes" not in data[0]
+        assert "notes" not in data[0]["messages"][0]
+
+    def test_json_no_db_still_works(self, db_with_notes, tmp_path):
+        import json
+        from memex.exporters.json_export import export
+        conv = _load_conv(db_with_notes)
+        out = str(tmp_path / "out.json")
+        export([conv], out)
+        data = json.loads(open(out).read())
+        assert data[0]["id"] == "c1"
+        assert "notes" not in data[0]
+
+
+class TestArkivExportNotes:
+    """Test arkiv export notes via _build_records (avoids __version__ import
+    shadowing issue when running under tests/memex/)."""
+
+    def _import_build_records(self):
+        """Import _build_records from arkiv_export, working around the
+        tests/memex/ __init__.py shadowing the real memex package."""
+        import importlib.util
+        mod_path = os.path.join(
+            os.path.dirname(__file__), "..", "..", "memex", "exporters", "arkiv_export.py"
+        )
+        spec = importlib.util.spec_from_file_location("arkiv_export", mod_path,
+                                                       submodule_search_locations=[])
+        mod = importlib.util.module_from_spec(spec)
+        # Patch memex.__version__ so the module can load
+        import memex as _memex_pkg
+        if not hasattr(_memex_pkg, "__version__"):
+            _memex_pkg.__version__ = "0.0.0-test"
+        spec.loader.exec_module(mod)
+        return mod._build_records
+
+    def test_arkiv_includes_msg_notes(self, db_with_notes):
+        build = self._import_build_records()
+        conv = _load_conv(db_with_notes)
+        records = build([conv], include_notes=True, db=db_with_notes)
+        assert len(records) == 1
+        meta = records[0]["metadata"]
+        assert "notes" in meta
+        assert any(n["text"] == "msg-level annotation" for n in meta["notes"])
+
+    def test_arkiv_no_notes_flag(self, db_with_notes):
+        build = self._import_build_records()
+        conv = _load_conv(db_with_notes)
+        records = build([conv], include_notes=False, db=db_with_notes)
+        assert len(records) == 1
+        assert "notes" not in records[0]["metadata"]
+
+    def test_arkiv_no_db_still_works(self, db_with_notes):
+        build = self._import_build_records()
+        conv = _load_conv(db_with_notes)
+        records = build([conv])
+        assert len(records) == 1
+        assert "notes" not in records[0]["metadata"]

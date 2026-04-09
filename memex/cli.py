@@ -80,6 +80,8 @@ def main():
     exp.add_argument("output", nargs="?", help="Output file path")
     exp.add_argument("--format", default="markdown", help="Export format (use --list-formats to see available)")
     exp.add_argument("--list-formats", action="store_true", help="List available export formats")
+    exp.add_argument("--no-notes", action="store_true",
+                     help="Exclude notes from exported output")
     exp.add_argument(
         "--db",
         help="Database directory",
@@ -483,7 +485,13 @@ def _cmd_export(args):
             if not result["has_more"]:
                 break
             cursor = result["next_cursor"]
-        exporter_mod.export(convs, args.output, db_path=db.db_path)
+        include_notes = not getattr(args, "no_notes", False)
+        exporter_mod.export(
+            convs, args.output,
+            db_path=db.db_path,
+            db=db,
+            include_notes=include_notes,
+        )
         print(f"Exported {len(convs)} conversation(s) to {args.output}")
 
 
