@@ -362,7 +362,17 @@ def _auto_import(file_path, format_name=None, exit_on_fail=True):
                 sys.exit(1)
             print(f"Warning: failed to import {file_path}: {e}", file=sys.stderr)
             return None
-    for name, info in importers.items():
+    # Preferred order: claude_code_full wins over claude_code when both
+    # detect (both share the same detect function, so otherwise the
+    # alphabetically-earlier skeleton importer would always win).
+    _PREFERRED = ("claude_code_full",)
+    ordered = list(_PREFERRED) + [
+        n for n in importers.keys() if n not in _PREFERRED
+    ]
+    for name in ordered:
+        info = importers.get(name)
+        if info is None:
+            continue
         if info["module"].detect(file_path):
             try:
                 return info["module"].import_path(file_path)

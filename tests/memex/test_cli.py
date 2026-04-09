@@ -7,12 +7,16 @@ import sys
 
 class TestCLIVersion:
     def test_version_flag(self):
+        # Read version from the installed package metadata to avoid
+        # pytest's tests/memex/__init__.py shadowing the real package.
+        from importlib.metadata import version
+        pkg_version = version("py-memex")
         result = subprocess.run(
             [sys.executable, "-m", "memex", "--version"],
             capture_output=True, text=True,
         )
         assert result.returncode == 0
-        assert "0.1.0" in result.stdout
+        assert pkg_version in result.stdout
 
 
 class TestCLIImport:
@@ -106,11 +110,12 @@ class TestCLIImportClaudeCode:
         )
         assert result.returncode == 0
         assert "Imported 1 conversation" in result.stdout
-        # Verify provenance was saved
+        # Verify provenance was saved. Auto-import prefers claude_code_full
+        # when both detect the same file, so accept either source_type.
         db = Database(str(db_dir))
         prov = db.get_provenance("sess-cli-test")
         assert len(prov) == 1
-        assert prov[0]["source_type"] == "claude_code"
+        assert prov[0]["source_type"] in ("claude_code", "claude_code_full")
         db.close()
 
 
@@ -1181,7 +1186,7 @@ class TestCLIDb:
         config = self._setup_db(tmp_path)
         result = subprocess.run(
             [sys.executable, "-m", "memex", "db",
-             "table", "conversations", "--format", "json"],
+             "conversations", "--format", "json"],
             capture_output=True, text=True,
             env={**os.environ, "MEMEX_CONFIG": str(config)},
         )

@@ -18,10 +18,34 @@ from memex.models import Message
 
 @asynccontextmanager
 async def lifespan(server):
-    """Initialize database registry from config on server startup."""
+    """Initialize database registry from config on server startup.
+
+    Resolution order matches the CLI:
+      1. MEMEX_CONFIG env var (if set and file exists)
+      2. ~/.memex/config.yaml (if exists)
+      3. MEMEX_DATABASE_PATH env var (single-db fallback)
+      4. ~/.memex/default (last-resort single-db fallback)
+    """
     import os
+    import logging
+    from pathlib import Path
+
+    log = logging.getLogger("memex.mcp")
     config_path = os.environ.get("MEMEX_CONFIG")
+    if not config_path:
+        default_yaml = Path.home() / ".memex" / "config.yaml"
+        if default_yaml.exists():
+            config_path = str(default_yaml)
     config = load_config(config_path)
+    if not config.get("databases"):
+        fallback = Path.home() / ".memex" / "default"
+        config["databases"] = {"default": {"path": str(fallback)}}
+        config["primary"] = "default"
+        log.warning(
+            "No memex config found. Using fallback database at %s. "
+            "Set MEMEX_CONFIG or create ~/.memex/config.yaml to configure.",
+            fallback,
+        )
     registry = DatabaseRegistry(config)
     try:
         yield {"registry": registry}
@@ -286,25 +310,27 @@ Examples:
             params.append(tag)
 
         # FTS search: find matching conversation IDs first
-        fts_ids = None
         if search:
             from memex.db import _sanitize_fts_query
             fts_q = _sanitize_fts_query(search)
-            if fts_q:
-                try:
-                    fts_rows = database.execute_sql(
-                        "SELECT DISTINCT conversation_id FROM messages_fts "
-                        "WHERE messages_fts MATCH ? LIMIT 1000",
-                        (fts_q,),
-                    )
-                    fts_ids = [r["conversation_id"] for r in fts_rows]
-                except Exception:
-                    fts_ids = []
-                if not fts_ids:
-                    return []
-                placeholders = ",".join("?" for _ in fts_ids)
-                conds.append(f"c.id IN ({placeholders})")
-                params.extend(fts_ids)
+            if not fts_q:
+                # Query sanitized to empty (only stop-words, punctuation, etc.)
+                # Return empty rather than silently ignoring the search filter.
+                return []
+            try:
+                fts_rows = database.execute_sql(
+                    "SELECT DISTINCT conversation_id FROM messages_fts "
+                    "WHERE messages_fts MATCH ? LIMIT 1000",
+                    (fts_q,),
+                )
+                fts_ids = [r["conversation_id"] for r in fts_rows]
+            except Exception:
+                fts_ids = []
+            if not fts_ids:
+                return []
+            placeholders = ",".join("?" for _ in fts_ids)
+            conds.append(f"c.id IN ({placeholders})")
+            params.extend(fts_ids)
 
         where = " AND ".join(conds) if conds else "1=1"
         params.append(limit)
@@ -430,6 +456,13 @@ Examples:
                     raise ToolError("Each remove_enrichments entry must have 'type' and 'value'")
 
         database = _get_db_from_ctx(mcp, ctx, db)
+        # Fail fast on readonly databases: the whole call is going to fail,
+        # don't crash mid-loop leaving caller with a partial-update state.
+        if database.readonly:
+            raise ToolError(
+                "SQL writes are disabled for this database. "
+                "Set MEMEX_SQL_WRITE=true to enable."
+            )
         updated = []
         errors = []
         for cid in ids:
@@ -447,7 +480,7 @@ Examples:
                     database.save_enrichments(cid, add_enrichments)
                 conv = database.load_conversation(cid)
                 updated.append(_conv_metadata(conv, database))
-            except ValueError as e:
+            except (ValueError, sqlite3.OperationalError) as e:
                 errors.append({"id": cid, "error": str(e)})
         return {"updated": updated, "errors": errors}
 

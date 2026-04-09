@@ -277,9 +277,48 @@ class TestHtmlRendering:
         """renderMedia should fall back to link for unknown media types."""
         html = get_template()
         start = html.index("function renderMedia(")
-        chunk = html[start:start + 800]
+        # renderMedia ends where the next top-level function begins.
+        end = html.index("function renderMarkdown(", start)
+        chunk = html[start:end]
         assert "<a href" in chunk
         assert "target" in chunk
+
+    def test_render_media_uses_attribute_escaping(self):
+        """renderMedia must use escAttr (not esc) for attribute values to
+        prevent quote-based attribute escape XSS."""
+        html = get_template()
+        start = html.index("function renderMedia(")
+        end = html.index("function renderMarkdown(", start)
+        chunk = html[start:end]
+        # All src= and href= values should be wrapped in escAttr(), never plain esc()
+        assert 'src="\' + escAttr(' in chunk
+        assert 'href="\' + escAttr(' in chunk
+
+    def test_render_media_has_url_scheme_allowlist(self):
+        """renderMedia must reject javascript:/vbscript: URLs via safeMediaUrl."""
+        html = get_template()
+        # safeMediaUrl helper should exist and be called from renderMedia
+        assert "function safeMediaUrl(" in html
+        start = html.index("function renderMedia(")
+        end = html.index("function renderMarkdown(", start)
+        chunk = html[start:end]
+        assert "safeMediaUrl(" in chunk
+
+    def test_execute_tool_rejects_non_select(self):
+        """executeTool must reject anything that isn't SELECT or EXPLAIN,
+        including WITH (which can mutate via data-modifying CTE)."""
+        html = get_template()
+        start = html.index("function executeTool(")
+        # Extract until the next function definition after executeTool.
+        end = html.index("function ", start + 1)
+        chunk = html[start:end]
+        # First-word check should only allow SELECT and EXPLAIN
+        assert '"SELECT"' in chunk
+        assert '"EXPLAIN"' in chunk
+        # WITH must NOT be on the allowlist (data-modifying CTEs bypass it)
+        assert '"WITH"' not in chunk
+        # And we check getRowsModified as defense in depth
+        assert "getRowsModified" in chunk
 
     def test_render_markdown_escapes_html_first(self):
         """renderMarkdown should escape HTML entities before markdown transforms."""

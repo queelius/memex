@@ -29,7 +29,7 @@ memex/
   models.py            # ContentBlock, Message, Conversation (tree)
   db.py                # Database (raw sqlite3, WAL, FTS5, migrations)
   config.py            # YAML config, DatabaseRegistry
-  mcp.py               # FastMCP server (4 tools, 2 resources)
+  mcp.py               # FastMCP server (5 tools, 2 resources)
   assets.py            # Asset resolution, copying, media markdown rendering
   cli.py               # argparse CLI (import, export, show, mcp, run)
   scripts/
@@ -72,8 +72,9 @@ memex/
 
 | Tool | Purpose |
 |---|---|
-| `execute_sql` | Primary read interface — all queries via SQL. Schema available via `memex://schema`. |
+| `execute_sql` | Primary read interface for arbitrary SQL. Schema available via `memex://schema`. |
 | `get_conversation` | Tree-aware retrieval + export (3 modes: metadata, messages, export) |
+| `get_conversations` | Bulk retrieval with filters (ids, tag, source, model, search, starred, pinned) and optional full messages. Collapses the N+1 of execute_sql + get_conversation × N. |
 | `update_conversations` | Modify conversation properties, tags, enrichments. Bulk 1..N. |
 | `append_message` | Add message to conversation tree with consistency guarantees. |
 
