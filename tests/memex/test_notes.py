@@ -16,8 +16,9 @@ def _get_tool_fn(server, name):
 
 
 class TestSchemaV4:
-    def test_schema_version_is_4(self):
-        assert SCHEMA_VERSION == 4
+    def test_schema_version_is_at_least_4(self):
+        # Notes landed in v4; later versions must still include the table.
+        assert SCHEMA_VERSION >= 4
 
     def test_fresh_database_has_notes_table(self, tmp_path):
         db = Database(str(tmp_path / "testdb"))

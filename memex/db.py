@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from memex.models import Conversation, Message
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS conversations (
@@ -66,14 +66,64 @@ CREATE TABLE IF NOT EXISTS notes (
     message_id TEXT,
     text TEXT NOT NULL,
     created_at DATETIME NOT NULL,
-    updated_at DATETIME NOT NULL
+    updated_at DATETIME NOT NULL,
+    -- Marginalia v2 additions (schema v5):
+    kind TEXT NOT NULL DEFAULT 'freeform',
+    anchor_start INTEGER,
+    anchor_end INTEGER,
+    anchor_hash TEXT,
+    parent_note_id TEXT REFERENCES notes(id) ON DELETE CASCADE
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
     note_id UNINDEXED, conversation_id UNINDEXED, message_id UNINDEXED, text,
     tokenize = 'porter unicode61'
 );
 CREATE INDEX IF NOT EXISTS idx_notes_target ON notes(conversation_id, message_id);
-CREATE INDEX IF NOT EXISTS idx_notes_kind ON notes(target_kind);
+CREATE INDEX IF NOT EXISTS idx_notes_target_kind ON notes(target_kind);
+CREATE INDEX IF NOT EXISTS idx_notes_kind ON notes(kind);
+CREATE INDEX IF NOT EXISTS idx_notes_parent ON notes(parent_note_id) WHERE parent_note_id IS NOT NULL;
+
+-- Graph spine (schema v5): typed edges between any two entities.
+-- No foreign keys across kinds — stale edges may exist after node deletion
+-- and can be swept with db.prune_stale_edges().
+CREATE TABLE IF NOT EXISTS edges (
+    id TEXT PRIMARY KEY,
+    from_kind TEXT NOT NULL,
+    from_id TEXT NOT NULL,
+    to_kind TEXT NOT NULL,
+    to_id TEXT NOT NULL,
+    edge_type TEXT NOT NULL,
+    metadata JSON NOT NULL DEFAULT '{}',
+    created_at DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_kind, from_id, edge_type);
+CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_kind, to_id, edge_type);
+CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(edge_type);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_unique
+    ON edges(from_kind, from_id, to_kind, to_id, edge_type);
+
+-- Trails (schema v5): Vannevar Bush's classical memex — named ordered paths
+-- through the archive. Steps may target any entity kind (conversation,
+-- message, note, external_ref, etc.). Trail steps are intentionally not
+-- FK-constrained to preserve curated content when source entities change.
+CREATE TABLE IF NOT EXISTS trails (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    metadata JSON NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS trail_steps (
+    trail_id TEXT NOT NULL REFERENCES trails(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    target_kind TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    annotation TEXT,
+    PRIMARY KEY (trail_id, position)
+);
+CREATE INDEX IF NOT EXISTS idx_trail_steps_target
+    ON trail_steps(target_kind, target_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_source ON conversations(source);
 CREATE INDEX IF NOT EXISTS idx_conversations_model ON conversations(model);
 CREATE INDEX IF NOT EXISTS idx_conversations_created ON conversations(created_at);
@@ -183,10 +233,103 @@ def _migrate_to_v4(conn):
     conn.commit()
 
 
+def _migrate_to_v5(conn):
+    """Graph spine + trails + marginalia v2.
+
+    Additive migration:
+    - ALTER TABLE notes to add: kind, anchor_start, anchor_end, anchor_hash,
+      parent_note_id. All are nullable or have defaults so existing rows are
+      unaffected.
+    - CREATE TABLE edges: typed relationships between any two entities.
+      Polymorphic (from_kind, from_id) → (to_kind, to_id). No cross-kind FK
+      enforcement; use prune_stale_edges() to sweep dangling refs.
+    - CREATE TABLE trails + trail_steps: Bush-style named paths.
+    """
+    # Notes v2 columns. SQLite ALTER TABLE ADD COLUMN restrictions:
+    #  - NOT NULL requires a DEFAULT (kind has 'freeform')
+    #  - FK REFERENCES is allowed when existing rows get NULL
+    # Guarded against duplicates because pre-existing (un-versioned) DBs
+    # may have created the notes table directly from SCHEMA_SQL before
+    # this migration runs — see _create_missing_tables.
+    _new_note_columns = [
+        "ALTER TABLE notes ADD COLUMN kind TEXT NOT NULL DEFAULT 'freeform'",
+        "ALTER TABLE notes ADD COLUMN anchor_start INTEGER",
+        "ALTER TABLE notes ADD COLUMN anchor_end INTEGER",
+        "ALTER TABLE notes ADD COLUMN anchor_hash TEXT",
+        "ALTER TABLE notes ADD COLUMN parent_note_id TEXT "
+        "REFERENCES notes(id) ON DELETE CASCADE",
+    ]
+    for stmt in _new_note_columns:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e):
+                raise
+
+    # Rename/add indexes. idx_notes_kind previously indexed target_kind in
+    # the v4 SCHEMA_SQL but that index name is now used for the new 'kind'
+    # column. We preserve the old target_kind index under a new name.
+    conn.executescript("""
+        DROP INDEX IF EXISTS idx_notes_kind;
+        CREATE INDEX IF NOT EXISTS idx_notes_target_kind
+            ON notes(target_kind);
+        CREATE INDEX IF NOT EXISTS idx_notes_kind ON notes(kind);
+        CREATE INDEX IF NOT EXISTS idx_notes_parent
+            ON notes(parent_note_id)
+            WHERE parent_note_id IS NOT NULL;
+    """)
+
+    # Graph edges: polymorphic typed relationships.
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS edges (
+            id TEXT PRIMARY KEY,
+            from_kind TEXT NOT NULL,
+            from_id TEXT NOT NULL,
+            to_kind TEXT NOT NULL,
+            to_id TEXT NOT NULL,
+            edge_type TEXT NOT NULL,
+            metadata JSON NOT NULL DEFAULT '{}',
+            created_at DATETIME NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_edges_from
+            ON edges(from_kind, from_id, edge_type);
+        CREATE INDEX IF NOT EXISTS idx_edges_to
+            ON edges(to_kind, to_id, edge_type);
+        CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(edge_type);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_unique
+            ON edges(from_kind, from_id, to_kind, to_id, edge_type);
+    """)
+
+    # Trails and trail steps.
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS trails (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            description TEXT,
+            created_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL,
+            metadata JSON NOT NULL DEFAULT '{}'
+        );
+        CREATE TABLE IF NOT EXISTS trail_steps (
+            trail_id TEXT NOT NULL REFERENCES trails(id) ON DELETE CASCADE,
+            position INTEGER NOT NULL,
+            target_kind TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            annotation TEXT,
+            PRIMARY KEY (trail_id, position)
+        );
+        CREATE INDEX IF NOT EXISTS idx_trail_steps_target
+            ON trail_steps(target_kind, target_id);
+    """)
+
+    conn.commit()
+
+
 MIGRATIONS: Dict[int, callable] = {
     1: _migrate_to_v2,
     2: _migrate_to_v3,
     3: _migrate_to_v4,
+    4: _migrate_to_v5,
 }
 
 
@@ -1020,12 +1163,29 @@ class Database:
         text: str,
         message_id: Optional[str] = None,
         note_id: Optional[str] = None,
+        kind: str = "freeform",
+        anchor_start: Optional[int] = None,
+        anchor_end: Optional[int] = None,
+        anchor_hash: Optional[str] = None,
+        parent_note_id: Optional[str] = None,
     ) -> str:
         """Add a free-form text note to a conversation or message.
 
         If message_id is provided, creates a message-level note
         (target_kind='message'). Otherwise creates a conversation-level note
         (target_kind='conversation'). Returns the note id.
+
+        Marginalia v2 (schema v5):
+            kind: note classifier, e.g. 'freeform', 'highlight', 'question',
+                'contradiction', 'synthesis', 'todo'. Applications define
+                their own vocabulary.
+            anchor_start, anchor_end: character offsets pinning the note
+                to a range within the target message's text content.
+            anchor_hash: SHA-256 of the anchored substring. If the source
+                content changes, the hash mismatch lets validators detect
+                the note has drifted off its anchor.
+            parent_note_id: if given, threads this note as a reply to
+                another note. Deleting the parent cascades to the reply.
         """
         import uuid as _uuid
         if note_id is None:
@@ -1036,9 +1196,14 @@ class Database:
             self.conn.execute(
                 "INSERT INTO notes "
                 "(id, target_kind, conversation_id, message_id, text, "
-                "created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (note_id, target_kind, conversation_id, message_id, text, now, now),
+                "created_at, updated_at, kind, anchor_start, anchor_end, "
+                "anchor_hash, parent_note_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    note_id, target_kind, conversation_id, message_id, text,
+                    now, now, kind, anchor_start, anchor_end, anchor_hash,
+                    parent_note_id,
+                ),
             )
             self.conn.execute(
                 "INSERT INTO notes_fts "
@@ -1305,3 +1470,295 @@ class Database:
             }
             for m in path
         ]
+
+    # ── Edges (graph spine, schema v5) ────────────────────────────────────
+
+    def add_edge(
+        self,
+        from_kind: str, from_id: str,
+        to_kind: str, to_id: str,
+        edge_type: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        edge_id: Optional[str] = None,
+    ) -> str:
+        """Insert a typed edge between any two entities.
+
+        Raises sqlite3.IntegrityError if an edge of the same edge_type
+        already exists between these two nodes (UNIQUE index enforces it).
+        Different edge_types between the same nodes are allowed.
+        """
+        import uuid as _uuid
+        if edge_id is None:
+            edge_id = str(_uuid.uuid4())
+        now = _fmt_dt(datetime.now())
+        try:
+            self.conn.execute(
+                "INSERT INTO edges "
+                "(id, from_kind, from_id, to_kind, to_id, edge_type, metadata, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    edge_id, from_kind, from_id, to_kind, to_id, edge_type,
+                    json.dumps(metadata or {}), now,
+                ),
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        return edge_id
+
+    def get_edges(
+        self,
+        *,
+        node_kind: Optional[str] = None,
+        node_id: Optional[str] = None,
+        direction: str = "both",
+        edge_type: Optional[str] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """Query edges around a single node.
+
+        Args:
+            node_kind, node_id: The node whose edges to return.
+                If omitted, queries all edges (optionally filtered by edge_type).
+            direction: "out" (node is source), "in" (node is target),
+                or "both" (either end). Ignored when node_id is None.
+            edge_type: Optional filter on the edge's type.
+        """
+        if direction not in ("out", "in", "both"):
+            raise ValueError(f"direction must be out|in|both, got {direction!r}")
+
+        conds: List[str] = []
+        params: List[Any] = []
+
+        if node_id is not None:
+            if direction == "out":
+                conds.append("from_id = ?")
+                params.append(node_id)
+                if node_kind:
+                    conds.append("from_kind = ?")
+                    params.append(node_kind)
+            elif direction == "in":
+                conds.append("to_id = ?")
+                params.append(node_id)
+                if node_kind:
+                    conds.append("to_kind = ?")
+                    params.append(node_kind)
+            else:  # both
+                if node_kind:
+                    conds.append(
+                        "((from_kind = ? AND from_id = ?) "
+                        "OR (to_kind = ? AND to_id = ?))"
+                    )
+                    params.extend([node_kind, node_id, node_kind, node_id])
+                else:
+                    conds.append("(from_id = ? OR to_id = ?)")
+                    params.extend([node_id, node_id])
+
+        if edge_type:
+            conds.append("edge_type = ?")
+            params.append(edge_type)
+
+        where = " AND ".join(conds) if conds else "1=1"
+        params.append(limit)
+        rows = self.conn.execute(
+            f"SELECT id, from_kind, from_id, to_kind, to_id, edge_type, "
+            f"metadata, created_at FROM edges WHERE {where} "
+            f"ORDER BY created_at DESC LIMIT ?",
+            tuple(params),
+        ).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["metadata"] = json.loads(d["metadata"]) if d["metadata"] else {}
+            result.append(d)
+        return result
+
+    def delete_edge(self, edge_id: str) -> bool:
+        """Delete an edge by id. Returns True if a row was deleted."""
+        try:
+            cursor = self.conn.execute(
+                "DELETE FROM edges WHERE id = ?", (edge_id,)
+            )
+            self.conn.commit()
+            return cursor.rowcount > 0
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    # ── Trails (curated paths, schema v5) ─────────────────────────────────
+
+    def create_trail(
+        self,
+        title: str,
+        description: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        trail_id: Optional[str] = None,
+    ) -> str:
+        """Create an empty trail. Steps are added via add_trail_step."""
+        import uuid as _uuid
+        if trail_id is None:
+            trail_id = str(_uuid.uuid4())
+        now = _fmt_dt(datetime.now())
+        try:
+            self.conn.execute(
+                "INSERT INTO trails (id, title, description, created_at, updated_at, metadata) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (trail_id, title, description, now, now, json.dumps(metadata or {})),
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        return trail_id
+
+    def add_trail_step(
+        self,
+        trail_id: str,
+        target_kind: str, target_id: str,
+        annotation: Optional[str] = None,
+        position: Optional[int] = None,
+    ) -> int:
+        """Append a step to a trail.
+
+        If position is None, appends at the end (max position + 1).
+        If position is given, shifts subsequent steps down by 1 to insert.
+        Returns the final position of the inserted step.
+        """
+        try:
+            if position is None:
+                row = self.conn.execute(
+                    "SELECT COALESCE(MAX(position), -1) + 1 AS next "
+                    "FROM trail_steps WHERE trail_id = ?",
+                    (trail_id,),
+                ).fetchone()
+                position = row["next"]
+            else:
+                # Shift existing steps at/after `position` down by 1.
+                # A naive `position = position + 1` collides with the PK
+                # because SQLite checks uniqueness per-row during UPDATE.
+                # Two-pass via a safe negative offset avoids any collision
+                # (assumes no trail exceeds _SHIFT_OFFSET steps).
+                _SHIFT_OFFSET = 1_000_000
+                self.conn.execute(
+                    "UPDATE trail_steps SET position = position - ? "
+                    "WHERE trail_id = ? AND position >= ?",
+                    (_SHIFT_OFFSET, trail_id, position),
+                )
+                self.conn.execute(
+                    "UPDATE trail_steps SET position = position + ? "
+                    "WHERE trail_id = ? AND position < 0",
+                    (_SHIFT_OFFSET + 1, trail_id),
+                )
+            self.conn.execute(
+                "INSERT INTO trail_steps "
+                "(trail_id, position, target_kind, target_id, annotation) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (trail_id, position, target_kind, target_id, annotation),
+            )
+            self.conn.execute(
+                "UPDATE trails SET updated_at = ? WHERE id = ?",
+                (_fmt_dt(datetime.now()), trail_id),
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        return position
+
+    def walk_trail(self, trail_id: str) -> List[Dict[str, Any]]:
+        """Return the trail's steps in order."""
+        rows = self.conn.execute(
+            "SELECT position, target_kind, target_id, annotation "
+            "FROM trail_steps WHERE trail_id = ? ORDER BY position",
+            (trail_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_trail(self, trail_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a trail's metadata. Returns None if not found."""
+        row = self.conn.execute(
+            "SELECT id, title, description, created_at, updated_at, metadata "
+            "FROM trails WHERE id = ?",
+            (trail_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        d["metadata"] = json.loads(d["metadata"]) if d["metadata"] else {}
+        return d
+
+    def list_trails(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """List trails, most recently updated first."""
+        rows = self.conn.execute(
+            "SELECT t.id, t.title, t.description, t.created_at, t.updated_at, "
+            "COUNT(s.position) AS step_count "
+            "FROM trails t LEFT JOIN trail_steps s ON s.trail_id = t.id "
+            "GROUP BY t.id ORDER BY t.updated_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def trails_containing(
+        self, target_kind: str, target_id: str,
+    ) -> List[Dict[str, Any]]:
+        """Find all trails that reference a given entity."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT t.id, t.title, t.description, "
+            "t.created_at, t.updated_at, s.position, s.annotation "
+            "FROM trails t JOIN trail_steps s ON s.trail_id = t.id "
+            "WHERE s.target_kind = ? AND s.target_id = ? "
+            "ORDER BY t.updated_at DESC",
+            (target_kind, target_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_trail(self, trail_id: str) -> bool:
+        """Delete a trail (and its steps, via CASCADE)."""
+        try:
+            cursor = self.conn.execute(
+                "DELETE FROM trails WHERE id = ?", (trail_id,)
+            )
+            self.conn.commit()
+            return cursor.rowcount > 0
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    # ── Edge maintenance ─────────────────────────────────────────────────
+
+    def prune_stale_edges(self) -> int:
+        """Delete edges whose endpoints no longer exist.
+
+        Sweeps the known entity kinds (conversation, message, note, trail)
+        and deletes any edge whose from_id or to_id has no matching row.
+        Edges pointing to unknown kinds (external_ref, etc.) are left alone.
+        Returns the number of edges deleted.
+        """
+        known = {
+            "conversation": "SELECT id FROM conversations",
+            "message": "SELECT id FROM messages",
+            "note": "SELECT id FROM notes",
+            "trail": "SELECT id FROM trails",
+        }
+        deleted = 0
+        try:
+            for kind, id_sql in known.items():
+                # Delete edges where the kind matches but the id isn't in the
+                # corresponding live-id set.
+                c1 = self.conn.execute(
+                    f"DELETE FROM edges WHERE from_kind = ? "
+                    f"AND from_id NOT IN ({id_sql})",
+                    (kind,),
+                )
+                c2 = self.conn.execute(
+                    f"DELETE FROM edges WHERE to_kind = ? "
+                    f"AND to_id NOT IN ({id_sql})",
+                    (kind,),
+                )
+                deleted += c1.rowcount + c2.rowcount
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        return deleted
