@@ -7,6 +7,7 @@ Convention: each script is a Python module with:
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 from typing import Any, Dict
 
@@ -20,9 +21,15 @@ def _user_dir() -> Path:
 
 
 def _load_module(name: str, path: Path):
-    """Load a Python module from a file path."""
-    spec = importlib.util.spec_from_file_location(f"memex_script_{name}", path)
+    """Load a Python module from a file path.
+
+    Registers the module in sys.modules so @dataclass and similar
+    metaclass-based decorators can look up their own module.
+    """
+    mod_name = f"memex_script_{name}"
+    spec = importlib.util.spec_from_file_location(mod_name, path)
     mod = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = mod
     spec.loader.exec_module(mod)
     return mod
 
