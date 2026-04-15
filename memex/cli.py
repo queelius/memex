@@ -99,10 +99,6 @@ def main():
         default=None,
     )
 
-    # db (sqlflag-powered query interface)
-    db_p = sub.add_parser("db", help="Query databases.", add_help=False)
-    db_p.add_argument("_db_args", nargs=argparse.REMAINDER)
-
     # mcp
     sub.add_parser("mcp", help="Start MCP server")
 
@@ -125,8 +121,6 @@ def main():
         _cmd_show(args)
     elif args.command == "export":
         _cmd_export(args)
-    elif args.command == "db":
-        _cmd_db(args._db_args or [])
     elif args.command == "mcp":
         _cmd_mcp(args)
     elif args.command == "run":
@@ -525,44 +519,6 @@ def _cmd_run(args, remaining):
         result = mod.run(db, script_args, apply=args.apply)
         if args.verbose and result:
             print(f"\nResult: {result}")
-
-
-def _cmd_db(argv: list[str]):
-    """Query databases via sqlflag. Reads ~/.memex/config.yaml for multi-db."""
-    import click
-    from sqlflag.cli import SqlFlag
-
-    config = _load_cli_config()
-    databases = config.get("databases", {})
-    primary = config.get("primary")
-
-    if not databases:
-        print("No databases configured. Create ~/.memex/config.yaml or set MEMEX_DATABASE_PATH.",
-              file=sys.stderr)
-        sys.exit(1)
-
-    group = click.Group(name="db", help="Query memex databases.")
-
-    for name, db_config in databases.items():
-        db_dir = os.path.expanduser(db_config["path"])
-        db_file = os.path.join(db_dir, "conversations.db")
-        if not os.path.exists(db_file):
-            continue
-        sf = SqlFlag(db_file, tables=db_config.get("tables"))
-        root = sf.click_app
-
-        if name == primary:
-            # Primary: mount commands directly for shortcut access
-            for cmd_name, cmd in root.commands.items():
-                group.add_command(cmd, name=cmd_name)
-
-        # Always mount as named subgroup for explicit access
-        sub = click.Group(name=name, help=f"Query {name} database.")
-        for cmd_name, cmd in root.commands.items():
-            sub.add_command(cmd, name=cmd_name)
-        group.add_command(sub)
-
-    group.main(argv)
 
 
 def _cmd_mcp(args):

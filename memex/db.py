@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from memex.models import Conversation, Message
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS conversations (
@@ -102,28 +102,6 @@ CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(edge_type);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_unique
     ON edges(from_kind, from_id, to_kind, to_id, edge_type);
 
--- Trails (schema v5): Vannevar Bush's classical memex — named ordered paths
--- through the archive. Steps may target any entity kind (conversation,
--- message, note, external_ref, etc.). Trail steps are intentionally not
--- FK-constrained to preserve curated content when source entities change.
-CREATE TABLE IF NOT EXISTS trails (
-    id TEXT PRIMARY KEY,
-    title TEXT NOT NULL,
-    description TEXT,
-    created_at DATETIME NOT NULL,
-    updated_at DATETIME NOT NULL,
-    metadata JSON NOT NULL DEFAULT '{}'
-);
-CREATE TABLE IF NOT EXISTS trail_steps (
-    trail_id TEXT NOT NULL REFERENCES trails(id) ON DELETE CASCADE,
-    position INTEGER NOT NULL,
-    target_kind TEXT NOT NULL,
-    target_id TEXT NOT NULL,
-    annotation TEXT,
-    PRIMARY KEY (trail_id, position)
-);
-CREATE INDEX IF NOT EXISTS idx_trail_steps_target
-    ON trail_steps(target_kind, target_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_source ON conversations(source);
 CREATE INDEX IF NOT EXISTS idx_conversations_model ON conversations(model);
 CREATE INDEX IF NOT EXISTS idx_conversations_created ON conversations(created_at);
@@ -234,7 +212,7 @@ def _migrate_to_v4(conn):
 
 
 def _migrate_to_v5(conn):
-    """Graph spine + trails + marginalia v2.
+    """Graph spine + marginalia v2.
 
     Additive migration:
     - ALTER TABLE notes to add: kind, anchor_start, anchor_end, anchor_hash,
@@ -243,7 +221,11 @@ def _migrate_to_v5(conn):
     - CREATE TABLE edges: typed relationships between any two entities.
       Polymorphic (from_kind, from_id) → (to_kind, to_id). No cross-kind FK
       enforcement; use prune_stale_edges() to sweep dangling refs.
-    - CREATE TABLE trails + trail_steps: Bush-style named paths.
+
+    Note: v5 originally also created trails and trail_steps tables.
+    Those have been removed in v6 (see _migrate_to_v6). This migration
+    retains the trails creation for databases upgrading 4→5→6 in sequence;
+    v6 will drop them.
     """
     # Notes v2 columns. SQLite ALTER TABLE ADD COLUMN restrictions:
     #  - NOT NULL requires a DEFAULT (kind has 'freeform')
@@ -325,11 +307,31 @@ def _migrate_to_v5(conn):
     conn.commit()
 
 
+def _migrate_to_v6(conn):
+    """Drop trails and trail_steps.
+
+    Trails moved to the meta-memex layer (cross-archive coordinator).
+    Each archive is now domain-focused; cross-archive operations like
+    trails live above in meta-memex. See ~/github/beta/meta-memex/docs/
+    for the new design.
+
+    Existing trail data is discarded. This is acceptable because trails
+    were brand new in v5 and not yet in production use.
+    """
+    conn.executescript("""
+        DROP INDEX IF EXISTS idx_trail_steps_target;
+        DROP TABLE IF EXISTS trail_steps;
+        DROP TABLE IF EXISTS trails;
+    """)
+    conn.commit()
+
+
 MIGRATIONS: Dict[int, callable] = {
     1: _migrate_to_v2,
     2: _migrate_to_v3,
     3: _migrate_to_v4,
     4: _migrate_to_v5,
+    5: _migrate_to_v6,
 }
 
 
@@ -1586,151 +1588,12 @@ class Database:
             self.conn.rollback()
             raise
 
-    # ── Trails (curated paths, schema v5) ─────────────────────────────────
-
-    def create_trail(
-        self,
-        title: str,
-        description: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        trail_id: Optional[str] = None,
-    ) -> str:
-        """Create an empty trail. Steps are added via add_trail_step."""
-        import uuid as _uuid
-        if trail_id is None:
-            trail_id = str(_uuid.uuid4())
-        now = _fmt_dt(datetime.now())
-        try:
-            self.conn.execute(
-                "INSERT INTO trails (id, title, description, created_at, updated_at, metadata) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (trail_id, title, description, now, now, json.dumps(metadata or {})),
-            )
-            self.conn.commit()
-        except Exception:
-            self.conn.rollback()
-            raise
-        return trail_id
-
-    def add_trail_step(
-        self,
-        trail_id: str,
-        target_kind: str, target_id: str,
-        annotation: Optional[str] = None,
-        position: Optional[int] = None,
-    ) -> int:
-        """Append a step to a trail.
-
-        If position is None, appends at the end (max position + 1).
-        If position is given, shifts subsequent steps down by 1 to insert.
-        Returns the final position of the inserted step.
-        """
-        try:
-            if position is None:
-                row = self.conn.execute(
-                    "SELECT COALESCE(MAX(position), -1) + 1 AS next "
-                    "FROM trail_steps WHERE trail_id = ?",
-                    (trail_id,),
-                ).fetchone()
-                position = row["next"]
-            else:
-                # Shift existing steps at/after `position` down by 1.
-                # A naive `position = position + 1` collides with the PK
-                # because SQLite checks uniqueness per-row during UPDATE.
-                # Two-pass via a safe negative offset avoids any collision
-                # (assumes no trail exceeds _SHIFT_OFFSET steps).
-                _SHIFT_OFFSET = 1_000_000
-                self.conn.execute(
-                    "UPDATE trail_steps SET position = position - ? "
-                    "WHERE trail_id = ? AND position >= ?",
-                    (_SHIFT_OFFSET, trail_id, position),
-                )
-                self.conn.execute(
-                    "UPDATE trail_steps SET position = position + ? "
-                    "WHERE trail_id = ? AND position < 0",
-                    (_SHIFT_OFFSET + 1, trail_id),
-                )
-            self.conn.execute(
-                "INSERT INTO trail_steps "
-                "(trail_id, position, target_kind, target_id, annotation) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (trail_id, position, target_kind, target_id, annotation),
-            )
-            self.conn.execute(
-                "UPDATE trails SET updated_at = ? WHERE id = ?",
-                (_fmt_dt(datetime.now()), trail_id),
-            )
-            self.conn.commit()
-        except Exception:
-            self.conn.rollback()
-            raise
-        return position
-
-    def walk_trail(self, trail_id: str) -> List[Dict[str, Any]]:
-        """Return the trail's steps in order."""
-        rows = self.conn.execute(
-            "SELECT position, target_kind, target_id, annotation "
-            "FROM trail_steps WHERE trail_id = ? ORDER BY position",
-            (trail_id,),
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-    def get_trail(self, trail_id: str) -> Optional[Dict[str, Any]]:
-        """Fetch a trail's metadata. Returns None if not found."""
-        row = self.conn.execute(
-            "SELECT id, title, description, created_at, updated_at, metadata "
-            "FROM trails WHERE id = ?",
-            (trail_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        d = dict(row)
-        d["metadata"] = json.loads(d["metadata"]) if d["metadata"] else {}
-        return d
-
-    def list_trails(self, limit: int = 50) -> List[Dict[str, Any]]:
-        """List trails, most recently updated first."""
-        rows = self.conn.execute(
-            "SELECT t.id, t.title, t.description, t.created_at, t.updated_at, "
-            "COUNT(s.position) AS step_count "
-            "FROM trails t LEFT JOIN trail_steps s ON s.trail_id = t.id "
-            "GROUP BY t.id ORDER BY t.updated_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-    def trails_containing(
-        self, target_kind: str, target_id: str,
-    ) -> List[Dict[str, Any]]:
-        """Find all trails that reference a given entity."""
-        rows = self.conn.execute(
-            "SELECT DISTINCT t.id, t.title, t.description, "
-            "t.created_at, t.updated_at, s.position, s.annotation "
-            "FROM trails t JOIN trail_steps s ON s.trail_id = t.id "
-            "WHERE s.target_kind = ? AND s.target_id = ? "
-            "ORDER BY t.updated_at DESC",
-            (target_kind, target_id),
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-    def delete_trail(self, trail_id: str) -> bool:
-        """Delete a trail (and its steps, via CASCADE)."""
-        try:
-            cursor = self.conn.execute(
-                "DELETE FROM trails WHERE id = ?", (trail_id,)
-            )
-            self.conn.commit()
-            return cursor.rowcount > 0
-        except Exception:
-            self.conn.rollback()
-            raise
-
     # ── Edge maintenance ─────────────────────────────────────────────────
 
     def prune_stale_edges(self) -> int:
         """Delete edges whose endpoints no longer exist.
 
-        Sweeps the known entity kinds (conversation, message, note, trail)
+        Sweeps the known entity kinds (conversation, message, note)
         and deletes any edge whose from_id or to_id has no matching row.
         Edges pointing to unknown kinds (external_ref, etc.) are left alone.
         Returns the number of edges deleted.
@@ -1739,7 +1602,6 @@ class Database:
             "conversation": "SELECT id FROM conversations",
             "message": "SELECT id FROM messages",
             "note": "SELECT id FROM notes",
-            "trail": "SELECT id FROM trails",
         }
         deleted = 0
         try:

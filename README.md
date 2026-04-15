@@ -31,12 +31,9 @@ memex show <id>                          # view a conversation
 memex show --search "topic"              # full-text search
 ```
 
-**Database stats (sqlflag-powered):**
+**Query the database:** use the MCP server (for LLM agents) or `sqlite3` directly:
 ```bash
-memex db                                 # list subcommands
-memex db conversations --format json     # query conversations table
-memex db schema                          # inspect structure
-memex db sql "SELECT count(*) FROM conversations"
+sqlite3 ~/.memex/conversations/conversations.db "SELECT count(*) FROM conversations"
 ```
 
 **Export:**

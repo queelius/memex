@@ -1,10 +1,13 @@
-"""Tests for schema v5: edges, trails, marginalia v2.
+"""Tests for schema v5/v6: edges and marginalia v2.
+
+v5 introduced edges, trails, and notes v2 columns.
+v6 removed trails (moved to meta-memex).
 
 Covers:
-- v4 → v5 migration preserves existing notes, adds new columns with defaults
-- Unversioned (pre-v1) → v5 migration works (the _create_missing_tables path)
+- v4 → v5 → v6 migration preserves existing notes, adds new columns with defaults
+- Unversioned (pre-v1) → v6 migration works (the _create_missing_tables path)
+- v6 drops trails and trail_steps tables
 - Edges: add/get/delete, uniqueness, direction filtering
-- Trails: create, add steps, walk, reverse-index (trails containing a node)
 - Notes v2: anchor fields, parent-child cascade, kind field
 - prune_stale_edges sweeps dangling refs
 """
@@ -37,11 +40,11 @@ def seeded_db(db):
     return db
 
 
-class TestSchemaV5:
+class TestSchema:
     def test_schema_version(self):
-        assert SCHEMA_VERSION == 5
+        assert SCHEMA_VERSION == 6
 
-    def test_fresh_db_has_v5_tables(self, db):
+    def test_fresh_db_has_edges_table(self, db):
         tables = {
             r["name"]
             for r in db.conn.execute(
@@ -49,8 +52,17 @@ class TestSchemaV5:
             ).fetchall()
         }
         assert "edges" in tables
-        assert "trails" in tables
-        assert "trail_steps" in tables
+
+    def test_fresh_db_has_no_trails_tables(self, db):
+        """v6 removed trails; fresh database should not have them."""
+        tables = {
+            r["name"]
+            for r in db.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert "trails" not in tables
+        assert "trail_steps" not in tables
 
     def test_fresh_db_has_notes_v2_columns(self, db):
         cols = {r["name"] for r in db.conn.execute("PRAGMA table_info(notes)").fetchall()}
@@ -64,9 +76,9 @@ class TestSchemaV5:
         assert "idx_edges_unique" in idxs
 
 
-class TestV4ToV5Migration:
+class TestMigration:
     def test_preserves_existing_notes(self, tmp_db_path, tmp_path):
-        """An existing v4 DB should migrate to v5 without losing notes data."""
+        """An existing v4 DB should migrate forward without losing notes data."""
         import os
         # Build a v4 database shape manually.
         db_file = os.path.join(tmp_db_path, "conversations.db")
@@ -87,7 +99,7 @@ class TestV4ToV5Migration:
 
         # Re-open via Database: migrations should run.
         db = Database(tmp_db_path)
-        assert db.conn.execute("SELECT version FROM schema_version").fetchone()["version"] == 5
+        assert db.conn.execute("SELECT version FROM schema_version").fetchone()["version"] == SCHEMA_VERSION
 
         row = db.conn.execute(
             "SELECT id, text, kind, anchor_start, parent_note_id FROM notes WHERE id='n1'"
@@ -97,6 +109,16 @@ class TestV4ToV5Migration:
         assert row["kind"] == "freeform"
         assert row["anchor_start"] is None
         assert row["parent_note_id"] is None
+
+        # v6: trails tables should not exist (dropped by migration)
+        tables = {
+            r["name"]
+            for r in db.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert "trails" not in tables
+        assert "trail_steps" not in tables
 
     def test_migration_is_idempotent_on_preexisting_unversioned_db(self, tmp_path):
         """An un-versioned DB (no schema_version table) bootstraps cleanly."""
@@ -119,9 +141,9 @@ class TestV4ToV5Migration:
         """)
         raw.commit()
         raw.close()
-        # Opening the DB should drive it all the way to v5 without erroring.
+        # Opening the DB should drive it all the way to the current version.
         db = Database(str(db_dir))
-        assert db.conn.execute("SELECT version FROM schema_version").fetchone()["version"] == 5
+        assert db.conn.execute("SELECT version FROM schema_version").fetchone()["version"] == SCHEMA_VERSION
 
 
 class TestEdges:
@@ -181,57 +203,6 @@ class TestEdges:
     def test_invalid_direction_raises(self, seeded_db):
         with pytest.raises(ValueError, match="direction"):
             seeded_db.get_edges(node_id="m1", direction="sideways")
-
-
-class TestTrails:
-    def test_create_and_walk(self, seeded_db):
-        tid = seeded_db.create_trail("My Trail", "A reading path")
-        seeded_db.add_trail_step(tid, "message", "m1", annotation="starts here")
-        seeded_db.add_trail_step(tid, "message", "m2", annotation="follows")
-        steps = seeded_db.walk_trail(tid)
-        assert [s["position"] for s in steps] == [0, 1]
-        assert steps[0]["target_id"] == "m1"
-        assert steps[1]["annotation"] == "follows"
-
-    def test_insert_at_position_shifts_later_steps(self, seeded_db):
-        tid = seeded_db.create_trail("Reorderable")
-        seeded_db.add_trail_step(tid, "message", "m1")  # position 0
-        seeded_db.add_trail_step(tid, "message", "m2")  # position 1
-        # Insert at position 0, should shift existing steps
-        seeded_db.add_trail_step(tid, "conversation", "c1", position=0)
-        steps = seeded_db.walk_trail(tid)
-        assert steps[0]["target_id"] == "c1"
-        assert steps[1]["target_id"] == "m1"
-        assert steps[2]["target_id"] == "m2"
-
-    def test_cascade_on_trail_delete(self, seeded_db):
-        tid = seeded_db.create_trail("Doomed")
-        seeded_db.add_trail_step(tid, "message", "m1")
-        assert seeded_db.delete_trail(tid) is True
-        # Steps should be gone via CASCADE
-        row = seeded_db.conn.execute(
-            "SELECT COUNT(*) as n FROM trail_steps WHERE trail_id = ?", (tid,),
-        ).fetchone()
-        assert row["n"] == 0
-
-    def test_reverse_index_finds_trails_containing_node(self, seeded_db):
-        t1 = seeded_db.create_trail("Trail A")
-        t2 = seeded_db.create_trail("Trail B")
-        seeded_db.add_trail_step(t1, "message", "m1")
-        seeded_db.add_trail_step(t2, "message", "m1")
-        seeded_db.add_trail_step(t2, "message", "m2")
-        trails = seeded_db.trails_containing("message", "m1")
-        ids = {t["id"] for t in trails}
-        assert ids == {t1, t2}
-
-    def test_list_includes_step_count(self, seeded_db):
-        tid = seeded_db.create_trail("Listable")
-        seeded_db.add_trail_step(tid, "message", "m1")
-        seeded_db.add_trail_step(tid, "message", "m2")
-        trails = seeded_db.list_trails()
-        our = [t for t in trails if t["id"] == tid]
-        assert len(our) == 1
-        assert our[0]["step_count"] == 2
 
 
 class TestMarginaliaV2:
