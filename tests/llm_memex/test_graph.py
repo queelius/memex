@@ -1,15 +1,14 @@
-"""Tests for schema v5/v6: edges and marginalia v2.
+"""Tests for schema v5→v6→v7 migrations and marginalia v2.
 
 v5 introduced edges, trails, and notes v2 columns.
 v6 removed trails (moved to meta-memex).
+v7 removed edges (cross-record graphs belong to meta-memex too).
 
 Covers:
-- v4 → v5 → v6 migration preserves existing notes, adds new columns with defaults
-- Unversioned (pre-v1) → v6 migration works (the _create_missing_tables path)
-- v6 drops trails and trail_steps tables
-- Edges: add/get/delete, uniqueness, direction filtering
+- v4 → v7 migration preserves existing notes, adds v2 columns with defaults
+- Unversioned (pre-v1) → v7 migration works (the _create_missing_tables path)
+- Fresh DBs at v7 have no trails, no trail_steps, and no edges tables
 - Notes v2: anchor fields, parent-child cascade, kind field
-- prune_stale_edges sweeps dangling refs
 """
 import sqlite3
 from datetime import datetime
@@ -42,16 +41,17 @@ def seeded_db(db):
 
 class TestSchema:
     def test_schema_version(self):
-        assert SCHEMA_VERSION == 6
+        assert SCHEMA_VERSION == 7
 
-    def test_fresh_db_has_edges_table(self, db):
+    def test_fresh_db_has_no_edges_table(self, db):
+        """v7 removed edges; cross-record graphs live in meta-memex, not here."""
         tables = {
             r["name"]
             for r in db.conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
-        assert "edges" in tables
+        assert "edges" not in tables
 
     def test_fresh_db_has_no_trails_tables(self, db):
         """v6 removed trails; fresh database should not have them."""
@@ -69,11 +69,12 @@ class TestSchema:
         for c in ("kind", "anchor_start", "anchor_end", "anchor_hash", "parent_note_id"):
             assert c in cols
 
-    def test_edges_unique_constraint(self, db):
-        idxs = [r["name"] for r in db.conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='edges'"
-        ).fetchall()]
-        assert "idx_edges_unique" in idxs
+    def test_edge_methods_removed(self):
+        """The edge-manipulation methods are gone from the Database class."""
+        for attr in ("add_edge", "get_edges", "delete_edge", "prune_stale_edges"):
+            assert not hasattr(Database, attr), (
+                f"Database.{attr} should have been removed in schema v7"
+            )
 
 
 class TestMigration:
@@ -146,65 +147,6 @@ class TestMigration:
         assert db.conn.execute("SELECT version FROM schema_version").fetchone()["version"] == SCHEMA_VERSION
 
 
-class TestEdges:
-    def test_add_and_retrieve(self, seeded_db):
-        eid = seeded_db.add_edge(
-            "message", "m1", "message", "m2", "answers",
-            metadata={"confidence": 0.9},
-        )
-        edges = seeded_db.get_edges(node_kind="message", node_id="m1", direction="out")
-        assert len(edges) == 1
-        assert edges[0]["id"] == eid
-        assert edges[0]["to_id"] == "m2"
-        assert edges[0]["metadata"] == {"confidence": 0.9}
-
-    def test_unique_constraint_same_type(self, seeded_db):
-        """Same (from, to, edge_type) triple must not duplicate."""
-        seeded_db.add_edge("message", "m1", "message", "m2", "answers")
-        with pytest.raises(sqlite3.IntegrityError):
-            seeded_db.add_edge("message", "m1", "message", "m2", "answers")
-
-    def test_different_edge_types_allowed(self, seeded_db):
-        """Same nodes may have multiple edges of different types."""
-        seeded_db.add_edge("message", "m1", "message", "m2", "answers")
-        seeded_db.add_edge("message", "m1", "message", "m2", "elaborates")
-        edges = seeded_db.get_edges(node_id="m1", direction="out")
-        types = {e["edge_type"] for e in edges}
-        assert types == {"answers", "elaborates"}
-
-    def test_direction_in_vs_out(self, seeded_db):
-        seeded_db.add_edge("message", "m1", "message", "m2", "answers")
-        out = seeded_db.get_edges(node_id="m1", direction="out")
-        in_ = seeded_db.get_edges(node_id="m2", direction="in")
-        both = seeded_db.get_edges(node_id="m1", direction="both")
-        assert len(out) == 1
-        assert len(in_) == 1
-        assert len(both) == 1
-
-    def test_direction_both_returns_either_end(self, seeded_db):
-        seeded_db.add_edge("message", "m1", "message", "m2", "answers")
-        seeded_db.add_edge("message", "m2", "message", "m1", "replies_to")
-        both = seeded_db.get_edges(node_id="m1", direction="both")
-        # Both the outgoing 'answers' and the incoming 'replies_to' should appear
-        assert len(both) == 2
-
-    def test_filter_by_edge_type(self, seeded_db):
-        seeded_db.add_edge("message", "m1", "message", "m2", "answers")
-        seeded_db.add_edge("message", "m1", "message", "m2", "elaborates")
-        answers_only = seeded_db.get_edges(node_id="m1", edge_type="answers")
-        assert len(answers_only) == 1
-        assert answers_only[0]["edge_type"] == "answers"
-
-    def test_delete_edge(self, seeded_db):
-        eid = seeded_db.add_edge("message", "m1", "message", "m2", "answers")
-        assert seeded_db.delete_edge(eid) is True
-        assert seeded_db.get_edges(node_id="m1") == []
-
-    def test_invalid_direction_raises(self, seeded_db):
-        with pytest.raises(ValueError, match="direction"):
-            seeded_db.get_edges(node_id="m1", direction="sideways")
-
-
 class TestMarginaliaV2:
     def test_anchor_fields_round_trip(self, seeded_db):
         nid = seeded_db.add_note(
@@ -248,30 +190,6 @@ class TestMarginaliaV2:
             "SELECT COUNT(*) as n FROM notes WHERE id = ?", (child,),
         ).fetchone()
         assert row["n"] == 0
-
-
-class TestPruneStaleEdges:
-    def test_prunes_edges_to_deleted_message(self, seeded_db):
-        seeded_db.add_edge("message", "m1", "message", "m2", "answers")
-        # Directly delete m2 (bypassing the typical delete_conversation path)
-        seeded_db.conn.execute(
-            "DELETE FROM messages WHERE conversation_id='c1' AND id='m2'"
-        )
-        seeded_db.conn.commit()
-        # Edge still exists — nothing auto-prunes
-        assert len(seeded_db.get_edges(node_id="m1")) == 1
-        # Now explicitly sweep
-        deleted = seeded_db.prune_stale_edges()
-        assert deleted >= 1
-        assert seeded_db.get_edges(node_id="m1") == []
-
-    def test_leaves_unknown_kinds_alone(self, seeded_db):
-        """Edges pointing to kinds outside memex (e.g. external_ref) must survive pruning."""
-        seeded_db.add_edge("message", "m1", "external_ref", "urn:doi:10.xyz", "cites")
-        seeded_db.prune_stale_edges()
-        edges = seeded_db.get_edges(node_id="m1")
-        assert len(edges) == 1
-        assert edges[0]["to_kind"] == "external_ref"
 
 
 # A v4-era schema replayed manually to seed the migration test above.

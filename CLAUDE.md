@@ -89,9 +89,9 @@ llm_memex/
 - Multi-database YAML config (`~/.memex/config.yaml`) with `sql_write: true` to enable writes via MCP
 - pyproject.toml version is dynamic from `llm_memex.__version__`
 
-## Database Schema (v6)
+## Database Schema (v7)
 
-Schema v6 migrations: v1→v2 (enrichments, provenance) → v3 (parent_conversation_id) → v4 (notes, notes_fts) → v5 (edges, marginalia v2) → v6 (drop trails/trail_steps, moved to meta-memex).
+Schema v7 migrations: v1→v2 (enrichments, provenance) → v3 (parent_conversation_id) → v4 (notes, notes_fts) → v5 (edges, marginalia v2) → v6 (drop trails, moved to meta-memex) → v7 (drop edges, also moved to meta-memex).
 
 **Core tables:**
 - `conversations`: PK `id`, boolean timestamps `starred_at`/`pinned_at`/`archived_at` (NULL=false, DATETIME=true), self-referential `parent_conversation_id`
@@ -100,7 +100,6 @@ Schema v6 migrations: v1→v2 (enrichments, provenance) → v3 (parent_conversat
 - `enrichments`: PK `(conversation_id, type, value)`, types: summary|topic|importance|excerpt, sources: user|claude|heuristic
 - `provenance`: PK `(conversation_id, source_type)`, tracks import origin
 - `notes` (marginalia): polymorphic `target_kind` ('message' or 'conversation'), FK with `ON DELETE SET NULL` (orphan survival). Marginalia v2 fields: `kind` (default 'freeform'), `anchor_start`/`anchor_end` (character offsets), `anchor_hash` (drift detection), `parent_note_id` (threaded replies, CASCADE delete)
-- `edges` (graph spine): typed relationships between any two entities. Polymorphic `(from_kind, from_id)` to `(to_kind, to_id)`. UNIQUE index on `(from_kind, from_id, to_kind, to_id, edge_type)`. No FK enforcement across kinds; use `db.prune_stale_edges()` to sweep dangling refs
 
 **FTS5 virtual tables:**
 - `messages_fts`: columns `conversation_id` (UNINDEXED), `message_id` (UNINDEXED), `text`. Porter + unicode61 tokenizer
@@ -121,7 +120,7 @@ Schema v6 migrations: v1→v2 (enrichments, provenance) → v3 (parent_conversat
 
 All tools accept an optional `db` parameter for multi-database targeting.
 
-### Reading notes and edges via execute_sql
+### Reading notes via execute_sql
 
 ```sql
 -- Notes for a conversation
@@ -131,12 +130,6 @@ WHERE conversation_id = ? ORDER BY created_at
 -- FTS search across notes
 SELECT n.* FROM notes_fts f JOIN notes n ON n.id = f.note_id
 WHERE notes_fts MATCH 'query'
-
--- Edges from a conversation
-SELECT * FROM edges WHERE from_kind = 'conversation' AND from_id = ?
-
--- All edges of a given type
-SELECT * FROM edges WHERE edge_type = 'related_to'
 ```
 
 ## Testing
@@ -171,7 +164,6 @@ The HTML exporter outputs a self-contained directory (`index.html` + `conversati
 - Two Claude Code importers share `_claude_code_common.py`: `claude_code` (conversation_only, strips tool use/thinking) and `claude_code_full` (full fidelity). Both use `source="claude_code"`, differentiated by `importer_mode` metadata and provenance `source_type`
 - `claude_code_full` imports subagent files from `subagents/` directories with `parent_conversation_id` links; subagent IDs are `{sessionId}:{agentId}` (deterministic); `conversation_only` skips subagents entirely
 - FTS5 is NOT trigger-maintained: `messages_fts` is manually updated in `save_conversation`, `append_message`, `update_message_content`, `delete_conversation`. `notes_fts` is maintained by `add_note`, `update_note`, `delete_note`
-- Edges have no FK enforcement across entity kinds. `prune_stale_edges()` sweeps conversation/message/note kinds; unknown kinds (external_ref, etc.) are left alone
 - HTML SPA search uses `LIKE '%term%'` on raw `messages.content` JSON (no FTS5 in sql.js)
 - Redact script scans only `type="text"` content blocks; tool_use/thinking blocks in full-fidelity imports are not scanned
 - MCP lifespan resolution: `MEMEX_CONFIG` env var, then `~/.memex/config.yaml`, then fallback to `~/.memex/default`

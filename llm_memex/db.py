@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from llm_memex.models import Conversation, Message
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS conversations (
@@ -83,24 +83,9 @@ CREATE INDEX IF NOT EXISTS idx_notes_target_kind ON notes(target_kind);
 CREATE INDEX IF NOT EXISTS idx_notes_kind ON notes(kind);
 CREATE INDEX IF NOT EXISTS idx_notes_parent ON notes(parent_note_id) WHERE parent_note_id IS NOT NULL;
 
--- Graph spine (schema v5): typed edges between any two entities.
--- No foreign keys across kinds — stale edges may exist after node deletion
--- and can be swept with db.prune_stale_edges().
-CREATE TABLE IF NOT EXISTS edges (
-    id TEXT PRIMARY KEY,
-    from_kind TEXT NOT NULL,
-    from_id TEXT NOT NULL,
-    to_kind TEXT NOT NULL,
-    to_id TEXT NOT NULL,
-    edge_type TEXT NOT NULL,
-    metadata JSON NOT NULL DEFAULT '{}',
-    created_at DATETIME NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_kind, from_id, edge_type);
-CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_kind, to_id, edge_type);
-CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(edge_type);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_unique
-    ON edges(from_kind, from_id, to_kind, to_id, edge_type);
+-- (edges table removed in schema v7: cross-record relationships belong to
+-- the federation layer, not to individual archives. See memex/meta-memex
+-- docs for the new home.)
 
 CREATE INDEX IF NOT EXISTS idx_conversations_source ON conversations(source);
 CREATE INDEX IF NOT EXISTS idx_conversations_model ON conversations(model);
@@ -214,18 +199,17 @@ def _migrate_to_v4(conn):
 def _migrate_to_v5(conn):
     """Graph spine + marginalia v2.
 
-    Additive migration:
+    Historical migration: v5 introduced the edges and trails tables and the
+    notes v2 columns. Trails were removed in v6 and edges in v7 — both moved
+    to the meta-memex federation layer. This migration still creates edges
+    (and trails) for databases following the 4→5→6→7 chain; those tables
+    are dropped by subsequent migrations. Fresh DBs bootstrap directly to
+    the current version and never materialize them.
+
+    Additive to the live schema:
     - ALTER TABLE notes to add: kind, anchor_start, anchor_end, anchor_hash,
       parent_note_id. All are nullable or have defaults so existing rows are
       unaffected.
-    - CREATE TABLE edges: typed relationships between any two entities.
-      Polymorphic (from_kind, from_id) → (to_kind, to_id). No cross-kind FK
-      enforcement; use prune_stale_edges() to sweep dangling refs.
-
-    Note: v5 originally also created trails and trail_steps tables.
-    Those have been removed in v6 (see _migrate_to_v6). This migration
-    retains the trails creation for databases upgrading 4→5→6 in sequence;
-    v6 will drop them.
     """
     # Notes v2 columns. SQLite ALTER TABLE ADD COLUMN restrictions:
     #  - NOT NULL requires a DEFAULT (kind has 'freeform')
@@ -261,7 +245,10 @@ def _migrate_to_v5(conn):
             WHERE parent_note_id IS NOT NULL;
     """)
 
-    # Graph edges: polymorphic typed relationships.
+    # (edges table was introduced in v5 but removed in v7; DBs that take
+    # the 4 → 5 → 6 → 7 migration path transiently create it below and
+    # _migrate_to_v7 drops it. Fresh DBs bootstrap directly to v7 and
+    # never create it.)
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS edges (
             id TEXT PRIMARY KEY,
@@ -273,13 +260,6 @@ def _migrate_to_v5(conn):
             metadata JSON NOT NULL DEFAULT '{}',
             created_at DATETIME NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_edges_from
-            ON edges(from_kind, from_id, edge_type);
-        CREATE INDEX IF NOT EXISTS idx_edges_to
-            ON edges(to_kind, to_id, edge_type);
-        CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(edge_type);
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_unique
-            ON edges(from_kind, from_id, to_kind, to_id, edge_type);
     """)
 
     # Trails and trail steps.
@@ -326,12 +306,39 @@ def _migrate_to_v6(conn):
     conn.commit()
 
 
+def _migrate_to_v7(conn):
+    """Drop edges table and its indexes.
+
+    The edges table was added in v5 alongside trails, intended as a generic
+    polymorphic relationship store. Trails moved to meta-memex in v6, but
+    edges stayed — dormant. Nothing in llm-memex actually writes to it
+    (no importer, MCP tool, or CLI), so it has been dead code.
+
+    Per the ecosystem contract (see ~/github/memex/CLAUDE.md): archives do
+    not build graphs; cross-record relationships belong in the federation
+    layer. v7 aligns the archive with that contract by removing the unused
+    infrastructure.
+
+    Any existing edges are discarded. The feature has never been exposed
+    through user-facing tools, so no production data is expected to exist.
+    """
+    conn.executescript("""
+        DROP INDEX IF EXISTS idx_edges_from;
+        DROP INDEX IF EXISTS idx_edges_to;
+        DROP INDEX IF EXISTS idx_edges_type;
+        DROP INDEX IF EXISTS idx_edges_unique;
+        DROP TABLE IF EXISTS edges;
+    """)
+    conn.commit()
+
+
 MIGRATIONS: Dict[int, callable] = {
     1: _migrate_to_v2,
     2: _migrate_to_v3,
     3: _migrate_to_v4,
     4: _migrate_to_v5,
     5: _migrate_to_v6,
+    6: _migrate_to_v7,
 }
 
 
@@ -1473,154 +1480,6 @@ class Database:
             for m in path
         ]
 
-    # ── Edges (graph spine, schema v5) ────────────────────────────────────
-
-    def add_edge(
-        self,
-        from_kind: str, from_id: str,
-        to_kind: str, to_id: str,
-        edge_type: str,
-        metadata: Optional[Dict[str, Any]] = None,
-        edge_id: Optional[str] = None,
-    ) -> str:
-        """Insert a typed edge between any two entities.
-
-        Raises sqlite3.IntegrityError if an edge of the same edge_type
-        already exists between these two nodes (UNIQUE index enforces it).
-        Different edge_types between the same nodes are allowed.
-        """
-        import uuid as _uuid
-        if edge_id is None:
-            edge_id = str(_uuid.uuid4())
-        now = _fmt_dt(datetime.now())
-        try:
-            self.conn.execute(
-                "INSERT INTO edges "
-                "(id, from_kind, from_id, to_kind, to_id, edge_type, metadata, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    edge_id, from_kind, from_id, to_kind, to_id, edge_type,
-                    json.dumps(metadata or {}), now,
-                ),
-            )
-            self.conn.commit()
-        except Exception:
-            self.conn.rollback()
-            raise
-        return edge_id
-
-    def get_edges(
-        self,
-        *,
-        node_kind: Optional[str] = None,
-        node_id: Optional[str] = None,
-        direction: str = "both",
-        edge_type: Optional[str] = None,
-        limit: int = 200,
-    ) -> List[Dict[str, Any]]:
-        """Query edges around a single node.
-
-        Args:
-            node_kind, node_id: The node whose edges to return.
-                If omitted, queries all edges (optionally filtered by edge_type).
-            direction: "out" (node is source), "in" (node is target),
-                or "both" (either end). Ignored when node_id is None.
-            edge_type: Optional filter on the edge's type.
-        """
-        if direction not in ("out", "in", "both"):
-            raise ValueError(f"direction must be out|in|both, got {direction!r}")
-
-        conds: List[str] = []
-        params: List[Any] = []
-
-        if node_id is not None:
-            if direction == "out":
-                conds.append("from_id = ?")
-                params.append(node_id)
-                if node_kind:
-                    conds.append("from_kind = ?")
-                    params.append(node_kind)
-            elif direction == "in":
-                conds.append("to_id = ?")
-                params.append(node_id)
-                if node_kind:
-                    conds.append("to_kind = ?")
-                    params.append(node_kind)
-            else:  # both
-                if node_kind:
-                    conds.append(
-                        "((from_kind = ? AND from_id = ?) "
-                        "OR (to_kind = ? AND to_id = ?))"
-                    )
-                    params.extend([node_kind, node_id, node_kind, node_id])
-                else:
-                    conds.append("(from_id = ? OR to_id = ?)")
-                    params.extend([node_id, node_id])
-
-        if edge_type:
-            conds.append("edge_type = ?")
-            params.append(edge_type)
-
-        where = " AND ".join(conds) if conds else "1=1"
-        params.append(limit)
-        rows = self.conn.execute(
-            f"SELECT id, from_kind, from_id, to_kind, to_id, edge_type, "
-            f"metadata, created_at FROM edges WHERE {where} "
-            f"ORDER BY created_at DESC LIMIT ?",
-            tuple(params),
-        ).fetchall()
-        result = []
-        for r in rows:
-            d = dict(r)
-            d["metadata"] = json.loads(d["metadata"]) if d["metadata"] else {}
-            result.append(d)
-        return result
-
-    def delete_edge(self, edge_id: str) -> bool:
-        """Delete an edge by id. Returns True if a row was deleted."""
-        try:
-            cursor = self.conn.execute(
-                "DELETE FROM edges WHERE id = ?", (edge_id,)
-            )
-            self.conn.commit()
-            return cursor.rowcount > 0
-        except Exception:
-            self.conn.rollback()
-            raise
-
-    # ── Edge maintenance ─────────────────────────────────────────────────
-
-    def prune_stale_edges(self) -> int:
-        """Delete edges whose endpoints no longer exist.
-
-        Sweeps the known entity kinds (conversation, message, note)
-        and deletes any edge whose from_id or to_id has no matching row.
-        Edges pointing to unknown kinds (external_ref, etc.) are left alone.
-        Returns the number of edges deleted.
-        """
-        known = {
-            "conversation": "SELECT id FROM conversations",
-            "message": "SELECT id FROM messages",
-            "note": "SELECT id FROM notes",
-        }
-        deleted = 0
-        try:
-            for kind, id_sql in known.items():
-                # Delete edges where the kind matches but the id isn't in the
-                # corresponding live-id set.
-                c1 = self.conn.execute(
-                    f"DELETE FROM edges WHERE from_kind = ? "
-                    f"AND from_id NOT IN ({id_sql})",
-                    (kind,),
-                )
-                c2 = self.conn.execute(
-                    f"DELETE FROM edges WHERE to_kind = ? "
-                    f"AND to_id NOT IN ({id_sql})",
-                    (kind,),
-                )
-                deleted += c1.rowcount + c2.rowcount
-            self.conn.commit()
-        except Exception:
-            self.conn.rollback()
-            raise
-        return deleted
+    # (edges methods removed in schema v7; see _migrate_to_v7 docstring.
+    # Cross-record graph persistence belongs to the meta-memex federation
+    # layer, not to individual archives.)
