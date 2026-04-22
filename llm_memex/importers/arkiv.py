@@ -10,6 +10,9 @@ Supported input layouts (all detected automatically):
 - directory with ``conversations.jsonl``, ``README.md``, and ``schema.yaml``
 - ``.zip`` file containing those three files
 - ``.tar.gz`` / ``.tgz`` file containing those three files
+- bare ``.jsonl`` file of arkiv records (no README/schema needed)
+- ``.jsonl.gz`` file of gzipped arkiv records — the format the browser SPA
+  emits for round-tripping annotations back to the primary DB
 
 This is intentionally forgiving — if ``README.md`` or ``schema.yaml`` is
 missing but ``conversations.jsonl`` is present, we still import. The archive's
@@ -37,6 +40,7 @@ Round-trip fidelity notes:
 """
 from __future__ import annotations
 
+import gzip
 import io
 import json
 import tarfile
@@ -108,8 +112,9 @@ def detect(path: str) -> bool:
         except (zipfile.BadZipFile, KeyError):
             return False
 
-    # .tar.gz / .tgz
     lower = str(p).lower()
+
+    # .tar.gz / .tgz
     if lower.endswith(".tar.gz") or lower.endswith(".tgz"):
         try:
             with tarfile.open(p, "r:gz") as tf:
@@ -123,6 +128,24 @@ def detect(path: str) -> bool:
                 rec = _jsonl_peek_first_record(extracted)
             return rec is not None and _is_llm_memex_arkiv_record(rec)
         except tarfile.TarError:
+            return False
+
+    # bare .jsonl.gz (single-file arkiv, e.g. emitted by the browser SPA)
+    if lower.endswith(".jsonl.gz"):
+        try:
+            with gzip.open(p, "rt", encoding="utf-8") as f:
+                rec = _jsonl_peek_first_record(f)
+            return rec is not None and _is_llm_memex_arkiv_record(rec)
+        except (OSError, gzip.BadGzipFile):
+            return False
+
+    # bare .jsonl
+    if lower.endswith(".jsonl"):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                rec = _jsonl_peek_first_record(f)
+            return rec is not None and _is_llm_memex_arkiv_record(rec)
+        except OSError:
             return False
 
     return False
@@ -153,6 +176,14 @@ def _open_jsonl(path: str) -> Iterable[Dict[str, Any]]:
                 return
             text = io.TextIOWrapper(extracted, encoding="utf-8")
             yield from _parse_jsonl_lines(text)
+        return
+    if lower.endswith(".jsonl.gz"):
+        with gzip.open(p, "rt", encoding="utf-8") as f:
+            yield from _parse_jsonl_lines(f)
+        return
+    if lower.endswith(".jsonl"):
+        with open(p, "r", encoding="utf-8") as f:
+            yield from _parse_jsonl_lines(f)
         return
     raise ValueError(f"unrecognized arkiv bundle: {path!r}")
 

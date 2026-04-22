@@ -561,6 +561,50 @@ class TestXssSafety:
         assert "SELECT target_kind, conversation_id, message_id FROM notes WHERE id = ?" in chunk
 
 
+class TestSpaArkivExport:
+    """The SPA can export its current state as arkiv .jsonl.gz for round-tripping
+    annotations back to the primary DB via `llm-memex import`."""
+
+    def test_template_has_download_arkiv_button(self):
+        html = get_template()
+        assert 'id="download-arkiv-btn"' in html
+        assert 'onclick="downloadArkiv()"' in html
+        # The button label nudges users toward the round-trip destination
+        assert "llm-memex import" in html
+
+    def test_build_arkiv_records_shape(self):
+        """The SPA's record builder produces the same shape as the Python
+        exporter (see llm_memex/exporters/arkiv_export._build_records)."""
+        html = get_template()
+        assert "function _buildArkivRecords()" in html
+        # Same metadata keys as Python exporter
+        assert "conversation_id: msg.conversation_id" in html
+        assert "role: msg.role" in html
+        assert "message_id" in html
+        # notes attachment path
+        assert "notesByMsg" in html
+        assert "meta.notes = notes" in html
+
+    def test_arkiv_records_are_text_centric(self):
+        """Skip non-text messages — matches the Python exporter's get_text()."""
+        html = get_template()
+        assert "function _extractMsgText(" in html
+        assert 'type === "text"' in html
+
+    def test_gzip_via_compression_stream(self):
+        """No JS zip library dependency; uses the native CompressionStream."""
+        html = get_template()
+        assert "function _gzipBytes(bytes)" in html
+        assert 'new CompressionStream("gzip")' in html
+
+    def test_downloaded_filename_format(self):
+        """Filename is date-stamped so multiple round-trips don't collide."""
+        html = get_template()
+        start = html.index("async function downloadArkiv()")
+        chunk = html[start:start + 1500]
+        assert 'a.download = "llm-memex-" + today + ".jsonl.gz"' in chunk
+
+
 class TestLibrarianChatMode:
     """Librarian chat: memex-aware system prompt + a top-bar entry point."""
 

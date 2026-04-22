@@ -222,6 +222,49 @@ class TestTarGzRoundTrip:
 
 # ── negative cases ─────────────────────────────────────────────
 
+class TestBareJsonlInput:
+    """Single-file arkiv inputs — what the browser SPA emits for round-trip."""
+
+    def _write_bundle_and_extract_jsonl(self, tmp_path):
+        bundle = tmp_path / "bundle"
+        arkiv_export([_seed_conversation()], str(bundle))
+        return (bundle / "conversations.jsonl").read_bytes()
+
+    def test_detect_bare_jsonl(self, tmp_path):
+        jsonl = self._write_bundle_and_extract_jsonl(tmp_path)
+        target = tmp_path / "annotations.jsonl"
+        target.write_bytes(jsonl)
+        assert arkiv_detect(str(target))
+
+    def test_roundtrip_bare_jsonl(self, tmp_path):
+        jsonl = self._write_bundle_and_extract_jsonl(tmp_path)
+        target = tmp_path / "annotations.jsonl"
+        target.write_bytes(jsonl)
+        convs = arkiv_import(str(target))
+        assert len(convs) == 1
+        assert convs[0].title == "Bernoulli sets and you"
+
+    def test_detect_bare_jsonl_gz(self, tmp_path):
+        import gzip as _gz
+        jsonl = self._write_bundle_and_extract_jsonl(tmp_path)
+        target = tmp_path / "annotations.jsonl.gz"
+        target.write_bytes(_gz.compress(jsonl))
+        assert arkiv_detect(str(target))
+
+    def test_roundtrip_bare_jsonl_gz(self, tmp_path):
+        """The exact path the SPA uses: user downloads an .jsonl.gz from the
+        exported HTML, then imports it back into the primary DB."""
+        import gzip as _gz
+        jsonl = self._write_bundle_and_extract_jsonl(tmp_path)
+        target = tmp_path / "annotations.jsonl.gz"
+        target.write_bytes(_gz.compress(jsonl))
+        convs = arkiv_import(str(target))
+        assert len(convs) == 1
+        c = convs[0]
+        assert c.title == "Bernoulli sets and you"
+        assert len(c.messages) == 2
+
+
 class TestDetectRejects:
     def test_nonexistent_path(self, tmp_path):
         assert not arkiv_detect(str(tmp_path / "nope"))
