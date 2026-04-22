@@ -284,6 +284,102 @@ class TestDetectRejects:
 
 # ── notes round-trip ───────────────────────────────────────────
 
+class TestMergeMode:
+    """--merge preserves existing conversation state and adds only new
+    messages + tags. This is the round-trip mode for HTML-SPA annotations."""
+
+    def test_merge_preserves_enrichments_on_existing_conv(self, tmp_path):
+        """Merging new messages must not wipe an enrichment the primary DB
+        already has."""
+        db_dir = tmp_path / "primary"
+        db_dir.mkdir()
+        with Database(str(db_dir)) as db:
+            conv = _seed_conversation()
+            db.save_conversation(conv)
+            # Mark the conversation with an enrichment (summary)
+            db.save_enrichments(conv.id, [
+                {"type": "summary", "value": "precious insight", "source": "user"}
+            ])
+
+            # Merge in "the same conversation plus one new message"
+            new_conv = _seed_conversation()
+            new_conv.add_message(Message(
+                id="m-3", role="user",
+                content=[text_block("a later question, added after the fact")],
+                parent_id="m-2",
+                created_at=datetime(2026, 4, 22, 10, 0, 0),
+            ))
+            stats = db.merge_conversation(new_conv)
+            assert stats["added_messages"] == 1  # m-3 is new; m-1, m-2 already there
+            assert stats["created_conversation"] == 0
+
+            # Enrichment survives
+            rows = db.execute_sql(
+                "SELECT type, value, source FROM enrichments WHERE conversation_id=?",
+                (new_conv.id,),
+            )
+            assert any(r["type"] == "summary" and r["value"] == "precious insight" for r in rows)
+
+            # Message count reflects the new total
+            msgs = db.execute_sql(
+                "SELECT COUNT(*) as n FROM messages WHERE conversation_id=?",
+                (new_conv.id,),
+            )
+            assert msgs[0]["n"] == 3
+
+    def test_merge_creates_new_conv_when_not_present(self, tmp_path):
+        db_dir = tmp_path / "primary"
+        db_dir.mkdir()
+        with Database(str(db_dir)) as db:
+            stats = db.merge_conversation(_seed_conversation())
+            assert stats["created_conversation"] == 1
+            assert stats["added_messages"] == 2
+
+    def test_merge_is_idempotent(self, tmp_path):
+        """Re-merging the same conversation should yield zero new messages."""
+        db_dir = tmp_path / "primary"
+        db_dir.mkdir()
+        with Database(str(db_dir)) as db:
+            db.merge_conversation(_seed_conversation())
+            stats2 = db.merge_conversation(_seed_conversation())
+            assert stats2["created_conversation"] == 0
+            assert stats2["added_messages"] == 0
+            assert stats2["added_tags"] == 0
+
+    def test_merge_notes_inserts_new_preserves_existing(self, tmp_path):
+        db_dir = tmp_path / "primary"
+        db_dir.mkdir()
+        with Database(str(db_dir)) as db:
+            db.save_conversation(_seed_conversation())
+            db.add_note(
+                conversation_id="conv-1", message_id="m-2",
+                text="original primary-DB note",
+            )
+            orig_notes = db.execute_sql(
+                "SELECT id, text FROM notes WHERE conversation_id='conv-1'"
+            )
+            assert len(orig_notes) == 1
+            orig_id = orig_notes[0]["id"]
+
+            # New batch: one new note + one that coincidentally has the same
+            # id as the existing one (INSERT OR IGNORE should keep the original
+            # text rather than overwriting it).
+            added = db.merge_notes([
+                {"id": "new-1", "conversation_id": "conv-1", "message_id": "m-1",
+                 "text": "freshly-imported annotation"},
+                {"id": orig_id, "conversation_id": "conv-1", "message_id": "m-2",
+                 "text": "different text, should be ignored"},
+            ])
+            assert added == 1
+            all_notes = {
+                r["id"]: r["text"] for r in db.execute_sql(
+                    "SELECT id, text FROM notes WHERE conversation_id='conv-1'"
+                )
+            }
+            assert all_notes[orig_id] == "original primary-DB note"
+            assert all_notes["new-1"] == "freshly-imported annotation"
+
+
 class TestNotesRoundTrip:
     def test_message_level_notes_preserved_in_metadata(self, tmp_path):
         """Message-level notes ride in arkiv metadata and land in

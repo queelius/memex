@@ -612,6 +612,163 @@ class Database:
             self.conn.rollback()
             raise
 
+    def merge_conversation(self, conv: Conversation) -> Dict[str, int]:
+        """Merge a conversation into the DB without clobbering existing state.
+
+        If the conversation does not exist, this is equivalent to
+        save_conversation. If it already exists, we:
+
+        - leave its conversations-row metadata (title, model, timestamps,
+          starred_at, pinned_at, archived_at, enrichments, provenance)
+          untouched;
+        - INSERT OR IGNORE each message, so new messages are added and
+          existing ones by the same (conversation_id, id) PK are kept;
+        - INSERT INTO messages_fts for each new message (tryExec-style
+          tolerance: if the FTS table is absent, skip);
+        - INSERT OR IGNORE each tag;
+        - recompute conversations.message_count from live rows;
+        - push conversations.updated_at forward to the newest inserted
+          message's created_at (only moves forward).
+
+        Returns a stats dict: {"added_messages": N, "added_tags": N,
+        "created_conversation": 0 or 1}.
+
+        This is the round-trip mode for merging annotations and chat
+        continuations back from an exported HTML bundle into the primary
+        DB. The assumption is that the bundle side may have added new
+        messages and notes, but cannot have changed enrichments or
+        provenance in ways we want to trust.
+        """
+        c = self.conn.cursor()
+        stats = {"added_messages": 0, "added_tags": 0, "created_conversation": 0}
+        try:
+            existing = c.execute(
+                "SELECT 1 FROM conversations WHERE id=?", (conv.id,)
+            ).fetchone()
+            if not existing:
+                # Fall back to full save for new conversations.
+                self.save_conversation(conv)
+                stats["created_conversation"] = 1
+                stats["added_messages"] = len(conv.messages)
+                stats["added_tags"] = len(conv.tags)
+                return stats
+
+            # Existing conversation: merge messages + tags only.
+            for msg in conv.messages.values():
+                cur = c.execute(
+                    "INSERT OR IGNORE INTO messages "
+                    "(conversation_id,id,role,parent_id,model,created_at,"
+                    "sensitive,content,metadata) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (
+                        conv.id, msg.id, msg.role, msg.parent_id, msg.model,
+                        _fmt_dt(msg.created_at), int(msg.sensitive),
+                        json.dumps(msg.content), json.dumps(msg.metadata),
+                    ),
+                )
+                if cur.rowcount:
+                    stats["added_messages"] += 1
+                    text = msg.get_text()
+                    if text:
+                        # Tolerate missing messages_fts (stripped on export).
+                        try:
+                            c.execute(
+                                "INSERT INTO messages_fts "
+                                "(conversation_id,message_id,text) "
+                                "VALUES (?,?,?)",
+                                (conv.id, msg.id, text),
+                            )
+                        except sqlite3.Error:
+                            pass
+
+            for tag in conv.tags:
+                cur = c.execute(
+                    "INSERT OR IGNORE INTO tags (conversation_id,tag) "
+                    "VALUES (?,?)",
+                    (conv.id, tag),
+                )
+                if cur.rowcount:
+                    stats["added_tags"] += 1
+
+            if stats["added_messages"]:
+                # Recompute message_count + push updated_at forward.
+                c.execute(
+                    "UPDATE conversations SET "
+                    "  message_count = (SELECT COUNT(*) FROM messages "
+                    "                   WHERE conversation_id=?), "
+                    "  updated_at = ("
+                    "    SELECT MAX(created_at) FROM messages "
+                    "    WHERE conversation_id=?"
+                    "  ) "
+                    "WHERE id=? AND ("
+                    "  updated_at IS NULL OR updated_at < "
+                    "    (SELECT MAX(created_at) FROM messages "
+                    "     WHERE conversation_id=?)"
+                    ")",
+                    (conv.id, conv.id, conv.id, conv.id),
+                )
+
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        return stats
+
+    def merge_notes(self, notes: List[Dict[str, Any]]) -> int:
+        """Merge notes with INSERT OR IGNORE semantics (keyed by note id).
+
+        Each note dict must have at minimum: id, conversation_id, text.
+        Optional: message_id, target_kind (defaults to "conversation" when
+        message_id is None, "message" otherwise), kind (defaults to
+        "freeform"), created_at, updated_at.
+
+        Returns the number of notes newly inserted.
+        """
+        if not notes:
+            return 0
+        c = self.conn.cursor()
+        added = 0
+        now = _fmt_dt(datetime.now())
+        try:
+            for n in notes:
+                if not n.get("id") or not n.get("conversation_id"):
+                    continue
+                text = n.get("text") or ""
+                if not text:
+                    continue
+                message_id = n.get("message_id")
+                target_kind = n.get("target_kind") or (
+                    "message" if message_id else "conversation"
+                )
+                kind = n.get("kind") or "freeform"
+                created = n.get("created_at") or now
+                updated = n.get("updated_at") or created
+                cur = c.execute(
+                    "INSERT OR IGNORE INTO notes "
+                    "(id,target_kind,conversation_id,message_id,kind,text,"
+                    " created_at,updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        n["id"], target_kind, n["conversation_id"],
+                        message_id, kind, text, created, updated,
+                    ),
+                )
+                if cur.rowcount:
+                    added += 1
+                    try:
+                        c.execute(
+                            "INSERT INTO notes_fts "
+                            "(note_id,conversation_id,message_id,text) "
+                            "VALUES (?,?,?,?)",
+                            (n["id"], n["conversation_id"], message_id, text),
+                        )
+                    except sqlite3.Error:
+                        pass
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        return added
+
     def load_conversation(self, id: str) -> Optional[Conversation]:
         rows = self.execute_sql(
             "SELECT * FROM conversations WHERE id=?", (id,)

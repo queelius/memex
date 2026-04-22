@@ -66,7 +66,14 @@ def main():
     imp.add_argument("--recursive", "-r", action="store_true",
                      help="Recursively import all detected files from a directory")
     imp.add_argument("--force", action="store_true",
-                     help="Re-import all conversations even if unchanged")
+                     help="Re-import all conversations even if unchanged "
+                          "(REPLACE mode: cascades delete messages/tags/enrichments)")
+    imp.add_argument("--merge", action="store_true",
+                     help="Merge into existing conversations without "
+                          "clobbering enrichments or conversation metadata. "
+                          "Adds only new messages and tags via INSERT OR IGNORE. "
+                          "Use this when round-tripping annotations from an "
+                          "exported HTML bundle back to the primary DB.")
     imp.add_argument("--no-copy-assets", action="store_true",
                      help="Skip copying media assets into the database directory")
     imp.add_argument(
@@ -216,11 +223,50 @@ def _cmd_import(args):
             print(" ".join(parts))
 
 
+def _materialize_arkiv_notes(conv, db):
+    """Pull any _arkiv_notes off each message's metadata and INSERT OR IGNORE
+    into the notes table. The arkiv importer stashes message-level notes
+    there during import so the conversation-save step doesn't need to know
+    about notes. INSERT OR IGNORE keeps this idempotent on re-imports.
+    """
+    notes = []
+    for msg in conv.messages.values():
+        arkiv_notes = msg.metadata.get("_arkiv_notes") if msg.metadata else None
+        if not arkiv_notes:
+            continue
+        for n in arkiv_notes:
+            if not n.get("id") or not n.get("text"):
+                continue
+            notes.append({
+                "id": n["id"],
+                "conversation_id": conv.id,
+                "message_id": msg.id,
+                "target_kind": "message",
+                "text": n["text"],
+            })
+        # Clean up so save_conversation doesn't re-serialize internal metadata.
+        msg.metadata.pop("_arkiv_notes", None)
+    if notes:
+        db.merge_notes(notes)
+
+
 def _save_convs(convs, source_path, args, db):
     """Save imported conversations to the database.
 
     Returns (imported_count, unchanged_count).
     source_path is used as the base for asset resolution.
+
+    Behavior modes:
+      - default:  INSERT OR REPLACE per conversation (cascade delete
+                  messages/tags/enrichments/provenance first). Used for
+                  fresh imports from platform exports.
+      - --force:  same as default but also bypass the unchanged-check.
+      - --merge:  for each conversation, keep existing DB state and only
+                  INSERT OR IGNORE new messages + tags. Preserves
+                  enrichments and provenance. Materialize any message-level
+                  notes present in arkiv metadata as notes rows. This is
+                  the round-trip mode for merging SPA-added annotations
+                  back into the primary DB.
     """
     from llm_memex.assets import resolve_source_assets, copy_assets
 
@@ -230,6 +276,17 @@ def _save_convs(convs, source_path, args, db):
     imported = 0
     unchanged = 0
     for conv in convs:
+        if getattr(args, "merge", False):
+            # Merge mode: preserve existing state, add only new messages and
+            # tags. Also materialize any arkiv message-level notes.
+            stats = db.merge_conversation(conv)
+            if stats["created_conversation"] or stats["added_messages"] or stats["added_tags"]:
+                imported += 1
+            else:
+                unchanged += 1
+            _materialize_arkiv_notes(conv, db)
+            continue
+
         # Skip-if-unchanged check (bypass with --force)
         if not args.force and db.conversation_unchanged(
             conv.id, conv.updated_at, conv.message_count
