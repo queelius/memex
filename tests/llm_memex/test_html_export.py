@@ -561,6 +561,66 @@ class TestXssSafety:
         assert "SELECT target_kind, conversation_id, message_id FROM notes WHERE id = ?" in chunk
 
 
+class TestLibrarianChatMode:
+    """Librarian chat: memex-aware system prompt + a top-bar entry point."""
+
+    def test_top_bar_has_chat_button(self):
+        html = get_template()
+        assert 'id="chat-toggle"' in html
+        assert 'onclick="openChat()"' in html
+
+    def test_has_open_chat_function(self):
+        html = get_template()
+        assert "function openChat()" in html
+
+    def test_hash_route_includes_chat(self):
+        html = get_template()
+        start = html.index("function buildRoute(r)")
+        chunk = html[start:start + 500]
+        assert 'r.mode === "chat"' in chunk
+        assert '"#/chat"' in chunk
+        pstart = html.index("function parseRoute()")
+        pchunk = html[pstart:pstart + 700]
+        assert '"chat"' in pchunk
+
+    def test_librarian_system_prompt_is_memex_aware(self):
+        html = get_template()
+        # Persona
+        assert "librarian of this person" in html
+        # Schema injection
+        assert "DATABASE SCHEMA:" in html
+        # Best practices list
+        assert "ALWAYS LIMIT" in html
+        # Example patterns
+        assert "EXAMPLE PATTERNS:" in html
+        # sql.js FTS limitation surfaced explicitly
+        assert "FTS5 virtual tables are NOT available" in html
+        assert "LIKE" in html
+
+    def test_conversation_system_prompt_exists(self):
+        """resumeConversation uses a memex-aware default, appended with user override."""
+        html = get_template()
+        assert "CONVERSATION_SYSTEM_PROMPT" in html
+        assert "continuing a conversation" in html
+        # User prompt composition: default + "\n\n" + user-set, not replace
+        start = html.index("async function resumeConversation")
+        chunk = html[start:start + 3000]
+        assert "CONVERSATION_SYSTEM_PROMPT + \"\\n\\n\" + userPrompt" in chunk
+
+    def test_input_visible_in_librarian_mode(self):
+        html = get_template()
+        assert 'chatMode === "librarian"' in html
+        # refreshChatUiState reveals input-area in librarian mode
+        assert "ask about your archive" in html
+
+    def test_send_message_dispatches_to_librarian(self):
+        html = get_template()
+        start = html.index("function sendMessage()")
+        chunk = html[start:start + 1200]
+        assert 'chatMode === "librarian"' in chunk
+        assert "askLibrarian(text)" in chunk
+
+
 class TestStreamEpoch:
     """Regression: rapid conv-A → conv-B switch must not inject conv-A's stream
     into conv-B. Each mode transition bumps streamEpoch; resumeConversation
@@ -1206,10 +1266,10 @@ class TestHtmlNotes:
         assert "function deleteNoteUI" in html
 
     def test_template_librarian_mentions_notes(self):
+        """Librarian system prompt tells the model how to query marginalia."""
         html = get_template("CREATE TABLE notes (id TEXT);")
-        assert "NOTES:" in html
         assert "notes table" in html
-        assert "notes_fts" in html
+        assert "marginalia" in html
 
     def test_template_has_notes_render_functions(self):
         html = get_template()
