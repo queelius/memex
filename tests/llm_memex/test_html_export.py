@@ -452,6 +452,62 @@ class TestHtmlRendering:
         assert "ORDER BY created_at" in chunk
 
 
+class TestHashRouter:
+    """Hash-based routing for bookmarks and browser back/forward."""
+
+    def test_template_has_router_functions(self):
+        html = get_template()
+        assert "function parseRoute()" in html
+        assert "function buildRoute(r)" in html
+        assert "function setRoute(r, opts)" in html
+        assert "function renderRoute()" in html
+
+    def test_hashchange_listener_wired(self):
+        html = get_template()
+        assert 'addEventListener("hashchange", renderRoute)' in html
+        assert "hashWired" in html
+
+    def test_router_recognizes_all_routes(self):
+        """parseRoute must recognize conv/search/marginalia routes."""
+        html = get_template()
+        start = html.index("function parseRoute()")
+        chunk = html[start:start + 600]
+        assert '"conv"' in chunk
+        assert '"search"' in chunk
+        assert '"marginalia"' in chunk
+
+    def test_mode_functions_update_hash(self):
+        """Mode entry-points call setRoute so URL reflects state."""
+        html = get_template()
+        # openConversation sets conv route
+        cs = html.index("function openConversation(convId)")
+        cchunk = html[cs:cs + 400]
+        assert "setRoute({ mode: \"conv\", id: convId })" in cchunk
+        # openMarginalia sets marginalia route
+        ms = html.index("function openMarginalia()")
+        mchunk = html[ms:ms + 400]
+        assert 'setRoute({ mode: "marginalia" })' in mchunk
+        # openSearchResults handles push-vs-replace for typing refinement
+        ss = html.index("function openSearchResults(initialTerm)")
+        schunk = html[ss:ss + 600]
+        assert "chatMode === \"search\"" in schunk  # same-mode check
+        assert "replace: true" in schunk
+        # goHome resets to empty route
+        gs = html.index("function goHome()")
+        gchunk = html[gs:gs + 300]
+        assert 'setRoute({ mode: "home" })' in gchunk
+
+    def test_routing_guard_prevents_loops(self):
+        """renderRoute sets routingFromHash so mode functions don't re-push."""
+        html = get_template()
+        assert "var routingFromHash = false;" in html
+        assert "routingFromHash = true;" in html
+        # setRoute respects the guard
+        ss = html.index("function setRoute(r, opts)")
+        schunk = html[ss:ss + 400]
+        assert "if (routingFromHash) return;" in schunk
+
+
 class TestHtmlTimelineRemoved:
     """Single-column refresh deleted the canvas timeline bar; these regressions
     guard that nothing creeps back in by accident."""
