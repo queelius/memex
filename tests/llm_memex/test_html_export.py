@@ -42,8 +42,11 @@ class TestHtmlTemplate:
         # URL param check
         assert "URLSearchParams" in html
         assert 'get("db")' in html
-        # Default fetch
+        # Default fetch tries .db.gz first (smaller), falls back to .db
+        assert "./conversations.db.gz" in html
         assert "./conversations.db" in html
+        # Gzip decompression uses native DecompressionStream (no lib)
+        assert 'new DecompressionStream("gzip")' in html
         # File picker fallback
         assert 'id="drop-zone"' in html
         assert 'id="file-input"' in html
@@ -969,6 +972,8 @@ class TestHtmlExporter:
         assert not (out_dir / "assets").exists()
 
     def test_export_copies_db(self, tmp_path):
+        """Default export gzips the DB for transfer; raw .db is removed."""
+        import gzip as _gz
         from llm_memex.db import Database
         from llm_memex.exporters.html import export
 
@@ -982,11 +987,36 @@ class TestHtmlExporter:
         db_path = str(db_dir / "conversations.db")
         export([conv], str(out_dir), db_path=db_path)
 
+        # The compressed form is shipped; raw .db is gone
+        assert (out_dir / "conversations.db.gz").exists()
+        assert not (out_dir / "conversations.db").exists()
+        # Decompress and confirm it's a valid SQLite copy
+        raw = (out_dir / "conversations.db")
+        with _gz.open(out_dir / "conversations.db.gz", "rb") as fin, \
+                open(raw, "wb") as fout:
+            fout.write(fin.read())
+        try:
+            with Database(str(out_dir), readonly=True) as db2:
+                result = db2.query_conversations()
+                assert len(result["items"]) == 1
+        finally:
+            raw.unlink()
+
+    def test_export_compress_db_false_keeps_raw(self, tmp_path):
+        """compress_db=False opt-out emits the plain .db."""
+        from llm_memex.db import Database
+        from llm_memex.exporters.html import export
+
+        db_dir = tmp_path / "db"
+        db_dir.mkdir()
+        with Database(str(db_dir)) as db:
+            db.save_conversation(_make_conv())
+
+        out_dir = tmp_path / "site"
+        db_path = str(db_dir / "conversations.db")
+        export([_make_conv()], str(out_dir), db_path=db_path, compress_db=False)
         assert (out_dir / "conversations.db").exists()
-        # Verify it's a valid SQLite copy
-        with Database(str(out_dir), readonly=True) as db2:
-            result = db2.query_conversations()
-            assert len(result["items"]) == 1
+        assert not (out_dir / "conversations.db.gz").exists()
 
     def test_export_copies_assets(self, tmp_path):
         from llm_memex.db import Database
@@ -1025,7 +1055,7 @@ class TestHtmlExporter:
         export([_make_conv()], str(out_dir), db_path=db_path)
 
         assert (out_dir / "index.html").exists()
-        assert (out_dir / "conversations.db").exists()
+        assert (out_dir / "conversations.db.gz").exists()
         assert not (out_dir / "assets").exists()
 
     def test_export_memory_db_skips_copy(self, tmp_path):
@@ -1103,7 +1133,8 @@ class TestHtmlExporter:
         assert "notes_fts" in src_tables
 
         out_dir = tmp_path / "site"
-        export([_make_conv()], str(out_dir), db_path=db_path)
+        # compress_db=False to inspect the raw .db in the test
+        export([_make_conv()], str(out_dir), db_path=db_path, compress_db=False)
 
         # Confirm exported DB has no FTS5 tables
         with sqlite3.connect(str(out_dir / "conversations.db")) as conn:
@@ -1131,7 +1162,7 @@ class TestHtmlExporter:
 
         out_dir = tmp_path / "site"
         db_path = str(db_dir / "conversations.db")
-        export([_make_conv()], str(out_dir), db_path=db_path)
+        export([_make_conv()], str(out_dir), db_path=db_path, compress_db=False)
 
         dst = out_dir / "conversations.db"
         with sqlite3.connect(str(dst)) as conn:
@@ -1139,6 +1170,33 @@ class TestHtmlExporter:
         assert mode.lower() == "delete"
         assert not (out_dir / "conversations.db-wal").exists()
         assert not (out_dir / "conversations.db-shm").exists()
+
+    def test_export_db_gz_is_valid_sqlite(self, tmp_path):
+        """conversations.db.gz decompresses back to a valid SQLite file."""
+        import gzip as _gz
+        import sqlite3
+        from llm_memex.db import Database
+        from llm_memex.exporters.html import export
+
+        db_dir = tmp_path / "db"
+        db_dir.mkdir()
+        with Database(str(db_dir)) as db:
+            db.save_conversation(_make_conv())
+
+        out_dir = tmp_path / "site"
+        db_path = str(db_dir / "conversations.db")
+        export([_make_conv()], str(out_dir), db_path=db_path)
+
+        # Decompress and open
+        raw = tmp_path / "decompressed.db"
+        with _gz.open(out_dir / "conversations.db.gz", "rb") as fin, \
+                open(raw, "wb") as fout:
+            fout.write(fin.read())
+        with sqlite3.connect(str(raw)) as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM conversations"
+            ).fetchone()[0]
+        assert count == 1
 
 
 class TestCLIExportHtml:
@@ -1178,13 +1236,19 @@ class TestCLIExportHtml:
         assert result.returncode == 0, f"stderr: {result.stderr}"
         assert "Exported 1 conversation" in result.stdout
 
-        # Verify directory structure
+        # Verify directory structure (DB is gzipped by default)
         assert (out_dir / "index.html").exists()
-        assert (out_dir / "conversations.db").exists()
+        assert (out_dir / "conversations.db.gz").exists()
 
         # Verify index.html content
         html = (out_dir / "index.html").read_text()
         assert "<!DOCTYPE html>" in html
+
+        # Decompress to inspect the DB
+        import gzip as _gz
+        with _gz.open(out_dir / "conversations.db.gz", "rb") as fin, \
+                open(out_dir / "conversations.db", "wb") as fout:
+            fout.write(fin.read())
 
         # Verify the copied DB is usable
         from llm_memex.db import Database
