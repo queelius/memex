@@ -150,13 +150,12 @@ class TestHtmlTemplate:
     def test_template_on_db_loaded_calls_subroutines(self):
         """onDbLoaded should call renderFilters, initTimeline, and loadConversations."""
         html = get_template()
-        # Extract the onDbLoaded function body (between function declaration and next function)
         start = html.index("function onDbLoaded()")
-        # Check key calls exist within the function
-        chunk = html[start:start + 1000]
+        chunk = html[start:start + 1500]
         assert "renderFilters()" in chunk
         assert "initTimeline()" in chunk
         assert "loadConversations()" in chunk
+        assert "renderWelcomeStats()" in chunk
 
     def test_template_conversation_count_in_status(self):
         """onDbLoaded should query conversation count for status bar."""
@@ -1069,13 +1068,51 @@ class TestHtmlNotes:
         assert ".search-result-card" in html
         assert ".search-result-snippet mark" in html
 
-    def test_message_role_labels_lowercase_styling(self):
-        """Role labels are not uppercase — they inherit normal case from DOM."""
+    def test_template_has_welcome_hero_stats(self):
+        """Welcome screen has stat tiles + source breakdown populated on DB load."""
         html = get_template()
-        # The old text-transform: uppercase rule was removed
+        assert 'id="welcome-stats"' in html
+        assert 'id="welcome-sources"' in html
+        assert "function renderWelcomeStats()" in html
+        assert ".welcome-stat-value" in html
+        assert ".welcome-stat-label" in html
+        # Queries for each stat
+        assert "FROM conversations" in html
+        assert "MIN(created_at)" in html
+
+    def test_template_has_source_color_palette(self):
+        """Each source has a distinct color dot; theme defines the palette."""
+        html = get_template()
+        assert "--src-openai" in html
+        assert "--src-anthropic" in html
+        assert "--src-claude-code" in html
+        assert "--src-gemini" in html
+        assert ".source-dot" in html
+
+    def test_template_uses_warm_palette(self):
+        """Warm off-white + bronze, not GitHub blue."""
+        html = get_template()
+        # GitHub-flavored colors should be gone
+        assert "#0d1117" not in html
+        assert "#58a6ff" not in html
+        assert "#0969da" not in html
+        # Warm tokens present (cream bg + bronze accent)
+        assert "#faf7f0" in html or "#1a1714" in html  # warm bg tokens
+
+    def test_message_role_labels_are_subtle(self):
+        """Role labels use small-caps convention: small font + letter-spacing.
+
+        The v1 design shouted with large ALL-CAPS labels. The refreshed
+        design uses the modern small-caps convention: tiny font (~10-11px)
+        with tracking so the uppercase reads as a label, not a headline.
+        """
+        html = get_template()
         start = html.index(".message-role {")
-        block = html[start:start + 200]
-        assert "text-transform: uppercase" not in block
+        block = html[start:start + 250]
+        # Label is small (not headline-sized)
+        assert "font-size: 10" in block or "font-size: 11" in block
+        # Has letter-spacing so uppercase reads as a small-caps label
+        assert "letter-spacing:" in block
 
     def test_template_has_notes_js(self):
         html = get_template()
