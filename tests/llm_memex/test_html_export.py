@@ -153,11 +153,13 @@ class TestHtmlTemplate:
         assert "ORDER BY c.updated_at DESC LIMIT 500" in html
 
     def test_template_on_db_loaded_calls_subroutines(self):
-        """onDbLoaded wires the search box and renders the home state."""
+        """onDbLoaded wires the search box and routes to the initial view."""
         html = get_template()
         start = html.index("function onDbLoaded()")
         chunk = html[start:start + 1500]
-        assert "renderHome()" in chunk
+        # onDbLoaded delegates rendering to the hash router, which resolves
+        # to renderHome() when no hash is present.
+        assert "renderRoute()" in chunk
         assert "searchWired" in chunk
         # Home-render itself delegates to these
         home_start = html.index("function renderHome()")
