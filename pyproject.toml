@@ -3,11 +3,11 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "py-memex"
+name = "llm-memex"
 dynamic = ["version"]
-description = "Personal conversation knowledge base — import, search, and analyze conversations from ChatGPT, Claude, Gemini, and Claude Code"
+description = "Personal conversation knowledge base: import, search, and analyze conversations from ChatGPT, Claude, Gemini, and Claude Code"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
     {name = "Alex Towell", email = "lex@metafunctor.com"},
 ]
@@ -15,7 +15,6 @@ readme = "README.md"
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -32,22 +31,23 @@ dependencies = [
 dev = ["pytest>=7.0", "pytest-cov", "pytest-asyncio"]
 
 [project.urls]
-Homepage = "https://github.com/queelius/memex"
-Repository = "https://github.com/queelius/memex"
-Issues = "https://github.com/queelius/memex/issues"
+Homepage = "https://github.com/queelius/llm-memex"
+Repository = "https://github.com/queelius/llm-memex"
+Issues = "https://github.com/queelius/llm-memex/issues"
 
 [project.scripts]
-memex = "memex.cli:main"
+llm-memex = "llm_memex.cli:main"
 
 [tool.pytest.ini_options]
-testpaths = ["tests/memex"]
+testpaths = ["tests/llm_memex"]
 asyncio_mode = "auto"
 
 [tool.setuptools.dynamic]
-version = {attr = "memex.__version__"}
+version = {attr = "llm_memex.__version__"}
 
 [tool.setuptools.packages.find]
-include = ["memex*"]
+include = ["llm_memex*"]
 
 [tool.setuptools.package-data]
-"memex.scripts" = ["patterns/*.txt"]
+"llm_memex.scripts" = ["patterns/*.txt"]
+"llm_memex.exporters" = ["vendored/*"]

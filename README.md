@@ -1,17 +1,17 @@
-# memex
+# llm-memex
 
 Personal conversation knowledge base. Import, search, and analyze conversations from ChatGPT, Claude, Gemini, and Claude Code. MCP-first for LLM agent access.
 
 ## Install
 
 ```bash
-pip install py-memex
+pip install llm-memex
 ```
 
 For development:
 ```bash
-git clone https://github.com/queelius/memex
-cd memex
+git clone https://github.com/queelius/llm-memex
+cd llm-memex
 pip install -e ".[dev]"
 ```
 
@@ -19,16 +19,16 @@ pip install -e ".[dev]"
 
 **Import conversations:**
 ```bash
-memex import conversations.json          # auto-detects format
-memex import ~/.claude/projects/          # directory of Claude Code sessions
-memex import export.json --format openai  # force format
+llm-memex import conversations.json          # auto-detects format
+llm-memex import ~/.claude/projects/          # directory of Claude Code sessions
+llm-memex import export.json --format openai  # force format
 ```
 
 **Browse and search:**
 ```bash
-memex show                               # list conversations
-memex show <id>                          # view a conversation
-memex show --search "topic"              # full-text search
+llm-memex show                               # list conversations
+llm-memex show <id>                          # view a conversation
+llm-memex show --search "topic"              # full-text search
 ```
 
 **Query the database:** use the MCP server (for LLM agents) or `sqlite3` directly:
@@ -38,23 +38,23 @@ sqlite3 ~/.memex/conversations/conversations.db "SELECT count(*) FROM conversati
 
 **Export:**
 ```bash
-memex export output.md --format markdown
-memex export output.json --format json
-memex export ./archive --format arkiv    # universal archive format
-memex export ./site --format html        # self-contained HTML SPA
+llm-memex export output.md --format markdown
+llm-memex export output.json --format json
+llm-memex export ./archive --format arkiv    # universal archive format
+llm-memex export ./site --format html        # self-contained HTML SPA
 ```
 
 **MCP server** (for Claude Desktop, agent SDKs, etc.):
 ```bash
-memex mcp
+llm-memex mcp
 ```
 
 **Scripts:**
 ```bash
-memex run --list                                           # available scripts
-memex run redact --words "secret" --level word --apply
-memex run redact --pattern-file api_keys.txt --apply
-memex run enrich_trivial --apply
+llm-memex run --list                                           # available scripts
+llm-memex run redact --words "secret" --level word --apply
+llm-memex run redact --pattern-file api_keys.txt --apply
+llm-memex run enrich_trivial --apply
 ```
 
 ## Supported Formats
@@ -86,25 +86,25 @@ The HTML exporter builds a self-contained single-page app that loads the SQLite 
 Annotate messages and conversations with free-form text notes. Notes are stored in a dedicated `notes` table with FTS5 search, and appear across all surfaces (CLI, MCP, HTML SPA, exporters).
 
 ```bash
-memex run note add --conv <id> "this was a turning point" --apply
-memex run note add --conv <id> --msg <id> "key insight here" --apply
-memex run note list --conv <id>
-memex run note search "turning point"
-memex run note delete <note_id> --apply
+llm-memex run note add --conv <id> "this was a turning point" --apply
+llm-memex run note add --conv <id> --msg <id> "key insight here" --apply
+llm-memex run note list --conv <id>
+llm-memex run note search "turning point"
+llm-memex run note delete <note_id> --apply
 ```
 
 Notes are included in exports by default. Use `--no-notes` to strip them:
 
 ```bash
-memex export ./public --format html              # includes notes
-memex export ./public --format html --no-notes   # strips notes
+llm-memex export ./public --format html              # includes notes
+llm-memex export ./public --format html --no-notes   # strips notes
 ```
 
 In the HTML SPA, click the pencil icon on any message or conversation header to add a note inline. Notes persist in the browser's sql.js copy and are included when you download the DB.
 
 ## Multi-Database Config
 
-memex supports multiple named databases via `~/.memex/config.yaml`:
+llm-memex supports multiple named databases via `~/.memex/config.yaml`:
 
 ```yaml
 primary: conversations
@@ -121,7 +121,7 @@ All CLI commands and MCP tools accept `--db <name>` (CLI) or `db=<name>` (MCP) t
 
 ## MCP Tools
 
-When running as an MCP server, memex exposes 6 tools:
+When running as an MCP server, llm-memex exposes 6 tools:
 
 - `execute_sql`: Primary read interface. All queries via SQL (read-only by default).
 - `get_conversation`: Tree-aware retrieval + export (metadata, messages, markdown/JSON).
@@ -130,13 +130,13 @@ When running as an MCP server, memex exposes 6 tools:
 - `append_message`: Add messages to conversation trees.
 - `add_note`: Annotate a message or conversation with a free-form text note.
 
-Resources: `memex://schema` (DDL + query patterns), `memex://databases` (multi-db discovery + stats).
+Resources: `llm-memex://schema` (DDL + query patterns), `llm-memex://databases` (multi-db discovery + stats).
 
 ## Development
 
 ```bash
-pytest tests/memex/ -v             # run tests
-pytest tests/memex/ --cov=memex    # with coverage
+pytest tests/llm_memex/ -v             # run tests
+pytest tests/llm_memex/ --cov=llm_memex    # with coverage
 ```
 
 ## License
