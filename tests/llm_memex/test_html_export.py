@@ -504,10 +504,101 @@ class TestHashRouter:
         html = get_template()
         assert "var routingFromHash = false;" in html
         assert "routingFromHash = true;" in html
-        # setRoute respects the guard
+        # setRoute respects the guard (returns false when suppressed)
         ss = html.index("function setRoute(r, opts)")
-        schunk = html[ss:ss + 400]
-        assert "if (routingFromHash) return;" in schunk
+        schunk = html[ss:ss + 500]
+        assert "if (routingFromHash) return false;" in schunk
+
+    def test_parse_route_tolerates_bad_percent_encoding(self):
+        """parseRoute uses safeDecode so malformed hashes don't throw."""
+        html = get_template()
+        assert "function safeDecode(s)" in html
+        ps = html.index("function parseRoute()")
+        pchunk = html[ps:ps + 700]
+        assert "safeDecode(tail)" in pchunk
+
+    def test_go_home_avoids_double_render(self):
+        """goHome only renders manually when the hash didn't change."""
+        html = get_template()
+        gs = html.index("function goHome()")
+        gchunk = html[gs:gs + 800]
+        assert "var changed = setRoute" in gchunk
+        assert "if (!changed) renderHome();" in gchunk
+
+
+class TestXssSafety:
+    """Defense-in-depth regression tests for the XSS surfaces found in review."""
+
+    def test_add_note_btn_uses_data_attributes(self):
+        """addNoteBtn serializes IDs as data-* attrs and event-delegates the click,
+        rather than string-interpolating IDs into an onclick handler."""
+        html = get_template()
+        start = html.index("function addNoteBtn(targetKind, convId, msgId)")
+        chunk = html[start:start + 800]
+        assert 'data-action="add-note"' in chunk
+        assert "escAttr(convId" in chunk
+        # old dangerous pattern is gone
+        assert 'onclick="openNoteComposer' not in html
+
+    def test_add_note_click_is_event_delegated(self):
+        html = get_template()
+        assert "function wireNoteDelegation()" in html
+        assert 'data-action=\\"add-note\\"' in html
+
+    def test_safe_media_url_rejects_unsafe_chars(self):
+        """safeMediaUrl refuses URLs containing quotes/angle brackets/whitespace."""
+        html = get_template()
+        start = html.index("function safeMediaUrl(url)")
+        chunk = html[start:start + 600]
+        # The defensive reject clause
+        assert '["\\\'<>`\\s]' in chunk
+
+    def test_edit_note_single_select(self):
+        """editNote fetches target_kind + conversation_id + message_id in one SELECT."""
+        html = get_template()
+        start = html.index("function editNote(noteId, btn)")
+        chunk = html[start:start + 1200]
+        assert "SELECT target_kind, conversation_id, message_id FROM notes WHERE id = ?" in chunk
+
+
+class TestStreamEpoch:
+    """Regression: rapid conv-A → conv-B switch must not inject conv-A's stream
+    into conv-B. Each mode transition bumps streamEpoch; resumeConversation
+    captures it and bails when it changes."""
+
+    def test_stream_epoch_global_exists(self):
+        html = get_template()
+        assert "var streamEpoch = 0;" in html
+
+    def test_open_conversation_bumps_epoch(self):
+        html = get_template()
+        start = html.index("function openConversation(convId)")
+        chunk = html[start:start + 400]
+        assert "streamEpoch++" in chunk
+
+    def test_resume_conversation_captures_and_checks_epoch(self):
+        html = get_template()
+        start = html.index("async function resumeConversation(userText)")
+        chunk = html[start:start + 6000]
+        assert "var myEpoch = streamEpoch;" in chunk
+        assert "var streamConvId = activeConvId;" in chunk
+        assert "myEpoch !== streamEpoch" in chunk
+        # Post-stream DB writes use captured convId, not live activeConvId
+        assert "[streamConvId, assistMsgId, \"assistant\"" in chunk
+
+    def test_resume_conversation_maintains_messages_fts(self):
+        """When messages_fts exists (live DB), user/assistant messages are
+        mirrored to it via tryExec. When stripped (exported SPA), tryExec
+        silently no-ops."""
+        html = get_template()
+        assert 'tryExec(\n        "INSERT INTO messages_fts' in html or \
+               'tryExec(\\n        "INSERT INTO messages_fts' in html or \
+               "INSERT INTO messages_fts (conversation_id, message_id, text)" in html
+        # Assert at least one tryExec into messages_fts
+        start = html.index("async function resumeConversation")
+        chunk = html[start:start + 5000]
+        assert "messages_fts" in chunk
+        assert "tryExec" in chunk
 
 
 class TestHtmlTimelineRemoved:
@@ -921,6 +1012,29 @@ class TestHtmlExporter:
         assert "conversations" in dst_tables
         assert "messages" in dst_tables
         assert "notes" in dst_tables
+
+    def test_export_db_uses_delete_journal_mode(self, tmp_path):
+        """Export sets journal_mode=DELETE so no .db-wal / .db-shm sidecars
+        travel with the bundle."""
+        import sqlite3
+        from llm_memex.db import Database
+        from llm_memex.exporters.html import export
+
+        db_dir = tmp_path / "db"
+        db_dir.mkdir()
+        with Database(str(db_dir)) as db:
+            db.save_conversation(_make_conv())
+
+        out_dir = tmp_path / "site"
+        db_path = str(db_dir / "conversations.db")
+        export([_make_conv()], str(out_dir), db_path=db_path)
+
+        dst = out_dir / "conversations.db"
+        with sqlite3.connect(str(dst)) as conn:
+            mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        assert mode.lower() == "delete"
+        assert not (out_dir / "conversations.db-wal").exists()
+        assert not (out_dir / "conversations.db-shm").exists()
 
 
 class TestCLIExportHtml:

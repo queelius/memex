@@ -21,8 +21,13 @@ def _strip_fts5_and_vacuum(db_path: Path) -> None:
     sql.js (used by the HTML SPA) cannot query FTS5 — it's not compiled in.
     The shadow tables are ~50% of a typical DB, so dropping them before
     export roughly halves bundle size. The SPA falls back to LIKE queries.
+
+    Sets ``PRAGMA journal_mode=DELETE`` on the copy so no -wal/-shm sidecar
+    files are left next to the exported database when the process is
+    interrupted, and a subsequent VACUUM produces a fully-packed file.
     """
     with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("PRAGMA journal_mode=DELETE")
         for fts in _FTS5_TABLES:
             conn.execute(f"DROP TABLE IF EXISTS {fts}")
         conn.commit()
