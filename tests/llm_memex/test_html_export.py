@@ -564,6 +564,47 @@ class TestHtmlAnthropicIntegration:
         assert 'function loadSettings()' in html
         assert 'function saveSettings()' in html
 
+    def test_settings_has_provider_and_model_fields(self):
+        """Users can choose between Anthropic and OpenAI-compatible providers."""
+        html = get_template()
+        assert 'id="setting-provider"' in html
+        assert 'id="setting-model"' in html
+        # Both provider options surfaced
+        assert 'value="anthropic"' in html
+        assert 'value="openai"' in html
+
+    def test_template_has_chat_request_branching(self):
+        """buildChatRequest/extractDeltaText branch by provider string."""
+        html = get_template()
+        assert "function buildChatRequest(provider, apiKey, model, systemPrompt, messages)" in html
+        assert "function extractDeltaText(provider, data)" in html
+        # Anthropic wire format
+        assert '"x-api-key"' in html
+        assert '"anthropic-version"' in html
+        # OpenAI-compat wire format
+        assert '"Authorization"' in html
+        assert '"Bearer "' in html
+        # OpenAI delta accessor
+        assert "evt.choices" in html
+        # Anthropic delta accessor
+        assert 'evt.type === "content_block_delta"' in html
+
+    def test_default_model_per_provider(self):
+        """defaultModelFor returns a reasonable default for each provider."""
+        html = get_template()
+        start = html.index("function defaultModelFor(provider)")
+        chunk = html[start:start + 300]
+        assert "claude-sonnet-4-6" in chunk
+        assert "gpt-4o-mini" in chunk
+
+    def test_save_settings_persists_provider_and_model(self):
+        """Saved keys include provider and model."""
+        html = get_template()
+        start = html.index("function saveSettings()")
+        chunk = html[start:start + 800]
+        assert '"llm_memex_provider"' in chunk
+        assert '"llm_memex_model"' in chunk
+
     def test_load_settings_reads_localstorage(self):
         """loadSettings should read memex_api_key, memex_endpoint, memex_system_prompt."""
         html = get_template()
