@@ -1,20 +1,49 @@
-"""Export conversations as an arkiv archive (JSONL + README.md + schema.yaml)."""
+"""Export conversations as an arkiv archive.
+
+Writes the bundle as a directory, a ``.zip``, or a ``.tar.gz`` depending on
+the file extension of ``path``. All three layouts contain the same files:
+
+- ``conversations.jsonl``  -- one record per message (arkiv universal format)
+- ``README.md``            -- YAML frontmatter (ECHO self-description)
+- ``schema.yaml``          -- metadata key statistics
+
+Compression choice prioritizes longevity: ``.zip`` and ``.tar.gz`` are both
+ubiquitous (every OS and scripting language has supported them for 30+ years).
+"""
+import io
 import json
 import os
+import tarfile
+import tempfile
+import zipfile
 from datetime import date
+from pathlib import Path
 from typing import Any, Dict, List
 
-from llm_memex import __version__
 from llm_memex.models import Conversation
 
 
-def export(conversations: List[Conversation], path: str, **kwargs) -> None:
-    """Export conversations to an arkiv archive directory.
+def _detect_compression(path: str) -> str:
+    """Infer output format from *path*'s extension.
 
-    Creates a directory at *path* containing:
-    - conversations.jsonl  -- one record per message (arkiv universal format)
-    - README.md            -- YAML frontmatter (ECHO self-description)
-    - schema.yaml          -- metadata key statistics
+    Returns one of: ``"zip"``, ``"tar.gz"``, ``"dir"``.
+    """
+    lower = path.lower()
+    if lower.endswith(".zip"):
+        return "zip"
+    if lower.endswith(".tar.gz") or lower.endswith(".tgz"):
+        return "tar.gz"
+    return "dir"
+
+
+def export(conversations: List[Conversation], path: str, **kwargs) -> None:
+    """Export conversations to an arkiv archive.
+
+    Output format is inferred from *path*'s extension:
+
+    - ``path.zip``           -> single zip file
+    - ``path.tar.gz``/`.tgz` -> single gzip-compressed tarball
+    - any other path         -> directory containing the three files
 
     Parameters
     ----------
@@ -23,27 +52,64 @@ def export(conversations: List[Conversation], path: str, **kwargs) -> None:
     db : Database | None
         Database instance for querying notes.
     """
-    os.makedirs(path, exist_ok=True)
-
     include_notes = kwargs.get("include_notes", True)
     db = kwargs.get("db")
     records = _build_records(conversations, include_notes=include_notes, db=db)
 
-    # Write JSONL
-    jsonl_path = os.path.join(path, "conversations.jsonl")
-    with open(jsonl_path, "w") as f:
-        for rec in records:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
-    # Compute and write schema
-    schema = _compute_schema(records)
-    _write_schema_yaml(os.path.join(path, "schema.yaml"), schema, len(records))
-
-    # Write README
-    _write_readme(
-        os.path.join(path, "README.md"),
-        num_conversations=len(conversations),
+    jsonl_bytes = _records_to_jsonl_bytes(records)
+    schema_bytes = _schema_yaml_bytes(
+        _compute_schema(records), record_count=len(records)
     )
+    readme_bytes = _readme_bytes(num_conversations=len(conversations))
+
+    kind = _detect_compression(path)
+    if kind == "zip":
+        _write_zip(path, jsonl_bytes, schema_bytes, readme_bytes)
+    elif kind == "tar.gz":
+        _write_tar_gz(path, jsonl_bytes, schema_bytes, readme_bytes)
+    else:
+        os.makedirs(path, exist_ok=True)
+        _write_file(os.path.join(path, "conversations.jsonl"), jsonl_bytes)
+        _write_file(os.path.join(path, "schema.yaml"), schema_bytes)
+        _write_file(os.path.join(path, "README.md"), readme_bytes)
+
+
+def _records_to_jsonl_bytes(records: List[Dict[str, Any]]) -> bytes:
+    buf = io.StringIO()
+    for rec in records:
+        buf.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return buf.getvalue().encode("utf-8")
+
+
+def _write_file(path: str, data: bytes) -> None:
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def _write_zip(
+    path: str, jsonl: bytes, schema_yaml: bytes, readme: bytes
+) -> None:
+    """Write the three bundle files into a single .zip archive."""
+    # DEFLATE is the universally-supported compressor; good text ratio.
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("conversations.jsonl", jsonl)
+        zf.writestr("schema.yaml", schema_yaml)
+        zf.writestr("README.md", readme)
+
+
+def _write_tar_gz(
+    path: str, jsonl: bytes, schema_yaml: bytes, readme: bytes
+) -> None:
+    """Write the three bundle files into a single .tar.gz archive."""
+    with tarfile.open(path, "w:gz") as tf:
+        for name, data in (
+            ("conversations.jsonl", jsonl),
+            ("schema.yaml", schema_yaml),
+            ("README.md", readme),
+        ):
+            info = tarfile.TarInfo(name=name)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
 
 
 def _build_records(
@@ -159,20 +225,22 @@ def _json_type(value: Any) -> str:
 
 
 def _hashable(value: Any) -> Any:
-    """Make a value hashable for set storage."""
+    """Make a value hashable for set storage.
+
+    Recurses into lists so a list of dicts becomes a tuple of JSON strings
+    (each dict JSON-serialized) rather than a tuple of unhashable dicts.
+    """
     if isinstance(value, list):
-        return tuple(value)
+        return tuple(_hashable(v) for v in value)
     if isinstance(value, dict):
         return json.dumps(value, sort_keys=True)
     return value
 
 
-def _write_schema_yaml(path: str, schema: Dict[str, Dict[str, Any]], record_count: int) -> None:
-    """Write schema.yaml matching arkiv spec format.
-
-    Uses yaml.safe_dump so values containing YAML-special characters
-    (quotes, colons, brackets, newlines) are properly escaped.
-    """
+def _schema_yaml_bytes(
+    schema: Dict[str, Dict[str, Any]], record_count: int
+) -> bytes:
+    """Render schema.yaml as bytes."""
     import yaml
 
     metadata_keys: Dict[str, Dict[str, Any]] = {}
@@ -193,18 +261,29 @@ def _write_schema_yaml(path: str, schema: Dict[str, Dict[str, Any]], record_coun
             "metadata_keys": metadata_keys,
         }
     }
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("# Auto-generated by llm-memex. Edit freely.\n")
-        yaml.safe_dump(
-            doc, f,
-            default_flow_style=False,
-            sort_keys=False,
-            allow_unicode=True,
-        )
+    buf = io.StringIO()
+    buf.write("# Auto-generated by llm-memex. Edit freely.\n")
+    yaml.safe_dump(
+        doc,
+        buf,
+        default_flow_style=False,
+        sort_keys=False,
+        allow_unicode=True,
+    )
+    return buf.getvalue().encode("utf-8")
 
 
-def _write_readme(path: str, num_conversations: int) -> None:
-    """Write README.md with YAML frontmatter per arkiv spec."""
+def _readme_bytes(num_conversations: int) -> bytes:
+    """Render README.md as bytes."""
+    # Look up via installed package metadata rather than `from llm_memex
+    # import __version__` — the latter is ambiguous under pytest where
+    # `tests/llm_memex/` shadows the real package on sys.path.
+    try:
+        from importlib.metadata import version as _pkg_version
+        __version__ = _pkg_version("llm-memex")
+    except Exception:
+        __version__ = "unknown"
+
     today = date.today().isoformat()
     lines = [
         "---",
@@ -220,7 +299,7 @@ def _write_readme(path: str, num_conversations: int) -> None:
         "# llm-memex Conversations Archive",
         "",
         f"This archive contains {num_conversations} conversation(s) exported from llm-memex",
-        f"in [arkiv](https://github.com/alonzo-church/arkiv) universal record format.",
+        "in [arkiv](https://github.com/alonzo-church/arkiv) universal record format.",
         "",
         "Each record in `conversations.jsonl` represents one message with metadata",
         "linking it back to its conversation, speaker role, and source platform.",
@@ -231,6 +310,11 @@ def _write_readme(path: str, num_conversations: int) -> None:
         "arkiv import README.md --db archive.db",
         "```",
         "",
+        "To re-import into llm-memex (round-trip):",
+        "",
+        "```bash",
+        "llm-memex import <this bundle> --format arkiv",
+        "```",
+        "",
     ]
-    with open(path, "w") as f:
-        f.write("\n".join(lines))
+    return "\n".join(lines).encode("utf-8")
