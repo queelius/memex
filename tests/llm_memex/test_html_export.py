@@ -15,7 +15,6 @@ class TestHtmlTemplate:
         html = get_template()
         assert 'id="search-box"' in html
         assert 'id="conv-list"' in html
-        assert 'id="timeline-canvas"' in html
         assert 'id="settings-overlay"' in html
         assert "anthropic-dangerous-direct-browser-access" in html
 
@@ -28,11 +27,15 @@ class TestHtmlTemplate:
         assert "--font-mono:" in html
 
     def test_template_contains_layout_structure(self):
+        """Single-column layout: top-bar + main, no sidebar, no timeline."""
         html = get_template()
-        assert 'id="sidebar"' in html
-        assert 'id="main"' in html
-        assert 'id="timeline"' in html
         assert 'id="app"' in html
+        assert 'id="top-bar"' in html
+        assert 'id="main"' in html
+        assert 'id="top-brand"' in html
+        # Sidebar and timeline were removed in the single-column refresh
+        assert 'id="sidebar"' not in html
+        assert 'id="timeline"' not in html
 
     def test_template_contains_db_loading_cascade(self):
         html = get_template()
@@ -59,9 +62,11 @@ class TestHtmlTemplate:
         assert "function onDbLoaded()" in html
         assert "function loadConversations()" in html
         assert "function openConversation(convId)" in html
-        assert "function initTimeline()" in html
+        assert "function renderHome()" in html
         assert "function sendMessage()" in html
         assert "function downloadDb()" in html
+        # Timeline is gone
+        assert "function initTimeline" not in html
 
     def test_template_references_local_wasm(self):
         """sql-wasm is referenced as a local sibling file, not a CDN URL.
@@ -148,14 +153,18 @@ class TestHtmlTemplate:
         assert "ORDER BY c.updated_at DESC LIMIT 500" in html
 
     def test_template_on_db_loaded_calls_subroutines(self):
-        """onDbLoaded should call renderFilters, initTimeline, and loadConversations."""
+        """onDbLoaded wires the search box and renders the home state."""
         html = get_template()
         start = html.index("function onDbLoaded()")
         chunk = html[start:start + 1500]
-        assert "renderFilters()" in chunk
-        assert "initTimeline()" in chunk
-        assert "loadConversations()" in chunk
-        assert "renderWelcomeStats()" in chunk
+        assert "renderHome()" in chunk
+        assert "searchWired" in chunk
+        # Home-render itself delegates to these
+        home_start = html.index("function renderHome()")
+        home_chunk = html[home_start:home_start + 1000]
+        assert "renderWelcomeStats()" in home_chunk
+        assert "renderFilters()" in home_chunk
+        assert "loadConversations()" in home_chunk
 
     def test_template_conversation_count_in_status(self):
         """onDbLoaded should query conversation count for status bar."""
@@ -443,164 +452,25 @@ class TestHtmlRendering:
         assert "ORDER BY created_at" in chunk
 
 
-class TestHtmlTimeline:
-    """Tests for timeline scrubber (Task 4)."""
+class TestHtmlTimelineRemoved:
+    """Single-column refresh deleted the canvas timeline bar; these regressions
+    guard that nothing creeps back in by accident."""
 
-    def test_template_has_timeline_state_variables(self):
-        """Template should have timelineData and timelineSelection state."""
+    def test_template_has_no_timeline_dom(self):
         html = get_template()
-        assert "var timelineData = []" in html
-        assert "var timelineSelection = null" in html
+        assert 'id="timeline-canvas"' not in html
+        assert 'id="timeline-start"' not in html
+        assert 'id="timeline-end"' not in html
 
-    def test_template_has_timeline_html_elements(self):
-        """Template should have timeline canvas and label spans."""
+    def test_template_has_no_timeline_functions(self):
         html = get_template()
-        assert 'id="timeline-canvas"' in html
-        assert 'id="timeline-start"' in html
-        assert 'id="timeline-end"' in html
+        assert "function initTimeline" not in html
+        assert "function drawTimeline" not in html
 
-    def test_template_has_timeline_label_css(self):
-        """Template should have CSS for timeline labels."""
+    def test_template_has_no_timeline_state(self):
         html = get_template()
-        assert ".timeline-label" in html
-
-    def test_init_timeline_queries_monthly_counts(self):
-        """initTimeline should query monthly conversation counts."""
-        html = get_template()
-        start = html.index("function initTimeline()")
-        end = html.index("function drawTimeline()")
-        chunk = html[start:end]
-        assert "strftime('%Y-%m', created_at)" in chunk
-        assert "GROUP BY month" in chunk
-        assert "ORDER BY month" in chunk
-
-    def test_init_timeline_sets_labels(self):
-        """initTimeline should set timeline-start and timeline-end labels."""
-        html = get_template()
-        start = html.index("function initTimeline()")
-        end = html.index("function drawTimeline()")
-        chunk = html[start:end]
-        assert "timeline-start" in chunk
-        assert "timeline-end" in chunk
-
-    def test_init_timeline_bails_on_no_conversations(self):
-        """initTimeline should bail early if no conversations."""
-        html = get_template()
-        start = html.index("function initTimeline()")
-        chunk = html[start:start + 200]
-        assert "totalConvCount === 0" in chunk
-        assert "return" in chunk
-
-    def test_init_timeline_has_mouse_events(self):
-        """initTimeline should wire mousedown, mousemove, mouseup, dblclick."""
-        html = get_template()
-        start = html.index("function initTimeline()")
-        end = html.index("function drawTimeline()")
-        chunk = html[start:end]
-        assert '"mousedown"' in chunk
-        assert '"mousemove"' in chunk
-        assert '"mouseup"' in chunk
-        assert '"dblclick"' in chunk
-
-    def test_init_timeline_mouseup_sets_date_filters(self):
-        """mouseup should set activeFilters.dateFrom and dateTo."""
-        html = get_template()
-        start = html.index("function initTimeline()")
-        end = html.index("function drawTimeline()")
-        chunk = html[start:end]
-        assert "activeFilters.dateFrom" in chunk
-        assert "activeFilters.dateTo" in chunk
-        assert "loadConversations()" in chunk
-
-    def test_init_timeline_dblclick_clears_selection(self):
-        """Double-click should clear selection and date filters."""
-        html = get_template()
-        start = html.index("function initTimeline()")
-        end = html.index("function drawTimeline()")
-        chunk = html[start:end]
-        # Find dblclick handler
-        dblclick_pos = chunk.index('"dblclick"')
-        after_dblclick = chunk[dblclick_pos:]
-        assert "timelineSelection = null" in after_dblclick
-        assert "activeFilters.dateFrom = null" in after_dblclick
-        assert "activeFilters.dateTo = null" in after_dblclick
-
-    def test_init_timeline_uses_resize_observer(self):
-        """initTimeline should use ResizeObserver to redraw on resize."""
-        html = get_template()
-        start = html.index("function initTimeline()")
-        end = html.index("function drawTimeline()")
-        chunk = html[start:end]
-        assert "ResizeObserver" in chunk
-        assert "drawTimeline()" in chunk
-
-    def test_draw_timeline_exists(self):
-        """Template should have drawTimeline function."""
-        html = get_template()
-        assert "function drawTimeline()" in html
-
-    def test_draw_timeline_handles_device_pixel_ratio(self):
-        """drawTimeline should handle devicePixelRatio for crisp rendering."""
-        html = get_template()
-        start = html.index("function drawTimeline()")
-        end = html.index("function sendMessage()")
-        chunk = html[start:end]
-        assert "devicePixelRatio" in chunk
-
-    def test_draw_timeline_reads_css_colors(self):
-        """drawTimeline should read colors from CSS custom properties."""
-        html = get_template()
-        start = html.index("function drawTimeline()")
-        end = html.index("function sendMessage()")
-        chunk = html[start:end]
-        assert "getComputedStyle" in chunk
-        assert "getPropertyValue" in chunk
-        assert "--border" in chunk
-        assert "--text-accent" in chunk
-
-    def test_draw_timeline_uses_canvas_2d(self):
-        """drawTimeline should use canvas 2d context."""
-        html = get_template()
-        start = html.index("function drawTimeline()")
-        end = html.index("function sendMessage()")
-        chunk = html[start:end]
-        assert "getContext" in chunk
-        assert '"2d"' in chunk
-
-    def test_draw_timeline_calculates_bar_dimensions(self):
-        """drawTimeline should calculate bar width and height from data."""
-        html = get_template()
-        start = html.index("function drawTimeline()")
-        end = html.index("function sendMessage()")
-        chunk = html[start:end]
-        assert "maxCount" in chunk
-        assert "fillRect" in chunk
-
-    def test_draw_timeline_uses_accent_for_selection(self):
-        """drawTimeline should use accent color for selected bars."""
-        html = get_template()
-        start = html.index("function drawTimeline()")
-        end = html.index("function sendMessage()")
-        chunk = html[start:end]
-        assert "accentColor" in chunk
-        assert "barColor" in chunk
-        assert "timelineSelection" in chunk
-
-    def test_draw_timeline_clears_canvas(self):
-        """drawTimeline should clear the canvas before redrawing."""
-        html = get_template()
-        start = html.index("function drawTimeline()")
-        end = html.index("function sendMessage()")
-        chunk = html[start:end]
-        assert "clearRect" in chunk
-
-    def test_init_timeline_calls_draw_timeline(self):
-        """initTimeline should call drawTimeline after loading data."""
-        html = get_template()
-        start = html.index("function initTimeline()")
-        end = html.index("function drawTimeline()")
-        chunk = html[start:end]
-        assert "drawTimeline()" in chunk
+        assert "var timelineData" not in html
+        assert "var timelineSelection" not in html
 
 
 class TestHtmlAnthropicIntegration:
@@ -1037,18 +907,20 @@ class TestHtmlNotes:
         assert ".marginalia-card" in html
         assert ".marginalia-card-title" in html
 
-    def test_marginalia_hides_input_area(self):
-        """When switching to marginalia mode, the input area should hide."""
+    def test_input_area_only_visible_for_conversation_mode(self):
+        """The note/continue input is hidden in home/marginalia/search modes."""
         html = get_template()
-        assert 'chatMode === "marginalia"' in html
-        # The refresh helper hides input-area in marginalia mode
+        # refreshChatUiState only reveals the input when reading a conversation
+        assert 'chatMode === "conversation"' in html
+        # Otherwise input-area is hidden
         assert 'inputArea.classList.add("hidden")' in html
 
     def test_template_has_search_results_mode(self):
+        """Search is driven by the top search box, invoked with a query term."""
         html = get_template()
-        assert 'id="search-toggle"' in html
-        assert 'openSearchResults()' in html
-        assert "function openSearchResults()" in html
+        assert 'id="search-box"' in html
+        # openSearchResults now takes a term from the top search box
+        assert "function openSearchResults(initialTerm)" in html
         # Query ranks conversations by match count
         assert "COUNT(*) AS match_count" in html
         assert "ORDER BY match_count DESC" in html
