@@ -84,7 +84,7 @@ CREATE INDEX IF NOT EXISTS idx_notes_kind ON notes(kind);
 CREATE INDEX IF NOT EXISTS idx_notes_parent ON notes(parent_note_id) WHERE parent_note_id IS NOT NULL;
 
 -- (edges table removed in schema v7: cross-record relationships belong to
--- the federation layer, not to individual archives. See memex/meta-memex
+-- the federation layer, not to individual archives. See memex/memex
 -- docs for the new home.)
 
 CREATE INDEX IF NOT EXISTS idx_conversations_source ON conversations(source);
@@ -201,7 +201,7 @@ def _migrate_to_v5(conn):
 
     Historical migration: v5 introduced the edges and trails tables and the
     notes v2 columns. Trails were removed in v6 and edges in v7 — both moved
-    to the meta-memex federation layer. This migration still creates edges
+    to the memex federation layer. This migration still creates edges
     (and trails) for databases following the 4→5→6→7 chain; those tables
     are dropped by subsequent migrations. Fresh DBs bootstrap directly to
     the current version and never materialize them.
@@ -290,9 +290,9 @@ def _migrate_to_v5(conn):
 def _migrate_to_v6(conn):
     """Drop trails and trail_steps.
 
-    Trails moved to the meta-memex layer (cross-archive coordinator).
+    Trails moved to the memex layer (cross-archive coordinator).
     Each archive is now domain-focused; cross-archive operations like
-    trails live above in meta-memex. See ~/github/beta/meta-memex/docs/
+    trails live above in memex. See ~/github/beta/memex/docs/
     for the new design.
 
     Existing trail data is discarded. This is acceptable because trails
@@ -310,7 +310,7 @@ def _migrate_to_v7(conn):
     """Drop edges table and its indexes.
 
     The edges table was added in v5 alongside trails, intended as a generic
-    polymorphic relationship store. Trails moved to meta-memex in v6, but
+    polymorphic relationship store. Trails moved to memex in v6, but
     edges stayed — dormant. Nothing in llm-memex actually writes to it
     (no importer, MCP tool, or CLI), so it has been dead code.
 
@@ -1638,5 +1638,5 @@ class Database:
         ]
 
     # (edges methods removed in schema v7; see _migrate_to_v7 docstring.
-    # Cross-record graph persistence belongs to the meta-memex federation
+    # Cross-record graph persistence belongs to the memex federation
     # layer, not to individual archives.)

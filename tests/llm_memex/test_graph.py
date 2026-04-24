@@ -1,8 +1,8 @@
 """Tests for schema v5→v6→v7 migrations and marginalia v2.
 
 v5 introduced edges, trails, and notes v2 columns.
-v6 removed trails (moved to meta-memex).
-v7 removed edges (cross-record graphs belong to meta-memex too).
+v6 removed trails (moved to memex).
+v7 removed edges (cross-record graphs belong to memex too).
 
 Covers:
 - v4 → v7 migration preserves existing notes, adds v2 columns with defaults
@@ -44,7 +44,7 @@ class TestSchema:
         assert SCHEMA_VERSION == 7
 
     def test_fresh_db_has_no_edges_table(self, db):
-        """v7 removed edges; cross-record graphs live in meta-memex, not here."""
+        """v7 removed edges; cross-record graphs live in memex, not here."""
         tables = {
             r["name"]
             for r in db.conn.execute(

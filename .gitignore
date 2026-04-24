@@ -111,3 +111,11 @@ test.db/
 
 # Benchmark data
 .benchmarks/site/
+
+# MCP tool artifacts (test harness outputs)
+.playwright-mcp/
+
+# Development screenshots in the repo root. Anything meant for docs
+# or README assets should live under ``docs/`` or ``images/`` instead.
+/*.png
+/*.html

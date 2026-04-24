@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Ecosystem Context
 
-This repo (`llm-memex/`) is one archive in the `*-memex` ecosystem at `~/github/memex/` (see `../CLAUDE.md`). It covers **AI chat conversations** (ChatGPT, Claude, Gemini, Claude Code). Trails and cross-archive features have moved to `meta-memex/`. This archive is domain-focused: store, index, and expose conversations.
+This repo (`llm-memex/`) is one archive in the `*-memex` ecosystem at `~/github/memex/` (see `../CLAUDE.md`). It covers **AI chat conversations** (ChatGPT, Claude, Gemini, Claude Code). Trails and cross-archive features have moved to `memex/`. This archive is domain-focused: store, index, and expose conversations.
 
 ## Commands
 
@@ -91,7 +91,7 @@ llm_memex/
 
 ## Database Schema (v7)
 
-Schema v7 migrations: v1→v2 (enrichments, provenance) → v3 (parent_conversation_id) → v4 (notes, notes_fts) → v5 (edges, marginalia v2) → v6 (drop trails, moved to meta-memex) → v7 (drop edges, also moved to meta-memex).
+Schema v7 migrations: v1→v2 (enrichments, provenance) → v3 (parent_conversation_id) → v4 (notes, notes_fts) → v5 (edges, marginalia v2) → v6 (drop trails, moved to memex federation layer) → v7 (drop edges, also moved to memex federation layer).
 
 **Core tables:**
 - `conversations`: PK `id`, boolean timestamps `starred_at`/`pinned_at`/`archived_at` (NULL=false, DATETIME=true), self-referential `parent_conversation_id`
